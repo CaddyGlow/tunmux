@@ -42,7 +42,8 @@ async fn run(command: Command) -> anyhow::Result<()> {
             server,
             country,
             p2p,
-        } => cmd_connect(server, country, p2p).await,
+            backend,
+        } => cmd_connect(server, country, p2p, &backend).await,
         Command::Disconnect => cmd_disconnect(),
     }
 }
@@ -98,7 +99,7 @@ async fn cmd_logout() -> anyhow::Result<()> {
     // Disconnect if active
     if wireguard::wg_quick::is_active() {
         println!("Disconnecting active VPN connection...");
-        wireguard::wg_quick::down()?;
+        disconnect_active()?;
     }
 
     config::delete_session()?;
@@ -172,11 +173,14 @@ async fn cmd_connect(
     server_name: Option<String>,
     country: Option<String>,
     p2p: bool,
+    backend_arg: &str,
 ) -> anyhow::Result<()> {
     // Check if already connected
     if wireguard::wg_quick::is_active() {
         anyhow::bail!("Already connected. Run `protonvpn disconnect` first.");
     }
+
+    let backend = wireguard::backend::WgBackend::from_str_arg(backend_arg)?;
 
     let session = config::load_session()?;
     let client = api::http::ProtonClient::authenticated(&session.uid, &session.access_token)?;
@@ -224,22 +228,42 @@ async fn cmd_connect(
     // Restore keys from session
     let keys = crypto::keys::VpnKeys::from_base64(&session.ed25519_private_key)?;
 
-    // Generate WireGuard config
     let server_pubkey = physical
         .x25519_public_key
         .as_deref()
         .ok_or_else(|| error::AppError::NoServerFound)?;
 
-    let wg_config = wireguard::config::generate_config(&wireguard::config::WgConfigParams {
+    let params = wireguard::config::WgConfigParams {
         private_key: &keys.wg_private_key(),
         server_public_key: server_pubkey,
         server_ip: &physical.entry_ip,
         server_port: 51820,
-    });
+    };
 
-    // Write config and bring up interface
-    wireguard::wg_quick::up(&wg_config)?;
-    println!("Connected to {} ({})", server.name, server.exit_country);
+    match backend {
+        wireguard::backend::WgBackend::WgQuick => {
+            let wg_config = wireguard::config::generate_config(&params);
+            wireguard::wg_quick::up(&wg_config)?;
+
+            // Save minimal connection state so disconnect knows which backend was used
+            let state = wireguard::connection::ConnectionState {
+                backend,
+                server_endpoint: format!("{}:{}", params.server_ip, params.server_port),
+                original_gateway_ip: None,
+                original_gateway_iface: None,
+                original_resolv_conf: None,
+            };
+            state.save()?;
+        }
+        wireguard::backend::WgBackend::Kernel => {
+            wireguard::kernel::up(&params)?;
+        }
+    }
+
+    println!(
+        "Connected to {} ({}) [backend: {}]",
+        server.name, server.exit_country, backend
+    );
     Ok(())
 }
 
@@ -249,7 +273,27 @@ fn cmd_disconnect() -> anyhow::Result<()> {
         return Ok(());
     }
 
-    wireguard::wg_quick::down()?;
+    disconnect_active()?;
     println!("Disconnected");
+    Ok(())
+}
+
+/// Tear down the active VPN, dispatching to the correct backend.
+fn disconnect_active() -> anyhow::Result<()> {
+    match wireguard::connection::ConnectionState::load()? {
+        Some(state) => match state.backend {
+            wireguard::backend::WgBackend::Kernel => {
+                wireguard::kernel::down(&state)?;
+            }
+            wireguard::backend::WgBackend::WgQuick => {
+                wireguard::wg_quick::down()?;
+                wireguard::connection::ConnectionState::remove()?;
+            }
+        },
+        // No state file -- fall back to wg-quick (legacy connections)
+        None => {
+            wireguard::wg_quick::down()?;
+        }
+    }
     Ok(())
 }

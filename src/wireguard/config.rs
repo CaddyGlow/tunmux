@@ -4,9 +4,9 @@
 // - IPv4: 10.2.0.2/32, DNS 10.2.0.1
 // - IPv6: 2a07:b944::2:2/128, DNS 2a07:b944::2:1
 
-const WG_ADDRESS: &str = "10.2.0.2/32";
-const WG_DNS: &str = "10.2.0.1";
-const WG_ALLOWED_IPS: &str = "0.0.0.0/0, ::/0";
+pub const WG_ADDRESS: &str = "10.2.0.2/32";
+pub const WG_DNS: &str = "10.2.0.1";
+pub const WG_ALLOWED_IPS: &str = "0.0.0.0/0, ::/0";
 
 /// Parameters needed to generate a WireGuard config.
 pub struct WgConfigParams<'a> {

@@ -48,6 +48,10 @@ pub enum Command {
         /// Prefer P2P-capable servers
         #[arg(long)]
         p2p: bool,
+
+        /// WireGuard backend: auto, wg-quick, kernel
+        #[arg(long, default_value = "auto")]
+        backend: String,
     },
 
     /// Disconnect from VPN
