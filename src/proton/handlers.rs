@@ -1,6 +1,6 @@
 use crate::api;
 use crate::cli::ProtonCommand;
-use crate::config::{self, Provider};
+use crate::config::{self, AppConfig, Provider};
 use crate::crypto;
 use crate::error;
 use crate::models;
@@ -9,23 +9,23 @@ use crate::wireguard;
 const PROVIDER: Provider = Provider::Proton;
 const INTERFACE_NAME: &str = "proton0";
 
-pub async fn dispatch(command: ProtonCommand) -> anyhow::Result<()> {
+pub async fn dispatch(command: ProtonCommand, config: &AppConfig) -> anyhow::Result<()> {
     match command {
-        ProtonCommand::Login { username } => cmd_login(&username).await,
-        ProtonCommand::Logout => cmd_logout().await,
-        ProtonCommand::Info => cmd_info(),
-        ProtonCommand::Servers { country, free } => cmd_servers(country, free).await,
+        ProtonCommand::Login { username } => cmd_login(&username, config).await,
+        ProtonCommand::Logout => cmd_logout(config).await,
+        ProtonCommand::Info => cmd_info(config),
+        ProtonCommand::Servers { country, free } => cmd_servers(country, free, config).await,
         ProtonCommand::Connect {
             server,
             country,
             p2p,
             backend,
-        } => cmd_connect(server, country, p2p, &backend).await,
+        } => cmd_connect(server, country, p2p, backend, config).await,
         ProtonCommand::Disconnect => cmd_disconnect(),
     }
 }
 
-async fn cmd_login(username: &str) -> anyhow::Result<()> {
+async fn cmd_login(username: &str, config: &AppConfig) -> anyhow::Result<()> {
     let password = rpassword::prompt_password("Password: ")?;
 
     let mut client = api::http::ProtonClient::new()?;
@@ -67,25 +67,25 @@ async fn cmd_login(username: &str) -> anyhow::Result<()> {
         certificate_pem: cert.certificate,
     };
 
-    config::save_session(PROVIDER, &session)?;
+    config::save_session(PROVIDER, &session, config)?;
     println!("Logged in as {} ({})", username, session.plan_title);
     Ok(())
 }
 
-async fn cmd_logout() -> anyhow::Result<()> {
+async fn cmd_logout(config: &AppConfig) -> anyhow::Result<()> {
     // Disconnect if active
     if wireguard::wg_quick::is_interface_active(INTERFACE_NAME) {
         println!("Disconnecting active VPN connection...");
         disconnect_active()?;
     }
 
-    config::delete_session(PROVIDER)?;
+    config::delete_session(PROVIDER, config)?;
     println!("Logged out");
     Ok(())
 }
 
-fn cmd_info() -> anyhow::Result<()> {
-    let session: models::session::Session = config::load_session(PROVIDER)?;
+fn cmd_info(config: &AppConfig) -> anyhow::Result<()> {
+    let session: models::session::Session = config::load_session(PROVIDER, config)?;
     println!("Username:    {}", session.vpn_username);
     println!(
         "Plan:        {} ({})",
@@ -97,8 +97,8 @@ fn cmd_info() -> anyhow::Result<()> {
     Ok(())
 }
 
-async fn cmd_servers(country: Option<String>, free: bool) -> anyhow::Result<()> {
-    let session: models::session::Session = config::load_session(PROVIDER)?;
+async fn cmd_servers(country: Option<String>, free: bool, config: &AppConfig) -> anyhow::Result<()> {
+    let session: models::session::Session = config::load_session(PROVIDER, config)?;
     let client = api::http::ProtonClient::authenticated(&session.uid, &session.access_token)?;
 
     let resp = api::servers::fetch_server_list(&client).await?;
@@ -150,7 +150,8 @@ async fn cmd_connect(
     server_name: Option<String>,
     country: Option<String>,
     p2p: bool,
-    backend_arg: &str,
+    backend_arg: Option<String>,
+    config: &AppConfig,
 ) -> anyhow::Result<()> {
     // Check if already connected (any provider)
     if let Some(state) = wireguard::connection::ConnectionState::load()? {
@@ -164,9 +165,14 @@ async fn cmd_connect(
         anyhow::bail!("Already connected. Run `tunmux proton disconnect` first.");
     }
 
-    let backend = wireguard::backend::WgBackend::from_str_arg(backend_arg)?;
+    let backend_str = backend_arg.as_deref()
+        .unwrap_or(&config.general.backend);
+    let backend = wireguard::backend::WgBackend::from_str_arg(backend_str)?;
 
-    let session: models::session::Session = config::load_session(PROVIDER)?;
+    // Apply config defaults -- CLI flags override config
+    let effective_country = country.or_else(|| config.proton.default_country.clone());
+
+    let session: models::session::Session = config::load_session(PROVIDER, config)?;
     let client = api::http::ProtonClient::authenticated(&session.uid, &session.access_token)?;
 
     // Fetch servers
@@ -187,7 +193,7 @@ async fn cmd_connect(
             .ok_or_else(|| error::AppError::NoServerFound)?
     } else {
         // Apply filters
-        if let Some(ref cc) = country {
+        if let Some(ref cc) = effective_country {
             let cc_upper = cc.to_uppercase();
             servers.retain(|s| s.exit_country == cc_upper);
         }

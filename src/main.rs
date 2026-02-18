@@ -28,15 +28,17 @@ async fn main() {
         .without_time()
         .init();
 
-    if let Err(e) = run(cli.provider).await {
+    let config = config::load_config();
+
+    if let Err(e) = run(cli.provider, config).await {
         error!("{}", e);
         std::process::exit(1);
     }
 }
 
-async fn run(provider: ProviderCommand) -> anyhow::Result<()> {
+async fn run(provider: ProviderCommand, config: config::AppConfig) -> anyhow::Result<()> {
     match provider {
-        ProviderCommand::Proton { command } => proton::handlers::dispatch(command).await,
-        ProviderCommand::Airvpn { command } => airvpn::handlers::dispatch(command).await,
+        ProviderCommand::Proton { command } => proton::handlers::dispatch(command, &config).await,
+        ProviderCommand::Airvpn { command } => airvpn::handlers::dispatch(command, &config).await,
     }
 }

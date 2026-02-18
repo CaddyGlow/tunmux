@@ -38,6 +38,7 @@ management.
 ## Build
 
     cargo build
+    cargo build --features keyring   # enable OS keyring credential storage
 
 ## Usage
 
@@ -81,9 +82,40 @@ management.
 
 ## Configuration
 
+### Config file
+
+tunmux reads `~/.config/tunmux/config.toml` for default preferences. All fields
+are optional; a missing file means all defaults apply.
+
+    [general]
+    backend = "auto"              # default WireGuard backend: auto, wg-quick, kernel
+    credential_store = "keyring"  # "keyring" or "file" (requires --features keyring)
+
+    [proton]
+    default_country = "CH"
+
+    [airvpn]
+    default_country = "NL"
+    default_device = "laptop"
+
+CLI flags always override config values. For example, `--backend wg-quick` takes
+precedence over `backend = "kernel"` in the config file, and `--country US`
+overrides `default_country`.
+
+### Keyring support
+
+When built with `--features keyring` and `credential_store = "keyring"` is set
+in the config file, session credentials are stored in the OS secret service
+(e.g., GNOME Keyring, KDE Wallet, macOS Keychain) instead of plaintext JSON
+files. No automatic migration -- after enabling keyring, run
+`tunmux <provider> login` again to store credentials in the keyring.
+
+### Data directory
+
 Session and connection state stored in `~/.config/tunmux/`:
 
     ~/.config/tunmux/
+      config.toml              # user preferences (optional)
       connection.json          # active connection state (provider-neutral)
       proton/
         session.json           # Proton VPN credentials and keys

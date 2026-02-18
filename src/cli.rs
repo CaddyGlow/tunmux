@@ -65,8 +65,8 @@ pub enum ProtonCommand {
         p2p: bool,
 
         /// WireGuard backend: auto, wg-quick, kernel
-        #[arg(long, default_value = "auto")]
-        backend: String,
+        #[arg(long)]
+        backend: Option<String>,
     },
 
     /// Disconnect from VPN
@@ -108,8 +108,8 @@ pub enum AirVpnCommand {
         key: Option<String>,
 
         /// WireGuard backend: auto, wg-quick, kernel
-        #[arg(long, default_value = "auto")]
-        backend: String,
+        #[arg(long)]
+        backend: Option<String>,
     },
 
     /// Disconnect from VPN

@@ -3,6 +3,10 @@ name = "tunmux"
 version = "0.1.0"
 edition = "2021"
 
+[features]
+default = []
+keyring = ["dep:keyring"]
+
 [dependencies]
 # CLI
 clap = { version = "4", features = ["derive"] }
@@ -16,6 +20,7 @@ reqwest = { version = "0.12", features = ["json", "rustls-tls", "cookies"], defa
 # Serialization
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+toml = "0.8"
 
 # Logging
 tracing = "0.1"
@@ -58,3 +63,6 @@ rpassword = "7"
 # Error handling
 thiserror = "2"
 anyhow = "1"
+
+# Keyring (optional)
+keyring = { version = "3", optional = true }

@@ -1,5 +1,5 @@
 use crate::cli::{AirVpnCommand, ApiKeyAction, DeviceAction, PortAction};
-use crate::config::{self, Provider};
+use crate::config::{self, AppConfig, Provider};
 use crate::error;
 use crate::wireguard;
 
@@ -11,23 +11,23 @@ const PROVIDER: Provider = Provider::AirVpn;
 const INTERFACE_NAME: &str = "airvpn0";
 const MANIFEST_FILE: &str = "manifest.json";
 
-pub async fn dispatch(command: AirVpnCommand) -> anyhow::Result<()> {
+pub async fn dispatch(command: AirVpnCommand, config: &AppConfig) -> anyhow::Result<()> {
     match command {
-        AirVpnCommand::Login { username } => cmd_login(&username).await,
-        AirVpnCommand::Logout => cmd_logout().await,
-        AirVpnCommand::Info => cmd_info(),
+        AirVpnCommand::Login { username } => cmd_login(&username, config).await,
+        AirVpnCommand::Logout => cmd_logout(config).await,
+        AirVpnCommand::Info => cmd_info(config),
         AirVpnCommand::Servers { country } => cmd_servers(country),
         AirVpnCommand::Connect {
             server,
             country,
             key,
             backend,
-        } => cmd_connect(server, country, key, &backend).await,
+        } => cmd_connect(server, country, key, backend, config).await,
         AirVpnCommand::Disconnect => cmd_disconnect(),
-        AirVpnCommand::Sessions => cmd_sessions().await,
-        AirVpnCommand::Ports { action } => cmd_ports(action).await,
-        AirVpnCommand::Devices { action } => cmd_devices(action).await,
-        AirVpnCommand::ApiKeys { action } => cmd_api_keys(action).await,
+        AirVpnCommand::Sessions => cmd_sessions(config).await,
+        AirVpnCommand::Ports { action } => cmd_ports(action, config).await,
+        AirVpnCommand::Devices { action } => cmd_devices(action, config).await,
+        AirVpnCommand::ApiKeys { action } => cmd_api_keys(action, config).await,
         AirVpnCommand::Generate {
             server,
             protocol,
@@ -39,13 +39,13 @@ pub async fn dispatch(command: AirVpnCommand) -> anyhow::Result<()> {
             output,
             format,
         } => {
-            cmd_generate(&server, &protocol, device, &entry, &exit, mtu, keepalive, output, &format)
+            cmd_generate(&server, &protocol, device, &entry, &exit, mtu, keepalive, output, &format, config)
                 .await
         }
     }
 }
 
-async fn cmd_login(username: &str) -> anyhow::Result<()> {
+async fn cmd_login(username: &str, config: &AppConfig) -> anyhow::Result<()> {
     let password = rpassword::prompt_password("Password: ")?;
 
     let client = AirVpnClient::new()?;
@@ -63,21 +63,21 @@ async fn cmd_login(username: &str) -> anyhow::Result<()> {
     println!("Fetched {} servers", manifest.servers.len());
 
     // Save session and manifest
-    config::save_session(PROVIDER, &session)?;
+    config::save_session(PROVIDER, &session, config)?;
     save_manifest(&manifest)?;
 
     println!("Logged in as {}", username);
     Ok(())
 }
 
-async fn cmd_logout() -> anyhow::Result<()> {
+async fn cmd_logout(config: &AppConfig) -> anyhow::Result<()> {
     // Disconnect if active
     if wireguard::wg_quick::is_interface_active(INTERFACE_NAME) {
         println!("Disconnecting active VPN connection...");
         disconnect_active()?;
     }
 
-    config::delete_session(PROVIDER)?;
+    config::delete_session(PROVIDER, config)?;
 
     // Also remove manifest
     let manifest_path = config::config_dir(PROVIDER).join(MANIFEST_FILE);
@@ -89,8 +89,8 @@ async fn cmd_logout() -> anyhow::Result<()> {
     Ok(())
 }
 
-fn cmd_info() -> anyhow::Result<()> {
-    let session: AirSession = config::load_session(PROVIDER)?;
+fn cmd_info(config: &AppConfig) -> anyhow::Result<()> {
+    let session: AirSession = config::load_session(PROVIDER, config)?;
     println!("Username:   {}", session.username);
     println!("WG keys:    {}", session.keys.len());
     for key in &session.keys {
@@ -146,7 +146,8 @@ async fn cmd_connect(
     server_name: Option<String>,
     country: Option<String>,
     key_name: Option<String>,
-    backend_arg: &str,
+    backend_arg: Option<String>,
+    config: &AppConfig,
 ) -> anyhow::Result<()> {
     // Check if already connected (any provider)
     if let Some(state) = wireguard::connection::ConnectionState::load()? {
@@ -160,13 +161,19 @@ async fn cmd_connect(
         anyhow::bail!("Already connected. Run `tunmux airvpn disconnect` first.");
     }
 
-    let backend = wireguard::backend::WgBackend::from_str_arg(backend_arg)?;
+    let backend_str = backend_arg.as_deref()
+        .unwrap_or(&config.general.backend);
+    let backend = wireguard::backend::WgBackend::from_str_arg(backend_str)?;
 
-    let session: AirSession = config::load_session(PROVIDER)?;
+    // Apply config defaults -- CLI flags override config
+    let effective_country = country.or_else(|| config.airvpn.default_country.clone());
+    let effective_key = key_name.or_else(|| config.airvpn.default_device.clone());
+
+    let session: AirSession = config::load_session(PROVIDER, config)?;
     let manifest = load_manifest()?;
 
     // Select WireGuard key by name, or use the first one
-    let wg_key = if let Some(ref name) = key_name {
+    let wg_key = if let Some(ref name) = effective_key {
         session
             .keys
             .iter()
@@ -203,7 +210,7 @@ async fn cmd_connect(
             .clone()
     } else {
         // Apply filters
-        if let Some(ref cc) = country {
+        if let Some(ref cc) = effective_country {
             let cc_upper = cc.to_uppercase();
             candidates.retain(|s| s.country_code.eq_ignore_ascii_case(&cc_upper));
         }
@@ -337,8 +344,8 @@ fn disconnect_active() -> anyhow::Result<()> {
     Ok(())
 }
 
-async fn cmd_sessions() -> anyhow::Result<()> {
-    let session: AirSession = config::load_session(PROVIDER)?;
+async fn cmd_sessions(config: &AppConfig) -> anyhow::Result<()> {
+    let session: AirSession = config::load_session(PROVIDER, config)?;
     let web = AirVpnWeb::login_or_restore(&session.username, &session.password).await?;
 
     let (sessions, message) = web.list_sessions().await?;
@@ -433,8 +440,8 @@ fn format_duration(connected_since: i64) -> String {
     }
 }
 
-async fn cmd_ports(action: PortAction) -> anyhow::Result<()> {
-    let session: AirSession = config::load_session(PROVIDER)?;
+async fn cmd_ports(action: PortAction, config: &AppConfig) -> anyhow::Result<()> {
+    let session: AirSession = config::load_session(PROVIDER, config)?;
     let web = AirVpnWeb::login_or_restore(&session.username, &session.password).await?;
 
     let result = match action {
@@ -621,8 +628,8 @@ async fn cmd_ports_set(
     Ok(())
 }
 
-async fn cmd_devices(action: DeviceAction) -> anyhow::Result<()> {
-    let session: AirSession = config::load_session(PROVIDER)?;
+async fn cmd_devices(action: DeviceAction, config: &AppConfig) -> anyhow::Result<()> {
+    let session: AirSession = config::load_session(PROVIDER, config)?;
     let web = AirVpnWeb::login_or_restore(&session.username, &session.password).await?;
 
     let result = match action {
@@ -689,8 +696,8 @@ async fn cmd_devices_delete(web: &AirVpnWeb, device: &str) -> anyhow::Result<()>
     Ok(())
 }
 
-async fn cmd_api_keys(action: ApiKeyAction) -> anyhow::Result<()> {
-    let session: AirSession = config::load_session(PROVIDER)?;
+async fn cmd_api_keys(action: ApiKeyAction, config: &AppConfig) -> anyhow::Result<()> {
+    let session: AirSession = config::load_session(PROVIDER, config)?;
     let web = AirVpnWeb::login_or_restore(&session.username, &session.password).await?;
 
     let result = match action {
@@ -812,8 +819,9 @@ async fn cmd_generate(
     keepalive: u16,
     output: Option<String>,
     format: &str,
+    config: &AppConfig,
 ) -> anyhow::Result<()> {
-    let mut session: AirSession = config::load_session(PROVIDER)?;
+    let mut session: AirSession = config::load_session(PROVIDER, config)?;
     let manifest = load_manifest()?;
 
     // Build protocol values. Default: first WireGuard mode from the manifest.
@@ -863,7 +871,7 @@ async fn cmd_generate(
         ("device", &device_name),
     ];
 
-    let api = AirVpnWebApi::from_session(&mut session).await?;
+    let api = AirVpnWebApi::from_session(&mut session, config).await?;
 
     if multi {
         let default_name = format!("airvpn.{}", format);

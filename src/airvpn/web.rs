@@ -8,7 +8,7 @@ use scraper::{Html, Selector};
 use serde::{Deserialize, Serialize};
 use tracing::debug;
 
-use crate::config::{self, Provider};
+use crate::config::{self, AppConfig, Provider};
 
 use super::models::ForwardedPort;
 
@@ -970,7 +970,7 @@ impl AirVpnWebApi {
 
     /// Build from a stored session, falling back to web provisioning.
     /// Updates the session's api_key field if a new key was provisioned.
-    pub async fn from_session(session: &mut super::models::AirSession) -> anyhow::Result<Self> {
+    pub async fn from_session(session: &mut super::models::AirSession, config: &AppConfig) -> anyhow::Result<Self> {
         // Try stored key first.
         if let Some(ref key) = session.api_key {
             if !key.is_empty() {
@@ -986,7 +986,7 @@ impl AirVpnWebApi {
 
         // Persist the key in the session for next time.
         session.api_key = Some(api.api_key.clone());
-        config::save_session(Provider::AirVpn, session)?;
+        config::save_session(Provider::AirVpn, session, config)?;
 
         Ok(api)
     }
