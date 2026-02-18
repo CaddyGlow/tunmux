@@ -103,12 +103,6 @@ pub fn session_path(provider: Provider) -> PathBuf {
     config_dir(provider).join("session.json")
 }
 
-/// Connection state file (provider-neutral): ~/.config/tunmux/connection.json
-#[must_use]
-pub fn connection_state_path() -> PathBuf {
-    app_config_dir().join("connection.json")
-}
-
 /// Connections directory: ~/.config/tunmux/connections/
 #[must_use]
 pub fn connections_dir() -> PathBuf {

@@ -178,7 +178,7 @@ async fn handle_plain(
 }
 
 /// Parse an absolute URI (http://host/path) into (host, path).
-fn parse_absolute_uri(uri: &str) -> anyhow::Result<(String, String)> {
+pub(crate) fn parse_absolute_uri(uri: &str) -> anyhow::Result<(String, String)> {
     let without_scheme = uri
         .strip_prefix("http://")
         .or_else(|| uri.strip_prefix("https://"))
@@ -193,4 +193,178 @@ fn parse_absolute_uri(uri: &str) -> anyhow::Result<(String, String)> {
     };
 
     Ok((host, path))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+
+    #[test]
+    fn test_parse_absolute_uri_with_path() {
+        let (host, path) = parse_absolute_uri("http://example.com/foo/bar").unwrap();
+        assert_eq!(host, "example.com");
+        assert_eq!(path, "/foo/bar");
+    }
+
+    #[test]
+    fn test_parse_absolute_uri_with_port() {
+        let (host, path) = parse_absolute_uri("http://example.com:8080/path").unwrap();
+        assert_eq!(host, "example.com:8080");
+        assert_eq!(path, "/path");
+    }
+
+    #[test]
+    fn test_parse_absolute_uri_no_path() {
+        let (host, path) = parse_absolute_uri("http://example.com").unwrap();
+        assert_eq!(host, "example.com");
+        assert_eq!(path, "/");
+    }
+
+    #[test]
+    fn test_parse_absolute_uri_no_scheme() {
+        let (host, path) = parse_absolute_uri("example.com/foo").unwrap();
+        assert_eq!(host, "example.com");
+        assert_eq!(path, "/foo");
+    }
+
+    /// TCP echo server. Returns the port.
+    async fn echo_server() -> u16 {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            while let Ok((mut stream, _)) = listener.accept().await {
+                tokio::spawn(async move {
+                    let mut buf = vec![0u8; 4096];
+                    loop {
+                        let n = match stream.read(&mut buf).await {
+                            Ok(0) | Err(_) => break,
+                            Ok(n) => n,
+                        };
+                        if stream.write_all(&buf[..n]).await.is_err() {
+                            break;
+                        }
+                    }
+                });
+            }
+        });
+        port
+    }
+
+    /// Minimal HTTP server that returns a fixed response. Returns the port.
+    async fn http_server(body: &'static str) -> u16 {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            while let Ok((mut stream, _)) = listener.accept().await {
+                tokio::spawn(async move {
+                    // Read until empty line (end of headers)
+                    let mut buf = vec![0u8; 4096];
+                    let mut total = Vec::new();
+                    loop {
+                        let n = match stream.read(&mut buf).await {
+                            Ok(0) | Err(_) => break,
+                            Ok(n) => n,
+                        };
+                        total.extend_from_slice(&buf[..n]);
+                        if total.windows(4).any(|w| w == b"\r\n\r\n") {
+                            break;
+                        }
+                    }
+                    let response = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        body.len(),
+                        body,
+                    );
+                    let _ = stream.write_all(response.as_bytes()).await;
+                    let _ = stream.shutdown().await;
+                });
+            }
+        });
+        port
+    }
+
+    #[tokio::test]
+    async fn test_http_connect_tunnel() {
+        let echo_port = echo_server().await;
+
+        let proxy_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy_addr = proxy_listener.local_addr().unwrap();
+
+        tokio::spawn(async move {
+            let (stream, _) = proxy_listener.accept().await.unwrap();
+            let _ = handle_http(stream).await;
+        });
+
+        let mut client = TcpStream::connect(proxy_addr).await.unwrap();
+
+        // Send CONNECT request
+        let request = format!(
+            "CONNECT 127.0.0.1:{} HTTP/1.1\r\nHost: 127.0.0.1:{}\r\n\r\n",
+            echo_port, echo_port
+        );
+        client.write_all(request.as_bytes()).await.unwrap();
+
+        // Read 200 response
+        let mut resp_buf = vec![0u8; 256];
+        let n = client.read(&mut resp_buf).await.unwrap();
+        let resp = String::from_utf8_lossy(&resp_buf[..n]);
+        assert!(resp.starts_with("HTTP/1.1 200"), "expected 200, got: {}", resp);
+
+        // Tunnel is established -- echo test
+        client.write_all(b"tunnel data").await.unwrap();
+        let mut buf = [0u8; 11];
+        client.read_exact(&mut buf).await.unwrap();
+        assert_eq!(&buf, b"tunnel data");
+    }
+
+    #[tokio::test]
+    async fn test_http_connect_unreachable() {
+        let proxy_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy_addr = proxy_listener.local_addr().unwrap();
+
+        tokio::spawn(async move {
+            let (stream, _) = proxy_listener.accept().await.unwrap();
+            let _ = handle_http(stream).await;
+        });
+
+        let mut client = TcpStream::connect(proxy_addr).await.unwrap();
+
+        let request = "CONNECT 127.0.0.1:1 HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n";
+        client.write_all(request.as_bytes()).await.unwrap();
+
+        let mut resp_buf = vec![0u8; 256];
+        let n = client.read(&mut resp_buf).await.unwrap();
+        let resp = String::from_utf8_lossy(&resp_buf[..n]);
+        assert!(resp.starts_with("HTTP/1.1 502"), "expected 502, got: {}", resp);
+    }
+
+    #[tokio::test]
+    async fn test_http_plain_get() {
+        let http_port = http_server("hello from server").await;
+
+        let proxy_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy_addr = proxy_listener.local_addr().unwrap();
+
+        tokio::spawn(async move {
+            let (stream, _) = proxy_listener.accept().await.unwrap();
+            let _ = handle_http(stream).await;
+        });
+
+        let mut client = TcpStream::connect(proxy_addr).await.unwrap();
+
+        let request = format!(
+            "GET http://127.0.0.1:{}/test HTTP/1.1\r\nHost: 127.0.0.1:{}\r\n\r\n",
+            http_port, http_port
+        );
+        client.write_all(request.as_bytes()).await.unwrap();
+
+        // Read full response
+        let mut resp = Vec::new();
+        client.read_to_end(&mut resp).await.unwrap();
+        let resp_str = String::from_utf8_lossy(&resp);
+        assert!(resp_str.contains("200 OK"), "expected 200, got: {}", resp_str);
+        assert!(resp_str.contains("hello from server"), "body missing: {}", resp_str);
+    }
 }

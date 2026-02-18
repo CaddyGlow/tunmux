@@ -43,7 +43,6 @@ impl ConnectionState {
 
     /// Load a specific instance.
     pub fn load(instance: &str) -> Result<Option<Self>> {
-        migrate_legacy_state()?;
         let path = config::connections_dir().join(format!("{}.json", instance));
         if !path.exists() {
             return Ok(None);
@@ -55,7 +54,6 @@ impl ConnectionState {
 
     /// Load all active connections.
     pub fn load_all() -> Result<Vec<Self>> {
-        migrate_legacy_state()?;
         let dir = config::connections_dir();
         if !dir.exists() {
             return Ok(Vec::new());
@@ -94,50 +92,4 @@ impl ConnectionState {
             .join(format!("{}.json", instance))
             .exists()
     }
-}
-
-/// Migrate legacy single connection.json to connections/ directory.
-fn migrate_legacy_state() -> Result<()> {
-    let legacy = config::connection_state_path();
-    let new_dir = config::connections_dir();
-    if legacy.exists() && !new_dir.exists() {
-        config::ensure_connections_dir()?;
-
-        let json = fs::read_to_string(&legacy)?;
-        // Try to parse as old format (no instance_name field) and add it
-        if let Ok(mut value) = serde_json::from_str::<serde_json::Value>(&json) {
-            if let Some(obj) = value.as_object_mut() {
-                if !obj.contains_key("instance_name") {
-                    obj.insert(
-                        "instance_name".to_string(),
-                        serde_json::Value::String(DIRECT_INSTANCE.to_string()),
-                    );
-                }
-                if !obj.contains_key("server_display_name") {
-                    let display = obj
-                        .get("server_endpoint")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("")
-                        .to_string();
-                    obj.insert(
-                        "server_display_name".to_string(),
-                        serde_json::Value::String(display),
-                    );
-                }
-                // Ensure new optional fields exist
-                for key in ["namespace_name", "proxy_pid", "socks_port", "http_port"] {
-                    if !obj.contains_key(key) {
-                        obj.insert(key.to_string(), serde_json::Value::Null);
-                    }
-                }
-            }
-            let migrated = serde_json::to_string_pretty(&value)?;
-            let dest = new_dir.join(format!("{}.json", DIRECT_INSTANCE));
-            fs::write(&dest, &migrated)?;
-            fs::set_permissions(&dest, fs::Permissions::from_mode(0o600))?;
-            fs::remove_file(&legacy)?;
-            info!("Migrated connection.json to connections/{}.json", DIRECT_INSTANCE);
-        }
-    }
-    Ok(())
 }

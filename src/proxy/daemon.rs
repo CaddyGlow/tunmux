@@ -1,6 +1,7 @@
 use std::fs;
 use std::net::TcpListener;
 use std::os::unix::fs::PermissionsExt;
+use std::sync::Arc;
 
 use tracing::info;
 
@@ -30,6 +31,10 @@ pub fn run(
         anyhow::bail!("failed to bind SOCKS5 on port {} (neither IPv4 nor IPv6)", socks_port);
     }
 
+    // UDP relay sockets for SOCKS5 UDP ASSOCIATE (same port as TCP -- no conflict)
+    let udp_socks4 = std::net::UdpSocket::bind(format!("127.0.0.1:{}", socks_port)).ok();
+    let udp_socks6 = std::net::UdpSocket::bind(format!("[::1]:{}", socks_port)).ok();
+
     let http4 = TcpListener::bind(format!("127.0.0.1:{}", http_port)).ok();
     let http6 = TcpListener::bind(format!("[::1]:{}", http_port)).ok();
     if http4.is_none() && http6.is_none() {
@@ -38,6 +43,9 @@ pub fn run(
 
     for listener in [&socks4, &socks6, &http4, &http6].into_iter().flatten() {
         listener.set_nonblocking(true)?;
+    }
+    for socket in [&udp_socks4, &udp_socks6].into_iter().flatten() {
+        socket.set_nonblocking(true)?;
     }
 
     // 2. Daemonize: double-fork + setsid
@@ -64,6 +72,8 @@ pub fn run(
     let mut bound = Vec::new();
     if socks4.is_some() { bound.push(format!("socks5=127.0.0.1:{}", socks_port)); }
     if socks6.is_some() { bound.push(format!("socks5=[::1]:{}", socks_port)); }
+    if udp_socks4.is_some() { bound.push(format!("socks5-udp=127.0.0.1:{}", socks_port)); }
+    if udp_socks6.is_some() { bound.push(format!("socks5-udp=[::1]:{}", socks_port)); }
     if http4.is_some() { bound.push(format!("http=127.0.0.1:{}", http_port)); }
     if http6.is_some() { bound.push(format!("http=[::1]:{}", http_port)); }
     info!(
@@ -108,15 +118,52 @@ pub fn run(
             None => None,
         };
 
+        // Convert UDP relay sockets to async + Arc
+        let udp_relay4: Option<(Arc<tokio::net::UdpSocket>, std::net::SocketAddr)> =
+            match udp_socks4 {
+                Some(s) => {
+                    let addr = s.local_addr()?;
+                    Some((Arc::new(tokio::net::UdpSocket::from_std(s)?), addr))
+                }
+                None => None,
+            };
+        let udp_relay6: Option<(Arc<tokio::net::UdpSocket>, std::net::SocketAddr)> =
+            match udp_socks6 {
+                Some(s) => {
+                    let addr = s.local_addr()?;
+                    Some((Arc::new(tokio::net::UdpSocket::from_std(s)?), addr))
+                }
+                None => None,
+            };
+
+        // Shared UDP association map across all relay tasks and SOCKS5 handlers
+        let associations = Arc::new(socks5::UdpAssociations::new());
+
+        // Spawn UDP inbound relay tasks
+        if let Some((ref socket, _)) = udp_relay4 {
+            tokio::spawn(socks5::run_udp_relay(socket.clone(), associations.clone()));
+        }
+        if let Some((ref socket, _)) = udp_relay6 {
+            tokio::spawn(socks5::run_udp_relay(socket.clone(), associations.clone()));
+        }
+
         info!("Accepting connections...");
 
         loop {
             tokio::select! {
                 result = accept_opt(&socks4) => {
-                    handle_accept(result, "SOCKS5", socks5::handle_socks5);
+                    let assoc = associations.clone();
+                    let relay = udp_relay4.clone();
+                    handle_accept(result, "SOCKS5", move |stream| {
+                        socks5::handle_socks5(stream, assoc, relay)
+                    });
                 }
                 result = accept_opt(&socks6) => {
-                    handle_accept(result, "SOCKS5", socks5::handle_socks5);
+                    let assoc = associations.clone();
+                    let relay = udp_relay6.clone();
+                    handle_accept(result, "SOCKS5", move |stream| {
+                        socks5::handle_socks5(stream, assoc, relay)
+                    });
                 }
                 result = accept_opt(&http4) => {
                     handle_accept(result, "HTTP", http::handle_http);
