@@ -6,17 +6,29 @@ management.
 
 ## Features
 
+### Proxy mode (network namespace isolation)
+
+Connect to multiple VPN exits simultaneously without routing all host traffic
+through the VPN. Each `--proxy` connection creates:
+
+- A dedicated Linux network namespace with its own WireGuard interface
+- A SOCKS5 and HTTP proxy on localhost that routes traffic through that namespace
+- Full isolation: only applications using the proxy go through the VPN
+
+Multiple proxy instances can run side-by-side, each with a different exit
+location and its own port pair. Host traffic is unaffected.
+
 ### Proton VPN
 - SRP authentication with 2FA (TOTP)
 - Ed25519/X25519 key generation and VPN certificate provisioning
 - Server listing with filters (country, free tier, P2P)
-- WireGuard connect/disconnect
+- WireGuard connect/disconnect (direct or proxy mode)
 
 ### AirVPN
 - Encrypted XML API authentication
 - Web session management (cookie-based, with session reuse)
 - Server listing from cached manifest
-- WireGuard connect/disconnect with key selection
+- WireGuard connect/disconnect with key selection (direct or proxy mode)
 - Port forwarding management (add, remove, edit, check reachability, DDNS)
 - Device (WireGuard key) management (add, rename, delete)
 - API key management (add, rename, delete)
@@ -26,14 +38,15 @@ management.
 ### WireGuard
 - Two backends: wg-quick (default) and kernel (ip/wg commands)
 - Auto-detection: uses wg-quick when available, falls back to kernel
-- Connection state tracking across providers (prevents dual connections)
+- Connection state tracking across providers
 - Kernel backend handles routing, DNS, and clean teardown
+- Namespace-aware kernel backend for proxy mode (no host route changes)
 
 ## Requirements
 
 - Rust 2021 edition (latest stable)
-- Linux (uses ip/wg-quick commands)
-- sudo access for WireGuard operations
+- Linux (uses ip/wg-quick commands and network namespaces)
+- sudo access for WireGuard and namespace operations
 
 ## Build
 
@@ -42,7 +55,14 @@ management.
 
 ## Usage
 
-    tunmux <provider> <command>
+    tunmux <command>
+
+### Status
+
+    tunmux status
+
+Shows all active connections with instance names, providers, servers, backends,
+and proxy ports.
 
 ### Proton VPN
 
@@ -53,6 +73,28 @@ management.
     tunmux proton connect US#1
     tunmux proton disconnect
     tunmux proton logout
+
+#### Proxy mode
+
+    # First proxy instance (auto-assigns ports 1080/8118)
+    tunmux proton connect --proxy --country US
+
+    # Second proxy instance (auto-assigns ports 1081/8119)
+    tunmux proton connect --proxy --country CH
+
+    # Explicit ports
+    tunmux proton connect --proxy --country JP --socks-port 9050 --http-port 3128
+
+    # Use the proxy
+    curl --socks5 127.0.0.1:1080 https://api.ipify.org    # US exit
+    curl --socks5 127.0.0.1:1081 https://api.ipify.org    # CH exit
+    curl https://api.ipify.org                              # real IP (no proxy)
+
+    # Disconnect one instance
+    tunmux proton disconnect us-1
+
+    # Disconnect all proton connections
+    tunmux proton disconnect --all
 
 ### AirVPN
 
@@ -79,6 +121,72 @@ management.
     tunmux airvpn api delete "old-key"
     tunmux airvpn generate -s nl -s be -p wg-1637 -o config.conf
     tunmux airvpn logout
+
+#### Proxy mode
+
+    tunmux airvpn connect --proxy --country IT
+    tunmux airvpn connect --proxy Castor --socks-port 9060 --http-port 3129
+    tunmux airvpn disconnect castor
+    tunmux airvpn disconnect --all
+
+### Multi-instance disconnect
+
+When multiple connections are active for a provider, `disconnect` without
+arguments lists them:
+
+    $ tunmux proton disconnect
+    Multiple active connections. Specify which to disconnect:
+
+      us-1  US#1  SOCKS5 :1080, HTTP :8118
+      ch-3  CH#3  SOCKS5 :1081, HTTP :8119
+
+    Usage: tunmux proton disconnect <instance>
+           tunmux proton disconnect --all
+
+## Architecture
+
+### Proxy mode
+
+```
+Host namespace             Namespace: tunmux_us-1         Namespace: tunmux_ch-3
++------------------+      +---------------------+       +---------------------+
+| App A            |      | wg-us-1 interface   |       | wg-ch-3 interface   |
+|  socks5 :1080 ---|----->| US VPN exit         |       | CH VPN exit         |
+|                  |      +---------------------+       +---------------------+
+| App B            |             ^                             ^
+|  socks5 :1081 ---|-------------|-----------------------------+
+|                  |
+| Normal traffic   |
+|  (no proxy)      |--- direct internet (no VPN) --->
++------------------+
+```
+
+Each proxy daemon binds listeners on the host, then calls `setns()` to enter
+its VPN namespace. All outbound connections from the daemon route through that
+namespace's WireGuard tunnel. A single-threaded tokio runtime ensures all I/O
+stays on the thread that entered the namespace.
+
+### Instance naming
+
+Auto-derived from the server name:
+- Proton `US#1` -> instance `us-1`, interface `wg-us-1`, namespace `tunmux_us-1`
+- AirVPN `Castor` -> instance `castor`, interface `wg-castor`, namespace `tunmux_castor`
+
+### Port assignment
+
+- First instance: SOCKS5 `1080`, HTTP `8118`
+- Subsequent instances auto-increment: `1081`/`8119`, `1082`/`8120`, etc.
+- Override with `--socks-port` / `--http-port`
+
+### Direct mode
+
+Traditional all-traffic VPN (the default, without `--proxy`). Captures all host
+traffic through the WireGuard tunnel. Only one direct connection can be active
+at a time. Stored as the `_direct` instance.
+
+Direct and proxy connections can coexist: a direct connection routes all host
+traffic through one VPN, while proxy instances provide opt-in access to
+additional exits.
 
 ## Configuration
 
@@ -116,7 +224,11 @@ Session and connection state stored in `~/.config/tunmux/`:
 
     ~/.config/tunmux/
       config.toml              # user preferences (optional)
-      connection.json          # active connection state (provider-neutral)
+      connections/             # multi-instance connection state
+        us-1.json              # proxy instance state
+        us-1.pid               # proxy daemon PID
+        us-1.log               # proxy daemon log
+        _direct.json           # direct (non-proxy) connection state
       proton/
         session.json           # Proton VPN credentials and keys
       airvpn/

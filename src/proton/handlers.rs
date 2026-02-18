@@ -4,6 +4,8 @@ use crate::config::{self, AppConfig, Provider};
 use crate::crypto;
 use crate::error;
 use crate::models;
+use crate::netns;
+use crate::proxy;
 use crate::wireguard;
 
 const PROVIDER: Provider = Provider::Proton;
@@ -20,8 +22,11 @@ pub async fn dispatch(command: ProtonCommand, config: &AppConfig) -> anyhow::Res
             country,
             p2p,
             backend,
-        } => cmd_connect(server, country, p2p, backend, config).await,
-        ProtonCommand::Disconnect => cmd_disconnect(),
+            proxy,
+            socks_port,
+            http_port,
+        } => cmd_connect(server, country, p2p, backend, proxy, socks_port, http_port, config).await,
+        ProtonCommand::Disconnect { instance, all } => cmd_disconnect(instance, all),
     }
 }
 
@@ -76,7 +81,7 @@ async fn cmd_logout(config: &AppConfig) -> anyhow::Result<()> {
     // Disconnect if active
     if wireguard::wg_quick::is_interface_active(INTERFACE_NAME) {
         println!("Disconnecting active VPN connection...");
-        disconnect_active()?;
+        disconnect_instance_direct()?;
     }
 
     config::delete_session(PROVIDER, config)?;
@@ -146,28 +151,32 @@ async fn cmd_servers(country: Option<String>, free: bool, config: &AppConfig) ->
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn cmd_connect(
     server_name: Option<String>,
     country: Option<String>,
     p2p: bool,
     backend_arg: Option<String>,
+    use_proxy: bool,
+    socks_port_arg: Option<u16>,
+    http_port_arg: Option<u16>,
     config: &AppConfig,
 ) -> anyhow::Result<()> {
-    // Check if already connected (any provider)
-    if let Some(state) = wireguard::connection::ConnectionState::load()? {
-        anyhow::bail!(
-            "Already connected via {} ({}). Disconnect first.",
-            state.provider,
-            state.interface_name
-        );
-    }
-    if wireguard::wg_quick::is_interface_active(INTERFACE_NAME) {
-        anyhow::bail!("Already connected. Run `tunmux proton disconnect` first.");
-    }
-
     let backend_str = backend_arg.as_deref()
         .unwrap_or(&config.general.backend);
-    let backend = wireguard::backend::WgBackend::from_str_arg(backend_str)?;
+
+    if use_proxy {
+        // Proxy mode requires kernel backend
+        if backend_str == "wg-quick" {
+            anyhow::bail!("--proxy requires kernel backend (incompatible with --backend wg-quick)");
+        }
+    }
+
+    let backend = if use_proxy {
+        wireguard::backend::WgBackend::Kernel
+    } else {
+        wireguard::backend::WgBackend::from_str_arg(backend_str)?
+    };
 
     // Apply config defaults -- CLI flags override config
     let effective_country = country.or_else(|| config.proton.default_country.clone());
@@ -213,8 +222,6 @@ async fn cmd_connect(
         .best_physical()
         .ok_or(error::AppError::NoServerFound)?;
 
-    println!("Connecting to {} ({})...", server.name, physical.entry_ip);
-
     // Restore keys from session
     let keys = crypto::keys::VpnKeys::from_base64(&session.ed25519_private_key)?;
 
@@ -235,25 +242,147 @@ async fn cmd_connect(
         allowed_ips: "0.0.0.0/0, ::/0",
     };
 
+    if use_proxy {
+        connect_proxy(
+            server,
+            &params,
+            socks_port_arg,
+            http_port_arg,
+        )?;
+    } else {
+        connect_direct(server, &params, backend, config)?;
+    }
+
+    Ok(())
+}
+
+fn connect_proxy(
+    server: &models::server::LogicalServer,
+    params: &wireguard::config::WgConfigParams<'_>,
+    socks_port_arg: Option<u16>,
+    http_port_arg: Option<u16>,
+) -> anyhow::Result<()> {
+    let instance = proxy::instance_name(&server.name);
+
+    // Check for duplicate instance
+    if wireguard::connection::ConnectionState::exists(&instance) {
+        anyhow::bail!(
+            "instance {:?} already exists (server {} already connected). Disconnect first or pick a different server.",
+            instance,
+            server.name
+        );
+    }
+
+    let interface_name = format!("wg-{}", instance);
+    let namespace_name = format!("tunmux_{}", instance);
+
+    // Determine ports
+    let proxy_config = if let (Some(sp), Some(hp)) = (socks_port_arg, http_port_arg) {
+        proxy::ProxyConfig {
+            socks_port: sp,
+            http_port: hp,
+        }
+    } else {
+        let mut auto = proxy::next_available_ports()?;
+        if let Some(sp) = socks_port_arg {
+            auto.socks_port = sp;
+        }
+        if let Some(hp) = http_port_arg {
+            auto.http_port = hp;
+        }
+        auto
+    };
+
+    println!("Connecting to {} ({})...", server.name, params.server_ip);
+
+    // Create namespace
+    netns::create(&namespace_name)?;
+
+    // Bring up WireGuard in namespace
+    if let Err(e) = wireguard::kernel::up_in_netns(params, &interface_name, &namespace_name) {
+        netns::delete(&namespace_name)?;
+        return Err(e.into());
+    }
+
+    // Spawn proxy daemon
+    let pid = match proxy::spawn_daemon(&instance, &namespace_name, &proxy_config) {
+        Ok(pid) => pid,
+        Err(e) => {
+            // Clean up on failure
+            netns::delete(&namespace_name)?;
+            return Err(e);
+        }
+    };
+
+    // Save connection state
+    let state = wireguard::connection::ConnectionState {
+        instance_name: instance.clone(),
+        provider: PROVIDER.dir_name().to_string(),
+        interface_name,
+        backend: wireguard::backend::WgBackend::Kernel,
+        server_endpoint: format!("{}:{}", params.server_ip, params.server_port),
+        server_display_name: server.name.clone(),
+        original_gateway_ip: None,
+        original_gateway_iface: None,
+        original_resolv_conf: None,
+        namespace_name: Some(namespace_name),
+        proxy_pid: Some(pid),
+        socks_port: Some(proxy_config.socks_port),
+        http_port: Some(proxy_config.http_port),
+    };
+    state.save()?;
+
+    println!(
+        "Connected {} ({}) -- SOCKS5 127.0.0.1:{}, HTTP 127.0.0.1:{}",
+        instance, server.name, proxy_config.socks_port, proxy_config.http_port
+    );
+    Ok(())
+}
+
+fn connect_direct(
+    server: &models::server::LogicalServer,
+    params: &wireguard::config::WgConfigParams<'_>,
+    backend: wireguard::backend::WgBackend,
+    _config: &AppConfig,
+) -> anyhow::Result<()> {
+    use wireguard::connection::DIRECT_INSTANCE;
+
+    // Check if a direct connection already exists
+    if wireguard::connection::ConnectionState::exists(DIRECT_INSTANCE) {
+        anyhow::bail!(
+            "Already connected via direct VPN. Disconnect first."
+        );
+    }
+    if wireguard::wg_quick::is_interface_active(INTERFACE_NAME) {
+        anyhow::bail!("Already connected. Run `tunmux proton disconnect` first.");
+    }
+
+    println!("Connecting to {} ({})...", server.name, params.server_ip);
+
     match backend {
         wireguard::backend::WgBackend::WgQuick => {
-            let wg_config = wireguard::config::generate_config(&params);
+            let wg_config = wireguard::config::generate_config(params);
             wireguard::wg_quick::up(&wg_config, INTERFACE_NAME, PROVIDER)?;
 
-            // Save connection state so disconnect knows which backend was used
             let state = wireguard::connection::ConnectionState {
+                instance_name: DIRECT_INSTANCE.to_string(),
                 provider: PROVIDER.dir_name().to_string(),
                 interface_name: INTERFACE_NAME.to_string(),
                 backend,
                 server_endpoint: format!("{}:{}", params.server_ip, params.server_port),
+                server_display_name: server.name.clone(),
                 original_gateway_ip: None,
                 original_gateway_iface: None,
                 original_resolv_conf: None,
+                namespace_name: None,
+                proxy_pid: None,
+                socks_port: None,
+                http_port: None,
             };
             state.save()?;
         }
         wireguard::backend::WgBackend::Kernel => {
-            wireguard::kernel::up(&params, INTERFACE_NAME, PROVIDER.dir_name())?;
+            wireguard::kernel::up(params, INTERFACE_NAME, PROVIDER.dir_name(), &server.name)?;
         }
     }
 
@@ -264,33 +393,120 @@ async fn cmd_connect(
     Ok(())
 }
 
-fn cmd_disconnect() -> anyhow::Result<()> {
-    if !wireguard::wg_quick::is_interface_active(INTERFACE_NAME) {
-        println!("Not connected.");
+fn cmd_disconnect(instance: Option<String>, all: bool) -> anyhow::Result<()> {
+    let provider_name = PROVIDER.dir_name();
+
+    if all {
+        let connections = wireguard::connection::ConnectionState::load_all()?;
+        let mine: Vec<_> = connections
+            .into_iter()
+            .filter(|c| c.provider == provider_name)
+            .collect();
+        if mine.is_empty() {
+            println!("No active proton connections.");
+            return Ok(());
+        }
+        for conn in mine {
+            disconnect_one(&conn)?;
+            println!("Disconnected {}", conn.instance_name);
+        }
         return Ok(());
     }
 
-    disconnect_active()?;
-    println!("Disconnected");
+    if let Some(ref name) = instance {
+        let conn = wireguard::connection::ConnectionState::load(name)?
+            .ok_or_else(|| anyhow::anyhow!("no connection with instance {:?}", name))?;
+        if conn.provider != provider_name {
+            anyhow::bail!("instance {:?} belongs to provider {:?}, not proton", name, conn.provider);
+        }
+        disconnect_one(&conn)?;
+        println!("Disconnected {}", name);
+        return Ok(());
+    }
+
+    // No instance specified -- find sole connection for this provider
+    let connections = wireguard::connection::ConnectionState::load_all()?;
+    let mine: Vec<_> = connections
+        .into_iter()
+        .filter(|c| c.provider == provider_name)
+        .collect();
+
+    match mine.len() {
+        0 => {
+            println!("Not connected.");
+        }
+        1 => {
+            let conn = &mine[0];
+            disconnect_one(conn)?;
+            println!("Disconnected {}", conn.instance_name);
+        }
+        _ => {
+            println!("Multiple active connections. Specify which to disconnect:\n");
+            for conn in &mine {
+                let ports = match (conn.socks_port, conn.http_port) {
+                    (Some(s), Some(h)) => format!("SOCKS5 :{}, HTTP :{}", s, h),
+                    _ => "-".to_string(),
+                };
+                println!("  {}  {}  {}", conn.instance_name, conn.server_display_name, ports);
+            }
+            println!("\nUsage: tunmux proton disconnect <instance>");
+            println!("       tunmux proton disconnect --all");
+        }
+    }
+
     Ok(())
 }
 
-/// Tear down the active VPN, dispatching to the correct backend.
-fn disconnect_active() -> anyhow::Result<()> {
-    match wireguard::connection::ConnectionState::load()? {
-        Some(state) => match state.backend {
+fn disconnect_one(state: &wireguard::connection::ConnectionState) -> anyhow::Result<()> {
+    // Stop proxy daemon if running
+    if let Some(pid) = state.proxy_pid {
+        proxy::stop_daemon(pid)?;
+    }
+
+    // Clean up proxy pid/log files
+    let pid_path = proxy::pid_file(&state.instance_name);
+    let log_path = proxy::log_file(&state.instance_name);
+    let _ = std::fs::remove_file(&pid_path);
+    let _ = std::fs::remove_file(&log_path);
+
+    // Delete namespace if set
+    if let Some(ref ns) = state.namespace_name {
+        netns::delete(ns)?;
+        // Remove /etc/netns/<ns>/ directory
+        let netns_etc = format!("/etc/netns/{}", ns);
+        if std::path::Path::new(&netns_etc).exists() {
+            let _ = std::process::Command::new("sudo")
+                .args(["rm", "-rf", &netns_etc])
+                .output();
+        }
+    }
+
+    // Tear down WireGuard
+    if state.namespace_name.is_some() {
+        // Proxy mode: namespace deletion already removed the interface
+        // Just remove state file
+        wireguard::connection::ConnectionState::remove(&state.instance_name)?;
+    } else {
+        // Direct mode: use the appropriate backend teardown
+        match state.backend {
             wireguard::backend::WgBackend::Kernel => {
-                wireguard::kernel::down(&state)?;
+                wireguard::kernel::down(state)?;
             }
             wireguard::backend::WgBackend::WgQuick => {
-                wireguard::wg_quick::down(INTERFACE_NAME, PROVIDER)?;
-                wireguard::connection::ConnectionState::remove()?;
+                wireguard::wg_quick::down(&state.interface_name, PROVIDER)?;
+                wireguard::connection::ConnectionState::remove(&state.instance_name)?;
             }
-        },
-        // No state file -- fall back to wg-quick (legacy connections)
-        None => {
-            wireguard::wg_quick::down(INTERFACE_NAME, PROVIDER)?;
         }
+    }
+
+    Ok(())
+}
+
+/// Legacy helper for logout -- disconnects any direct connection.
+fn disconnect_instance_direct() -> anyhow::Result<()> {
+    use wireguard::connection::DIRECT_INSTANCE;
+    if let Some(state) = wireguard::connection::ConnectionState::load(DIRECT_INSTANCE)? {
+        disconnect_one(&state)?;
     }
     Ok(())
 }

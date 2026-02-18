@@ -64,5 +64,8 @@ rpassword = "7"
 thiserror = "2"
 anyhow = "1"
 
+# Linux namespaces
+nix = { version = "0.29", features = ["sched", "net", "fs", "signal", "process"] }
+
 # Keyring (optional)
 keyring = { version = "3", optional = true }

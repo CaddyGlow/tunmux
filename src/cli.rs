@@ -4,7 +4,7 @@ use clap::{Parser, Subcommand};
 #[command(name = "tunmux", about = "Multi-provider VPN CLI", version)]
 pub struct Cli {
     #[command(subcommand)]
-    pub provider: ProviderCommand,
+    pub command: TopCommand,
 
     /// Enable verbose logging
     #[arg(short, long, global = true)]
@@ -12,7 +12,7 @@ pub struct Cli {
 }
 
 #[derive(Subcommand)]
-pub enum ProviderCommand {
+pub enum TopCommand {
     /// Proton VPN commands
     Proton {
         #[command(subcommand)]
@@ -23,6 +23,24 @@ pub enum ProviderCommand {
     Airvpn {
         #[command(subcommand)]
         command: AirVpnCommand,
+    },
+
+    /// Show active VPN connections and proxy instances
+    Status,
+
+    /// Internal: proxy daemon process (hidden)
+    #[command(hide = true)]
+    ProxyDaemon {
+        #[arg(long)]
+        netns: String,
+        #[arg(long)]
+        socks_port: u16,
+        #[arg(long)]
+        http_port: u16,
+        #[arg(long)]
+        pid_file: String,
+        #[arg(long)]
+        log_file: String,
     },
 }
 
@@ -67,10 +85,30 @@ pub enum ProtonCommand {
         /// WireGuard backend: auto, wg-quick, kernel
         #[arg(long)]
         backend: Option<String>,
+
+        /// Start a SOCKS5/HTTP proxy (VPN traffic isolated in network namespace)
+        #[arg(long)]
+        proxy: bool,
+
+        /// SOCKS5 proxy port (default: auto-assign from 1080)
+        #[arg(long)]
+        socks_port: Option<u16>,
+
+        /// HTTP proxy port (default: auto-assign from 8118)
+        #[arg(long)]
+        http_port: Option<u16>,
     },
 
     /// Disconnect from VPN
-    Disconnect,
+    Disconnect {
+        /// Instance name to disconnect (from `tunmux status`). If omitted,
+        /// disconnects the sole active connection or lists choices.
+        instance: Option<String>,
+
+        /// Disconnect all active connections for this provider
+        #[arg(long)]
+        all: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -110,10 +148,30 @@ pub enum AirVpnCommand {
         /// WireGuard backend: auto, wg-quick, kernel
         #[arg(long)]
         backend: Option<String>,
+
+        /// Start a SOCKS5/HTTP proxy (VPN traffic isolated in network namespace)
+        #[arg(long)]
+        proxy: bool,
+
+        /// SOCKS5 proxy port (default: auto-assign from 1080)
+        #[arg(long)]
+        socks_port: Option<u16>,
+
+        /// HTTP proxy port (default: auto-assign from 8118)
+        #[arg(long)]
+        http_port: Option<u16>,
     },
 
     /// Disconnect from VPN
-    Disconnect,
+    Disconnect {
+        /// Instance name to disconnect (from `tunmux status`). If omitted,
+        /// disconnects the sole active connection or lists choices.
+        instance: Option<String>,
+
+        /// Disconnect all active connections for this provider
+        #[arg(long)]
+        all: bool,
+    },
 
     /// Show active VPN sessions
     Sessions,

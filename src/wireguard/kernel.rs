@@ -5,34 +5,101 @@ use std::process::{Command, Stdio};
 use tracing::info;
 
 use crate::error::{AppError, Result};
+use crate::netns;
 
 use super::backend::WgBackend;
 use super::config::WgConfigParams;
-use super::connection::ConnectionState;
+use super::connection::{ConnectionState, DIRECT_INSTANCE};
 
-/// Bring up a WireGuard tunnel using kernel ip/wg commands.
-pub fn up(params: &WgConfigParams<'_>, interface_name: &str, provider: &str) -> Result<()> {
+/// Bring up a WireGuard tunnel using kernel ip/wg commands (host routing).
+pub fn up(params: &WgConfigParams<'_>, interface_name: &str, provider: &str, server_display_name: &str) -> Result<()> {
     let (gw_ip, gw_iface) = get_default_gateway()?;
     let original_resolv = fs::read_to_string("/etc/resolv.conf").ok();
 
     let state = ConnectionState {
+        instance_name: DIRECT_INSTANCE.to_string(),
         provider: provider.to_string(),
         interface_name: interface_name.to_string(),
         backend: WgBackend::Kernel,
         server_endpoint: format!("{}:{}", params.server_ip, params.server_port),
+        server_display_name: server_display_name.to_string(),
         original_gateway_ip: Some(gw_ip.clone()),
         original_gateway_iface: Some(gw_iface.clone()),
         original_resolv_conf: original_resolv,
+        namespace_name: None,
+        proxy_pid: None,
+        socks_port: None,
+        http_port: None,
     };
     state.save()?;
 
     if let Err(e) = bring_up(params, interface_name, &gw_ip, &gw_iface) {
         // Clean up on failure
         let _ = sudo_run(&["ip", "link", "del", "dev", interface_name]);
-        ConnectionState::remove()?;
+        ConnectionState::remove(DIRECT_INSTANCE)?;
         return Err(e);
     }
 
+    Ok(())
+}
+
+/// Bring up a WireGuard tunnel inside a network namespace (no host route changes).
+pub fn up_in_netns(
+    params: &WgConfigParams<'_>,
+    interface_name: &str,
+    namespace: &str,
+) -> Result<()> {
+    // 1. Create WG interface in host namespace
+    sudo_run(&["ip", "link", "add", "dev", interface_name, "type", "wireguard"])?;
+
+    // 2. Configure WG keys/peer (must happen before move -- wg command works on host interface)
+    let endpoint = format!("{}:{}", params.server_ip, params.server_port);
+    let allowed_ips_wg = params.allowed_ips.replace(", ", ",");
+    if let Err(e) = wg_set(
+        interface_name,
+        params.private_key,
+        params.server_public_key,
+        &endpoint,
+        &allowed_ips_wg,
+        params.preshared_key,
+    ) {
+        let _ = sudo_run(&["ip", "link", "del", "dev", interface_name]);
+        return Err(e);
+    }
+
+    // 3. Move interface to namespace
+    if let Err(e) = netns::move_interface(interface_name, namespace) {
+        let _ = sudo_run(&["ip", "link", "del", "dev", interface_name]);
+        return Err(e);
+    }
+
+    // 4. Configure inside namespace
+    for addr in params.addresses {
+        netns::exec(namespace, &["ip", "addr", "add", addr, "dev", interface_name])?;
+    }
+    netns::exec(namespace, &["ip", "link", "set", "up", "dev", interface_name])?;
+    netns::exec(namespace, &["ip", "route", "add", "default", "dev", interface_name])?;
+
+    // Add IPv6 default route if any assigned address is IPv6
+    let has_ipv6 = params.addresses.iter().any(|a| a.contains(':'));
+    if has_ipv6 {
+        netns::exec(namespace, &["ip", "-6", "route", "add", "default", "dev", interface_name])?;
+    }
+
+    // 5. Set DNS inside namespace: /etc/netns/<ns>/resolv.conf
+    let netns_etc = format!("/etc/netns/{}", namespace);
+    sudo_run(&["mkdir", "-p", &netns_etc])?;
+    let dns_content: String = params
+        .dns_servers
+        .iter()
+        .map(|d| format!("nameserver {}\n", d))
+        .collect();
+    sudo_tee(&format!("{}/resolv.conf", netns_etc), &dns_content)?;
+
+    info!(
+        "Kernel WireGuard tunnel brought up on {} in namespace {}",
+        interface_name, namespace
+    );
     Ok(())
 }
 
@@ -63,7 +130,7 @@ pub fn down(state: &ConnectionState) -> Result<()> {
         info!("Restored /etc/resolv.conf");
     }
 
-    ConnectionState::remove()?;
+    ConnectionState::remove(&state.instance_name)?;
     Ok(())
 }
 

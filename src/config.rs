@@ -24,6 +24,9 @@ pub struct AppConfig {
 pub struct GeneralConfig {
     pub backend: String,
     pub credential_store: String,
+    pub proxy: bool,
+    pub socks_port: Option<u16>,
+    pub http_port: Option<u16>,
 }
 
 impl Default for GeneralConfig {
@@ -31,6 +34,9 @@ impl Default for GeneralConfig {
         Self {
             backend: "auto".to_string(),
             credential_store: "file".to_string(),
+            proxy: false,
+            socks_port: None,
+            http_port: None,
         }
     }
 }
@@ -103,6 +109,21 @@ pub fn connection_state_path() -> PathBuf {
     app_config_dir().join("connection.json")
 }
 
+/// Connections directory: ~/.config/tunmux/connections/
+#[must_use]
+pub fn connections_dir() -> PathBuf {
+    app_config_dir().join("connections")
+}
+
+pub fn ensure_connections_dir() -> Result<()> {
+    let dir = connections_dir();
+    if !dir.exists() {
+        fs::create_dir_all(&dir)?;
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o700))?;
+    }
+    Ok(())
+}
+
 fn xdg_config_home() -> PathBuf {
     if let Some(config) = std::env::var_os("XDG_CONFIG_HOME") {
         PathBuf::from(config)
@@ -122,14 +143,6 @@ pub fn ensure_config_dir(provider: Provider) -> Result<()> {
     Ok(())
 }
 
-pub fn ensure_app_config_dir() -> Result<()> {
-    let dir = app_config_dir();
-    if !dir.exists() {
-        fs::create_dir_all(&dir)?;
-        fs::set_permissions(&dir, fs::Permissions::from_mode(0o700))?;
-    }
-    Ok(())
-}
 
 // ── Session persistence (file + keyring dispatch) ──────────────
 
