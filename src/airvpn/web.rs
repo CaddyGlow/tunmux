@@ -224,7 +224,7 @@ impl AirVpnWeb {
         reqwest::Client::builder()
             .cookie_provider(cookie_store)
             .redirect(redirect::Policy::none())
-            .user_agent("vpncli/0.1")
+            .user_agent("tunmux/0.1")
             .build()
             .context("failed to build reqwest client")
     }
@@ -926,7 +926,7 @@ async fn follow_redirects(
 // ── REST API client (API key auth) ──────────────────────────────
 
 const API_BASE_URL: &str = "https://airvpn.org/api";
-const API_KEY_NAME: &str = "vpncli";
+const API_KEY_NAME: &str = "tunmux";
 
 pub struct AirVpnWebApi {
     client: reqwest::Client,
@@ -937,7 +937,7 @@ impl AirVpnWebApi {
     /// Create with an explicit API key.
     pub fn with_key(api_key: &str) -> anyhow::Result<Self> {
         let client = reqwest::Client::builder()
-            .user_agent("vpncli/0.1")
+            .user_agent("tunmux/0.1")
             .build()
             .context("failed to build HTTP client")?;
         Ok(Self {

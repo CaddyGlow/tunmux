@@ -161,7 +161,7 @@ async fn cmd_connect(
         );
     }
     if wireguard::wg_quick::is_interface_active(INTERFACE_NAME) {
-        anyhow::bail!("Already connected. Run `vpncli proton disconnect` first.");
+        anyhow::bail!("Already connected. Run `tunmux proton disconnect` first.");
     }
 
     let backend = wireguard::backend::WgBackend::from_str_arg(backend_arg)?;

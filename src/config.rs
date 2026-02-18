@@ -7,7 +7,7 @@ use serde::Serialize;
 
 use crate::error::{AppError, Result};
 
-const APP_DIR: &str = "vpncli";
+const APP_DIR: &str = "tunmux";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Provider {
@@ -25,25 +25,25 @@ impl Provider {
     }
 }
 
-/// Root config directory: ~/.config/vpncli/
+/// Root config directory: ~/.config/tunmux/
 #[must_use]
 pub fn app_config_dir() -> PathBuf {
     xdg_config_home().join(APP_DIR)
 }
 
-/// Provider-specific config directory: ~/.config/vpncli/<provider>/
+/// Provider-specific config directory: ~/.config/tunmux/<provider>/
 #[must_use]
 pub fn config_dir(provider: Provider) -> PathBuf {
     app_config_dir().join(provider.dir_name())
 }
 
-/// Session file path: ~/.config/vpncli/<provider>/session.json
+/// Session file path: ~/.config/tunmux/<provider>/session.json
 #[must_use]
 pub fn session_path(provider: Provider) -> PathBuf {
     config_dir(provider).join("session.json")
 }
 
-/// Connection state file (provider-neutral): ~/.config/vpncli/connection.json
+/// Connection state file (provider-neutral): ~/.config/tunmux/connection.json
 #[must_use]
 pub fn connection_state_path() -> PathBuf {
     app_config_dir().join("connection.json")

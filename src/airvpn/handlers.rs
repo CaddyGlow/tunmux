@@ -30,13 +30,18 @@ pub async fn dispatch(command: AirVpnCommand) -> anyhow::Result<()> {
         AirVpnCommand::ApiKeys { action } => cmd_api_keys(action).await,
         AirVpnCommand::Generate {
             server,
+            protocol,
             device,
             entry,
             exit,
             mtu,
             keepalive,
             output,
-        } => cmd_generate(&server, device, &entry, &exit, mtu, keepalive, output).await,
+            format,
+        } => {
+            cmd_generate(&server, &protocol, device, &entry, &exit, mtu, keepalive, output, &format)
+                .await
+        }
     }
 }
 
@@ -152,7 +157,7 @@ async fn cmd_connect(
         );
     }
     if wireguard::wg_quick::is_interface_active(INTERFACE_NAME) {
-        anyhow::bail!("Already connected. Run `vpncli airvpn disconnect` first.");
+        anyhow::bail!("Already connected. Run `tunmux airvpn disconnect` first.");
     }
 
     let backend = wireguard::backend::WgBackend::from_str_arg(backend_arg)?;
@@ -796,30 +801,36 @@ fn is_leap(y: i64) -> bool {
     (y % 4 == 0 && y % 100 != 0) || y % 400 == 0
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn cmd_generate(
     servers: &[String],
+    protocols: &[String],
     device: Option<String>,
     entry: &str,
     exit: &str,
     mtu: u16,
     keepalive: u16,
     output: Option<String>,
+    format: &str,
 ) -> anyhow::Result<()> {
     let mut session: AirSession = config::load_session(PROVIDER)?;
     let manifest = load_manifest()?;
 
-    // Build protocol value from the first WireGuard mode in the manifest.
-    // The generator API uses a protocol ID that differs from the manifest's entry_index.
-    // Known mapping: WireGuard UDP = 3.
-    let wg_mode = manifest
-        .wg_modes
-        .first()
-        .ok_or_else(|| error::AppError::Other("no WireGuard modes in manifest".into()))?;
-    let proto_value = format!(
-        "wireguard_3_{}_{}",
-        wg_mode.protocol.to_lowercase(),
-        wg_mode.port
-    );
+    // Build protocol values. Default: first WireGuard mode from the manifest.
+    let proto_values: Vec<String> = if protocols.is_empty() {
+        let wg_mode = manifest
+            .wg_modes
+            .first()
+            .ok_or_else(|| error::AppError::Other("no WireGuard modes in manifest".into()))?;
+        vec![format!(
+            "wireguard_3_{}_{}",
+            wg_mode.protocol.to_lowercase(),
+            wg_mode.port
+        )]
+    } else {
+        protocols.iter().map(|p| resolve_protocol(p)).collect()
+    };
+    let protocols_value = proto_values.join(",");
 
     // Join multiple servers with comma.
     let servers_value = servers.join(",");
@@ -836,10 +847,12 @@ async fn cmd_generate(
     let mtu_str = mtu.to_string();
     let keepalive_str = keepalive.to_string();
 
-    let download = if servers.len() > 1 { "zip" } else { "auto" };
+    // Multiple files when >1 server or >1 protocol.
+    let multi = servers.len() > 1 || proto_values.len() > 1;
+    let download = if multi { format } else { "auto" };
 
     let form: Vec<(&str, &str)> = vec![
-        ("protocols", &proto_value),
+        ("protocols", &protocols_value),
         ("servers", &servers_value),
         ("download", download),
         ("system", "linux"),
@@ -852,7 +865,14 @@ async fn cmd_generate(
 
     let api = AirVpnWebApi::from_session(&mut session).await?;
 
-    if servers.len() == 1 {
+    if multi {
+        let default_name = format!("airvpn.{}", format);
+        let out = output.unwrap_or(default_name);
+
+        let (data, _content_type) = api.post_bytes("generator", &form).await?;
+        std::fs::write(&out, &data)?;
+        println!("Config written to {} ({}B)", out, data.len());
+    } else {
         let config = api.post_text("generator", &form).await?;
         match output {
             Some(path) => {
@@ -863,30 +883,46 @@ async fn cmd_generate(
                 print!("{}", config);
             }
         }
-    } else {
-        let (data, _content_type) = api.post_bytes("generator", &form).await?;
-
-        let is_zip = data.starts_with(b"PK\x03\x04");
-        if is_zip {
-            let out = output.unwrap_or_else(|| "airvpn.zip".to_string());
-            std::fs::write(&out, &data)?;
-            println!("Config written to {} ({}B)", out, data.len());
-        } else {
-            // Fallback: probably raw text with single config
-            let text = String::from_utf8_lossy(&data);
-            match output {
-                Some(path) => {
-                    std::fs::write(&path, &*text)?;
-                    println!("Config written to {}", path);
-                }
-                None => {
-                    print!("{}", text);
-                }
-            }
-        }
     }
 
     Ok(())
+}
+
+/// Resolve a user-friendly protocol name to the generator API format.
+///
+/// Short names:
+///   wg-PORT          -> wireguard_3_udp_PORT
+///   openvpn-udp-PORT -> openvpn_1_udp_PORT
+///   openvpn-tcp-PORT -> openvpn_1_tcp_PORT
+///   openvpn-ssh-PORT -> openvpn_1_ssh_PORT
+///   openvpn-ssl-PORT -> openvpn_1_ssl_PORT
+///
+/// Raw strings like wireguard_3_udp_1637 are passed through.
+fn resolve_protocol(name: &str) -> String {
+    let lower = name.to_lowercase();
+
+    // Already in raw format
+    if lower.starts_with("wireguard_") || lower.starts_with("openvpn_") {
+        return lower;
+    }
+
+    // wg or wg-PORT
+    if lower == "wg" || lower == "wireguard" {
+        return "wireguard_3_udp_1637".to_string();
+    }
+    if let Some(port) = lower.strip_prefix("wg-") {
+        return format!("wireguard_3_udp_{}", port);
+    }
+
+    // openvpn-TRANSPORT-PORT  (all OpenVPN protocols use entry_index 1)
+    if let Some(rest) = lower.strip_prefix("openvpn-") {
+        if rest.contains('-') {
+            return format!("openvpn_1_{}", rest.replacen('-', "_", 1));
+        }
+    }
+
+    // Fallback: pass through as-is
+    name.to_string()
 }
 
 fn save_manifest(manifest: &AirManifest) -> anyhow::Result<()> {
@@ -898,7 +934,7 @@ fn save_manifest(manifest: &AirManifest) -> anyhow::Result<()> {
 fn load_manifest() -> anyhow::Result<AirManifest> {
     let data = config::load_provider_file(PROVIDER, MANIFEST_FILE)?
         .ok_or_else(|| error::AppError::Other(
-            "no cached manifest -- run `vpncli airvpn login` first".into(),
+            "no cached manifest -- run `tunmux airvpn login` first".into(),
         ))?;
     let manifest: AirManifest = serde_json::from_slice(&data)?;
     Ok(manifest)

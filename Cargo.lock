@@ -2121,6 +2121,39 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e421abadd41a4225275504ea4d6566923418b7f05506fbc9c0fe86ba7396114b"
 
 [[package]]
+name = "tunmux"
+version = "0.1.0"
+dependencies = [
+ "aes",
+ "anyhow",
+ "base64",
+ "bcrypt",
+ "cbc",
+ "clap",
+ "cookie",
+ "curve25519-dalek",
+ "ed25519-dalek",
+ "hmac",
+ "num-bigint",
+ "num-integer",
+ "num-traits",
+ "rand 0.8.5",
+ "reqwest",
+ "reqwest_cookie_store",
+ "roxmltree",
+ "rpassword",
+ "rsa",
+ "scraper",
+ "serde",
+ "serde_json",
+ "sha2",
+ "thiserror",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "typenum"
 version = "1.19.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2185,39 +2218,6 @@ name = "version_check"
 version = "0.9.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
-
-[[package]]
-name = "vpncli"
-version = "0.1.0"
-dependencies = [
- "aes",
- "anyhow",
- "base64",
- "bcrypt",
- "cbc",
- "clap",
- "cookie",
- "curve25519-dalek",
- "ed25519-dalek",
- "hmac",
- "num-bigint",
- "num-integer",
- "num-traits",
- "rand 0.8.5",
- "reqwest",
- "reqwest_cookie_store",
- "roxmltree",
- "rpassword",
- "rsa",
- "scraper",
- "serde",
- "serde_json",
- "sha2",
- "thiserror",
- "tokio",
- "tracing",
- "tracing-subscriber",
-]
 
 [[package]]
 name = "want"

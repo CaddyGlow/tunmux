@@ -1,7 +1,7 @@
 use clap::{Parser, Subcommand};
 
 #[derive(Parser)]
-#[command(name = "vpncli", about = "Multi-provider VPN CLI", version)]
+#[command(name = "tunmux", about = "Multi-provider VPN CLI", version)]
 pub struct Cli {
     #[command(subcommand)]
     pub provider: ProviderCommand,
@@ -118,11 +118,20 @@ pub enum AirVpnCommand {
     /// Show active VPN sessions
     Sessions,
 
-    /// Generate a WireGuard config file via the AirVPN API
+    /// Generate a config file via the AirVPN API
     Generate {
         /// Server name or country code (repeatable, e.g., -s be -s nl)
         #[arg(short, long, required = true)]
         server: Vec<String>,
+
+        /// Protocol (repeatable). Options:
+        ///   wg-1637 (default), wg-47107, wg-51820,
+        ///   openvpn-udp-443, openvpn-udp-80, openvpn-udp-53, openvpn-udp-1194,
+        ///   openvpn-tcp-443, openvpn-tcp-80,
+        ///   openvpn-ssh-22, openvpn-ssl-443.
+        /// Raw format also accepted: wireguard_3_udp_PORT, openvpn_1_tcp_PORT
+        #[arg(short, long, verbatim_doc_comment)]
+        protocol: Vec<String>,
 
         /// Device/key name (default: first device)
         #[arg(short, long)]
@@ -144,9 +153,13 @@ pub enum AirVpnCommand {
         #[arg(long, default_value = "15")]
         keepalive: u16,
 
-        /// Output file (default: stdout)
+        /// Output file (default: stdout for single combo)
         #[arg(short, long)]
         output: Option<String>,
+
+        /// Archive format when multiple files: zip, 7z, tar, tar.gz, tar.bz2, tar.xz
+        #[arg(short, long, default_value = "zip")]
+        format: String,
     },
 
     /// Manage forwarded ports

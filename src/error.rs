@@ -24,10 +24,10 @@ pub enum AppError {
     #[error("2FA required")]
     TwoFactorRequired,
 
-    #[error("Not logged in -- run `vpncli <provider> login <username>` first")]
+    #[error("Not logged in -- run `tunmux <provider> login <username>` first")]
     NotLoggedIn,
 
-    #[error("Session expired -- run `vpncli <provider> login <username>` again")]
+    #[error("Session expired -- run `tunmux <provider> login <username>` again")]
     SessionExpired,
 
     #[error("No suitable server found")]
