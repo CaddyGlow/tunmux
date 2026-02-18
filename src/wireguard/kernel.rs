@@ -7,17 +7,17 @@ use tracing::info;
 use crate::error::{AppError, Result};
 
 use super::backend::WgBackend;
-use super::config::{WgConfigParams, WG_ADDRESS, WG_DNS};
+use super::config::WgConfigParams;
 use super::connection::ConnectionState;
 
-const INTERFACE: &str = "proton0";
-
 /// Bring up a WireGuard tunnel using kernel ip/wg commands.
-pub fn up(params: &WgConfigParams<'_>) -> Result<()> {
+pub fn up(params: &WgConfigParams<'_>, interface_name: &str, provider: &str) -> Result<()> {
     let (gw_ip, gw_iface) = get_default_gateway()?;
     let original_resolv = fs::read_to_string("/etc/resolv.conf").ok();
 
     let state = ConnectionState {
+        provider: provider.to_string(),
+        interface_name: interface_name.to_string(),
         backend: WgBackend::Kernel,
         server_endpoint: format!("{}:{}", params.server_ip, params.server_port),
         original_gateway_ip: Some(gw_ip.clone()),
@@ -26,9 +26,9 @@ pub fn up(params: &WgConfigParams<'_>) -> Result<()> {
     };
     state.save()?;
 
-    if let Err(e) = bring_up(params, &gw_ip, &gw_iface) {
+    if let Err(e) = bring_up(params, interface_name, &gw_ip, &gw_iface) {
         // Clean up on failure
-        let _ = sudo_run(&["ip", "link", "del", "dev", INTERFACE]);
+        let _ = sudo_run(&["ip", "link", "del", "dev", interface_name]);
         ConnectionState::remove()?;
         return Err(e);
     }
@@ -38,8 +38,10 @@ pub fn up(params: &WgConfigParams<'_>) -> Result<()> {
 
 /// Tear down a kernel WireGuard tunnel.
 pub fn down(state: &ConnectionState) -> Result<()> {
+    let iface = &state.interface_name;
+
     // Removing the interface also removes its routes and addresses
-    sudo_run(&["ip", "link", "del", "dev", INTERFACE])?;
+    sudo_run(&["ip", "link", "del", "dev", iface])?;
 
     // Remove the endpoint host route
     if let (Some(gw_ip), Some(gw_iface)) =
@@ -65,19 +67,23 @@ pub fn down(state: &ConnectionState) -> Result<()> {
     Ok(())
 }
 
-fn bring_up(params: &WgConfigParams<'_>, gw_ip: &str, gw_iface: &str) -> Result<()> {
+fn bring_up(params: &WgConfigParams<'_>, interface_name: &str, gw_ip: &str, gw_iface: &str) -> Result<()> {
     // 1. Create interface
-    sudo_run(&["ip", "link", "add", "dev", INTERFACE, "type", "wireguard"])?;
+    sudo_run(&["ip", "link", "add", "dev", interface_name, "type", "wireguard"])?;
 
     // 2. Configure wireguard (pipe private key via stdin)
     let endpoint = format!("{}:{}", params.server_ip, params.server_port);
-    wg_set(params.private_key, params.server_public_key, &endpoint)?;
+    // wg set expects comma-separated allowed-ips without spaces
+    let allowed_ips_wg = params.allowed_ips.replace(", ", ",");
+    wg_set(interface_name, params.private_key, params.server_public_key, &endpoint, &allowed_ips_wg, params.preshared_key)?;
 
-    // 3. Assign address
-    sudo_run(&["ip", "addr", "add", WG_ADDRESS, "dev", INTERFACE])?;
+    // 3. Assign addresses
+    for addr in params.addresses {
+        sudo_run(&["ip", "addr", "add", addr, "dev", interface_name])?;
+    }
 
     // 4. Bring interface up
-    sudo_run(&["ip", "link", "set", "up", "dev", INTERFACE])?;
+    sudo_run(&["ip", "link", "set", "up", "dev", interface_name])?;
 
     // 5. Add host route for the server endpoint via original gateway
     let host_route = format!("{}/32", params.server_ip);
@@ -86,33 +92,34 @@ fn bring_up(params: &WgConfigParams<'_>, gw_ip: &str, gw_iface: &str) -> Result<
     ])?;
 
     // 6. Split-route trick: 0/1 + 128/1 covers all traffic without replacing the default route
-    sudo_run(&["ip", "route", "add", "0.0.0.0/1", "dev", INTERFACE])?;
-    sudo_run(&["ip", "route", "add", "128.0.0.0/1", "dev", INTERFACE])?;
+    sudo_run(&["ip", "route", "add", "0.0.0.0/1", "dev", interface_name])?;
+    sudo_run(&["ip", "route", "add", "128.0.0.0/1", "dev", interface_name])?;
 
     // 7. Set DNS
-    let dns_content = format!("nameserver {}\n", WG_DNS);
+    let dns_content: String = params
+        .dns_servers
+        .iter()
+        .map(|d| format!("nameserver {}\n", d))
+        .collect();
     sudo_tee("/etc/resolv.conf", &dns_content)?;
 
-    info!("Kernel WireGuard tunnel brought up on {}", INTERFACE);
+    info!("Kernel WireGuard tunnel brought up on {}", interface_name);
     Ok(())
 }
 
-fn wg_set(private_key: &str, peer_pubkey: &str, endpoint: &str) -> Result<()> {
-    info!("Running: sudo wg set {} ...", INTERFACE);
+fn wg_set(interface_name: &str, private_key: &str, peer_pubkey: &str, endpoint: &str, allowed_ips: &str, preshared_key: Option<&str>) -> Result<()> {
+    info!("Running: sudo wg set {} ...", interface_name);
+
+    let args = vec![
+        "wg", "set", interface_name,
+        "private-key", "/dev/stdin",
+        "peer", peer_pubkey,
+        "allowed-ips", allowed_ips,
+        "endpoint", endpoint,
+    ];
+
     let mut child = Command::new("sudo")
-        .args([
-            "wg",
-            "set",
-            INTERFACE,
-            "private-key",
-            "/dev/stdin",
-            "peer",
-            peer_pubkey,
-            "allowed-ips",
-            "0.0.0.0/0,::/0",
-            "endpoint",
-            endpoint,
-        ])
+        .args(&args)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -133,6 +140,45 @@ fn wg_set(private_key: &str, peer_pubkey: &str, endpoint: &str) -> Result<()> {
         let stderr = String::from_utf8_lossy(&output.stderr);
         return Err(AppError::WireGuard(format!(
             "wg set failed: {}",
+            stderr.trim()
+        )));
+    }
+
+    // Handle preshared key as a separate wg set call if needed
+    if let Some(psk) = preshared_key {
+        set_preshared_key(interface_name, peer_pubkey, psk)?;
+    }
+
+    Ok(())
+}
+
+fn set_preshared_key(interface_name: &str, peer_pubkey: &str, psk: &str) -> Result<()> {
+    let mut child = Command::new("sudo")
+        .args([
+            "wg", "set", interface_name,
+            "peer", peer_pubkey,
+            "preshared-key", "/dev/stdin",
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|e| AppError::WireGuard(format!("failed to set preshared key: {}", e)))?;
+
+    if let Some(ref mut stdin) = child.stdin {
+        stdin
+            .write_all(psk.as_bytes())
+            .map_err(|e| AppError::WireGuard(format!("failed to write preshared key: {}", e)))?;
+    }
+
+    let output = child
+        .wait_with_output()
+        .map_err(|e| AppError::WireGuard(format!("wg set preshared-key failed: {}", e)))?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(AppError::WireGuard(format!(
+            "wg set preshared-key failed: {}",
             stderr.trim()
         )));
     }

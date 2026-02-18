@@ -1,5 +1,5 @@
 [package]
-name = "protonvpn"
+name = "vpncli"
 version = "0.1.0"
 edition = "2021"
 
@@ -11,7 +11,7 @@ clap = { version = "4", features = ["derive"] }
 tokio = { version = "1", features = ["full"] }
 
 # HTTP
-reqwest = { version = "0.12", features = ["json", "rustls-tls"], default-features = false }
+reqwest = { version = "0.12", features = ["json", "rustls-tls", "cookies"], default-features = false }
 
 # Serialization
 serde = { version = "1", features = ["derive"] }
@@ -36,6 +36,21 @@ rand = "0.8"
 
 # Encoding
 base64 = "0.22"
+
+# Crypto - AirVPN API
+rsa = { version = "0.9", features = ["std"] }
+aes = "0.8"
+cbc = "0.1"
+
+# HTML parsing
+scraper = "0.22"
+
+# Cookie persistence
+reqwest_cookie_store = "0.8"
+cookie = "0.18"
+
+# XML parsing
+roxmltree = "0.20"
 
 # Password input
 rpassword = "7"

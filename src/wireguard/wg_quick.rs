@@ -8,34 +8,32 @@ use tracing::info;
 use crate::config;
 use crate::error::{AppError, Result};
 
-const INTERFACE_NAME: &str = "proton0";
-
 /// Write the WireGuard config and bring up the interface.
-pub fn up(config_content: &str) -> Result<()> {
-    let path = write_config(config_content)?;
+pub fn up(config_content: &str, interface_name: &str, provider: config::Provider) -> Result<()> {
+    let path = write_config(config_content, interface_name, provider)?;
     run_wg_quick("up", &path)
 }
 
 /// Bring down the WireGuard interface and remove the config.
-pub fn down() -> Result<()> {
-    let path = config_file_path();
+pub fn down(interface_name: &str, provider: config::Provider) -> Result<()> {
+    let path = config_file_path(interface_name, provider);
     run_wg_quick("down", &path)?;
-    remove_config()
+    remove_config(interface_name, provider)
 }
 
-/// Check if the WireGuard interface is currently active.
+/// Check if a WireGuard interface is currently active.
 #[must_use]
-pub fn is_active() -> bool {
+pub fn is_interface_active(interface_name: &str) -> bool {
     Command::new("ip")
-        .args(["link", "show", INTERFACE_NAME])
+        .args(["link", "show", interface_name])
         .output()
         .map(|o| o.status.success())
         .unwrap_or(false)
 }
 
-fn write_config(content: &str) -> Result<PathBuf> {
-    config::ensure_config_dir()?;
-    let path = config_file_path();
+fn write_config(content: &str, interface_name: &str, provider: config::Provider) -> Result<PathBuf> {
+    config::ensure_config_dir(provider)?;
+    let path = config_file_path(interface_name, provider);
 
     fs::write(&path, content)?;
     fs::set_permissions(&path, fs::Permissions::from_mode(0o600))?;
@@ -43,8 +41,8 @@ fn write_config(content: &str) -> Result<PathBuf> {
     Ok(path)
 }
 
-fn remove_config() -> Result<()> {
-    let path = config_file_path();
+fn remove_config(interface_name: &str, provider: config::Provider) -> Result<()> {
+    let path = config_file_path(interface_name, provider);
     if path.exists() {
         fs::remove_file(&path)?;
         info!("WireGuard config removed");
@@ -73,6 +71,6 @@ fn run_wg_quick(action: &str, conf_path: &Path) -> Result<()> {
     Ok(())
 }
 
-fn config_file_path() -> PathBuf {
-    config::config_dir().join(format!("{}.conf", INTERFACE_NAME))
+fn config_file_path(interface_name: &str, provider: config::Provider) -> PathBuf {
+    config::config_dir(provider).join(format!("{}.conf", interface_name))
 }

@@ -24,10 +24,10 @@ pub enum AppError {
     #[error("2FA required")]
     TwoFactorRequired,
 
-    #[error("Not logged in -- run `protonvpn login <username>` first")]
+    #[error("Not logged in -- run `vpncli <provider> login <username>` first")]
     NotLoggedIn,
 
-    #[error("Session expired -- run `protonvpn login <username>` again")]
+    #[error("Session expired -- run `vpncli <provider> login <username>` again")]
     SessionExpired,
 
     #[error("No suitable server found")]
@@ -38,6 +38,15 @@ pub enum AppError {
 
     #[error("Crypto error: {0}")]
     Crypto(String),
+
+    #[error("AirVPN API error: {0}")]
+    AirVpnApi(String),
+
+    #[error("AirVPN crypto error: {0}")]
+    AirVpnCrypto(String),
+
+    #[error("XML parse error: {0}")]
+    Xml(String),
 
     #[error("{0}")]
     Other(String),

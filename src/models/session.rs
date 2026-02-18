@@ -2,7 +2,7 @@
 
 use serde::{Deserialize, Serialize};
 
-/// Persisted session data written to ~/.config/protonvpn-rs/session.json
+/// Persisted Proton session data written to ~/.config/vpncli/proton/session.json
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(rename_all = "PascalCase")]
 pub struct Session {

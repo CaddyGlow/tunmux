@@ -11,6 +11,8 @@ use super::backend::WgBackend;
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct ConnectionState {
+    pub provider: String,
+    pub interface_name: String,
     pub backend: WgBackend,
     pub server_endpoint: String,
     pub original_gateway_ip: Option<String>,
@@ -20,8 +22,8 @@ pub struct ConnectionState {
 
 impl ConnectionState {
     pub fn save(&self) -> Result<()> {
-        config::ensure_config_dir()?;
-        let path = Self::path();
+        config::ensure_app_config_dir()?;
+        let path = config::connection_state_path();
         let json = serde_json::to_string_pretty(self)?;
         fs::write(&path, &json)?;
         fs::set_permissions(&path, fs::Permissions::from_mode(0o600))?;
@@ -30,7 +32,7 @@ impl ConnectionState {
     }
 
     pub fn load() -> Result<Option<Self>> {
-        let path = Self::path();
+        let path = config::connection_state_path();
         if !path.exists() {
             return Ok(None);
         }
@@ -40,15 +42,11 @@ impl ConnectionState {
     }
 
     pub fn remove() -> Result<()> {
-        let path = Self::path();
+        let path = config::connection_state_path();
         if path.exists() {
             fs::remove_file(&path)?;
             info!("Connection state removed");
         }
         Ok(())
-    }
-
-    fn path() -> std::path::PathBuf {
-        config::config_dir().join("connection.json")
     }
 }
