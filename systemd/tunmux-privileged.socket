@@ -1,0 +1,15 @@
+[Unit]
+Description=tunmux privileged socket
+PartOf=tunmux-privileged.service
+
+[Socket]
+ListenStream=/run/tunmux/ctl.sock
+SocketMode=0660
+SocketUser=root
+SocketGroup=tunmux
+# Change SocketGroup to match the desired client group.
+Service=tunmux-privileged.service
+FileDescriptorName=ctl
+
+[Install]
+WantedBy=sockets.target

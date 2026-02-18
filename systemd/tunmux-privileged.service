@@ -1,0 +1,35 @@
+[Unit]
+Description=tunmux privileged operations service
+After=network.target
+
+[Service]
+Type=simple
+# `SocketGroup` in tunmux-privileged.socket controls who can connect to the socket.
+# `--authorized-group` controls SO_PEERCRED authorization checks for clients.
+ExecStart=/usr/bin/tunmux privileged --serve --authorized-group tunmux
+Restart=on-failure
+
+User=root
+Group=root
+
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+RuntimeDirectory=tunmux
+RuntimeDirectoryMode=0750
+StateDirectory=tunmux
+StateDirectoryMode=0700
+ReadWritePaths=/run/tunmux /run/netns /etc/netns /var/lib/tunmux /etc/resolv.conf
+SystemCallFilter=@system-service
+CapabilityBoundingSet=CAP_NET_ADMIN CAP_SYS_ADMIN CAP_DAC_OVERRIDE
+AmbientCapabilities=CAP_NET_ADMIN CAP_SYS_ADMIN CAP_DAC_OVERRIDE
+
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target

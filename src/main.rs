@@ -6,8 +6,11 @@ mod crypto;
 mod error;
 mod models;
 mod netns;
-mod proxy;
+mod privileged;
+mod privileged_api;
+mod privileged_client;
 mod proton;
+mod proxy;
 mod wireguard;
 
 use clap::Parser;
@@ -20,6 +23,20 @@ fn main() {
     let cli = Cli::parse();
 
     match cli.command {
+        // Privileged control server.
+        TopCommand::Privileged {
+            serve,
+            authorized_group,
+        } => {
+            if !serve {
+                eprintln!("privileged mode requires --serve");
+                std::process::exit(1);
+            }
+            if let Err(e) = privileged::serve(authorized_group) {
+                eprintln!("privileged service error: {}", e);
+                std::process::exit(1);
+            }
+        }
         // ProxyDaemon runs its own single-threaded runtime and daemonizes.
         // Do not initialize tracing here -- the daemon sets up file logging itself.
         TopCommand::ProxyDaemon {
@@ -75,7 +92,9 @@ async fn run(command: TopCommand, config: config::AppConfig) -> anyhow::Result<(
     match command {
         TopCommand::Proton { command } => proton::handlers::dispatch(command, &config).await,
         TopCommand::Airvpn { command } => airvpn::handlers::dispatch(command, &config).await,
-        TopCommand::Status | TopCommand::ProxyDaemon { .. } => unreachable!(),
+        TopCommand::Status | TopCommand::ProxyDaemon { .. } | TopCommand::Privileged { .. } => {
+            unreachable!()
+        }
     }
 }
 

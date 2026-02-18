@@ -28,7 +28,10 @@ pub fn run(
     let socks4 = TcpListener::bind(format!("127.0.0.1:{}", socks_port)).ok();
     let socks6 = TcpListener::bind(format!("[::1]:{}", socks_port)).ok();
     if socks4.is_none() && socks6.is_none() {
-        anyhow::bail!("failed to bind SOCKS5 on port {} (neither IPv4 nor IPv6)", socks_port);
+        anyhow::bail!(
+            "failed to bind SOCKS5 on port {} (neither IPv4 nor IPv6)",
+            socks_port
+        );
     }
 
     // UDP relay sockets for SOCKS5 UDP ASSOCIATE (same port as TCP -- no conflict)
@@ -38,7 +41,10 @@ pub fn run(
     let http4 = TcpListener::bind(format!("127.0.0.1:{}", http_port)).ok();
     let http6 = TcpListener::bind(format!("[::1]:{}", http_port)).ok();
     if http4.is_none() && http6.is_none() {
-        anyhow::bail!("failed to bind HTTP on port {} (neither IPv4 nor IPv6)", http_port);
+        anyhow::bail!(
+            "failed to bind HTTP on port {} (neither IPv4 nor IPv6)",
+            http_port
+        );
     }
 
     for listener in [&socks4, &socks6, &http4, &http6].into_iter().flatten() {
@@ -51,12 +57,7 @@ pub fn run(
     // 2. Daemonize: double-fork + setsid
     daemonize()?;
 
-    // 3. Write PID file (world-readable so the unprivileged parent can poll it)
-    let pid = std::process::id();
-    fs::write(pid_file, pid.to_string())?;
-    fs::set_permissions(pid_file, fs::Permissions::from_mode(0o644))?;
-
-    // 4. Set up file logging (world-readable so unprivileged user can read diagnostics)
+    // 3. Set up file logging first so any subsequent errors are captured.
     let log_fd = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
@@ -69,22 +70,128 @@ pub fn run(
         .with_ansi(false)
         .init();
 
+    // 4. Write PID file (world-readable so the unprivileged parent can poll it)
+    let pid = std::process::id();
+    fs::write(pid_file, pid.to_string())?;
+    fs::set_permissions(pid_file, fs::Permissions::from_mode(0o644))?;
+
     let mut bound = Vec::new();
-    if socks4.is_some() { bound.push(format!("socks5=127.0.0.1:{}", socks_port)); }
-    if socks6.is_some() { bound.push(format!("socks5=[::1]:{}", socks_port)); }
-    if udp_socks4.is_some() { bound.push(format!("socks5-udp=127.0.0.1:{}", socks_port)); }
-    if udp_socks6.is_some() { bound.push(format!("socks5-udp=[::1]:{}", socks_port)); }
-    if http4.is_some() { bound.push(format!("http=127.0.0.1:{}", http_port)); }
-    if http6.is_some() { bound.push(format!("http=[::1]:{}", http_port)); }
+    if socks4.is_some() {
+        bound.push(format!("socks5=127.0.0.1:{}", socks_port));
+    }
+    if socks6.is_some() {
+        bound.push(format!("socks5=[::1]:{}", socks_port));
+    }
+    if udp_socks4.is_some() {
+        bound.push(format!("socks5-udp=127.0.0.1:{}", socks_port));
+    }
+    if udp_socks6.is_some() {
+        bound.push(format!("socks5-udp=[::1]:{}", socks_port));
+    }
+    if http4.is_some() {
+        bound.push(format!("http=127.0.0.1:{}", http_port));
+    }
+    if http6.is_some() {
+        bound.push(format!("http=[::1]:{}", http_port));
+    }
     info!(
         "Proxy daemon started (pid={}, {}, netns={})",
-        pid, bound.join(", "), netns_name
+        pid,
+        bound.join(", "),
+        netns_name
     );
 
-    // 5. Enter VPN namespace -- all subsequent socket connections go through the VPN
+    // 5. Enter VPN namespace -- all subsequent socket connections go through the VPN.
+    //    setns(CLONE_NEWNET) only switches the network namespace; it does NOT
+    //    bind-mount /etc/netns/<ns>/resolv.conf over /etc/resolv.conf (that is a
+    //    userspace convention of `ip netns exec`).  We replicate it here so that
+    //    getaddrinfo inside the daemon uses the VPN's DNS servers.
+    if let Err(e) = nix::sched::unshare(nix::sched::CloneFlags::CLONE_NEWNS) {
+        tracing::error!("unshare(CLONE_NEWNS) failed: {}", e);
+        anyhow::bail!("unshare(CLONE_NEWNS) failed: {}", e);
+    }
+
+    // Stop mount propagation from leaking back to the host.  Without this,
+    // systemd's default "shared" propagation causes our bind-mounts to
+    // override the host's /etc/resolv.conf.  MS_SLAVE|MS_REC matches what
+    // `ip netns exec` does.
+    if let Err(e) = nix::mount::mount(
+        None::<&str>,
+        "/",
+        None::<&str>,
+        nix::mount::MsFlags::MS_SLAVE | nix::mount::MsFlags::MS_REC,
+        None::<&str>,
+    ) {
+        tracing::error!("mount --make-rslave / failed: {}", e);
+        anyhow::bail!("mount --make-rslave / failed: {}", e);
+    }
+
     if let Err(e) = netns::enter(netns_name) {
         tracing::error!("Failed to enter namespace: {}", e);
         return Err(e.into());
+    }
+
+    let ns_resolv = format!("/etc/netns/{}/resolv.conf", netns_name);
+    if std::path::Path::new(&ns_resolv).exists() {
+        let dns_content = std::fs::read_to_string(&ns_resolv)
+            .map_err(|e| anyhow::anyhow!("failed to read {}: {}", ns_resolv, e))?;
+
+        // On systemd-resolved hosts, /etc/resolv.conf is a symlink to
+        // /run/systemd/resolve/stub-resolv.conf.  Bind-mounting over the
+        // symlink or its target is fragile.  Instead, mount a private tmpfs
+        // over the resolve directory and write our DNS content there.  The
+        // existing symlink then naturally reads our content.
+        let resolve_dir = std::path::Path::new("/run/systemd/resolve");
+        if resolve_dir.exists() {
+            if let Err(e) = nix::mount::mount(
+                Some("tmpfs"),
+                resolve_dir,
+                Some("tmpfs"),
+                nix::mount::MsFlags::MS_NOSUID | nix::mount::MsFlags::MS_NODEV,
+                Some("size=1m,mode=0755"),
+            ) {
+                tracing::error!("tmpfs over /run/systemd/resolve failed: {}", e);
+                anyhow::bail!("tmpfs over /run/systemd/resolve failed: {}", e);
+            }
+            std::fs::write("/run/systemd/resolve/stub-resolv.conf", &dns_content)
+                .map_err(|e| anyhow::anyhow!("failed to write stub-resolv.conf: {}", e))?;
+            info!("Replaced /run/systemd/resolve/stub-resolv.conf with VPN DNS");
+        } else {
+            // No systemd-resolved; try direct bind-mount over /etc/resolv.conf.
+            if let Err(e) = nix::mount::mount(
+                Some(ns_resolv.as_str()),
+                "/etc/resolv.conf",
+                None::<&str>,
+                nix::mount::MsFlags::MS_BIND,
+                None::<&str>,
+            ) {
+                tracing::error!("bind-mount {} over /etc/resolv.conf failed: {}", ns_resolv, e);
+                anyhow::bail!("bind-mount {} over /etc/resolv.conf failed: {}", ns_resolv, e);
+            }
+            info!("Bind-mounted {} over /etc/resolv.conf", ns_resolv);
+        }
+    } else {
+        tracing::warn!("/etc/netns/{}/resolv.conf not found, DNS may leak", netns_name);
+    }
+
+    // On systemd-resolved hosts, glibc's nss-resolve module talks to
+    // systemd-resolved over D-Bus, bypassing both the network namespace
+    // and /etc/resolv.conf entirely.  Hide the D-Bus socket so nss-resolve
+    // fails and glibc falls back to the "dns" NSS module (which reads
+    // /etc/resolv.conf, now bind-mounted with the VPN's nameservers).
+    let dbus_socket = "/run/dbus/system_bus_socket";
+    if std::path::Path::new(dbus_socket).exists() {
+        if let Err(e) = nix::mount::mount(
+            Some("/dev/null"),
+            dbus_socket,
+            None::<&str>,
+            nix::mount::MsFlags::MS_BIND,
+            None::<&str>,
+        ) {
+            tracing::warn!("failed to mask D-Bus socket: {}", e);
+        } else {
+            info!("Masked D-Bus socket to prevent systemd-resolved DNS leak");
+        }
     }
 
     // 6. Build single-threaded tokio runtime (critical: setns affects only the calling thread)

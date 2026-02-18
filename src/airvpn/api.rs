@@ -42,13 +42,7 @@ impl AirVpnClient {
         let mut last_err = None;
 
         for url in BOOTSTRAP_URLS {
-            match self
-                .http
-                .post(*url)
-                .form(&form)
-                .send()
-                .await
-            {
+            match self.http.post(*url).form(&form).send().await {
                 Ok(resp) => {
                     if !resp.status().is_success() {
                         let status = resp.status();
@@ -57,10 +51,8 @@ impl AirVpnClient {
                             .await
                             .unwrap_or_else(|_| "<unreadable>".to_string());
                         warn!("HTTP {} from {}: {}", status, url, body);
-                        last_err = Some(AppError::AirVpnApi(format!(
-                            "HTTP {} from {}",
-                            status, url
-                        )));
+                        last_err =
+                            Some(AppError::AirVpnApi(format!("HTTP {} from {}", status, url)));
                         continue;
                     }
 
@@ -209,7 +201,12 @@ fn parse_manifest_response(xml: &str) -> Result<AirManifest> {
     let mut api_urls = Vec::new();
 
     for node in root.descendants() {
-        if node.has_tag_name("server") && node.parent_element().map(|p| p.has_tag_name("servers")).unwrap_or(false) {
+        if node.has_tag_name("server")
+            && node
+                .parent_element()
+                .map(|p| p.has_tag_name("servers"))
+                .unwrap_or(false)
+        {
             let ips_str = node.attribute("ips_entry").unwrap_or("");
             let ips_entry: Vec<String> = ips_str
                 .split(',')

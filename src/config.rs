@@ -1,6 +1,6 @@
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
@@ -91,6 +91,57 @@ pub fn app_config_dir() -> PathBuf {
     xdg_config_home().join(APP_DIR)
 }
 
+#[must_use]
+pub fn privileged_socket_path() -> PathBuf {
+    PathBuf::from("/run/tunmux/ctl.sock")
+}
+
+#[must_use]
+pub fn privileged_socket_dir() -> PathBuf {
+    PathBuf::from("/run/tunmux")
+}
+
+pub fn ensure_privileged_socket_dir() -> Result<()> {
+    let dir = privileged_socket_dir();
+    if !dir.exists() {
+        fs::create_dir_all(&dir)?;
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o750))?;
+    }
+    Ok(())
+}
+
+#[must_use]
+pub fn privileged_runtime_dir() -> PathBuf {
+    PathBuf::from("/var/lib/tunmux")
+}
+
+pub fn ensure_privileged_runtime_dir() -> Result<()> {
+    let dir = privileged_runtime_dir();
+    if !dir.exists() {
+        fs::create_dir_all(&dir)?;
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o700))?;
+    }
+    Ok(())
+}
+
+#[must_use]
+pub fn privileged_wg_dir() -> PathBuf {
+    privileged_runtime_dir().join("wg")
+}
+
+#[must_use]
+pub fn privileged_proxy_dir() -> PathBuf {
+    privileged_runtime_dir().join("proxy")
+}
+
+pub fn ensure_privileged_directory(path: &Path) -> Result<()> {
+    if !path.exists() {
+        fs::create_dir_all(path)?;
+        fs::set_permissions(path, fs::Permissions::from_mode(0o700))?;
+    }
+    Ok(())
+}
+
 /// Provider-specific config directory: ~/.config/tunmux/<provider>/
 #[must_use]
 pub fn config_dir(provider: Provider) -> PathBuf {
@@ -137,10 +188,13 @@ pub fn ensure_config_dir(provider: Provider) -> Result<()> {
     Ok(())
 }
 
-
 // ── Session persistence (file + keyring dispatch) ──────────────
 
-pub fn save_session<T: Serialize>(provider: Provider, session: &T, config: &AppConfig) -> Result<()> {
+pub fn save_session<T: Serialize>(
+    provider: Provider,
+    session: &T,
+    config: &AppConfig,
+) -> Result<()> {
     let json = serde_json::to_string_pretty(session)?;
 
     #[cfg(feature = "keyring")]
@@ -217,9 +271,7 @@ fn save_session_keyring(provider: Provider, json: &str) -> Result<()> {
 fn load_session_keyring<T: DeserializeOwned>(provider: Provider) -> Result<T> {
     let entry = keyring::Entry::new("tunmux", provider.dir_name())
         .map_err(|e| AppError::Other(format!("keyring error: {}", e)))?;
-    let json = entry
-        .get_password()
-        .map_err(|_| AppError::NotLoggedIn)?;
+    let json = entry.get_password().map_err(|_| AppError::NotLoggedIn)?;
     let session: T = serde_json::from_str(&json)?;
     Ok(session)
 }

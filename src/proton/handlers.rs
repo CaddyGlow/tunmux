@@ -25,7 +25,12 @@ pub async fn dispatch(command: ProtonCommand, config: &AppConfig) -> anyhow::Res
             proxy,
             socks_port,
             http_port,
-        } => cmd_connect(server, country, p2p, backend, proxy, socks_port, http_port, config).await,
+        } => {
+            cmd_connect(
+                server, country, p2p, backend, proxy, socks_port, http_port, config,
+            )
+            .await
+        }
         ProtonCommand::Disconnect { instance, all } => cmd_disconnect(instance, all),
     }
 }
@@ -102,7 +107,11 @@ fn cmd_info(config: &AppConfig) -> anyhow::Result<()> {
     Ok(())
 }
 
-async fn cmd_servers(country: Option<String>, free: bool, config: &AppConfig) -> anyhow::Result<()> {
+async fn cmd_servers(
+    country: Option<String>,
+    free: bool,
+    config: &AppConfig,
+) -> anyhow::Result<()> {
     let session: models::session::Session = config::load_session(PROVIDER, config)?;
     let client = api::http::ProtonClient::authenticated(&session.uid, &session.access_token)?;
 
@@ -162,8 +171,7 @@ async fn cmd_connect(
     http_port_arg: Option<u16>,
     config: &AppConfig,
 ) -> anyhow::Result<()> {
-    let backend_str = backend_arg.as_deref()
-        .unwrap_or(&config.general.backend);
+    let backend_str = backend_arg.as_deref().unwrap_or(&config.general.backend);
 
     if use_proxy {
         // Proxy mode requires kernel backend
@@ -243,12 +251,7 @@ async fn cmd_connect(
     };
 
     if use_proxy {
-        connect_proxy(
-            server,
-            &params,
-            socks_port_arg,
-            http_port_arg,
-        )?;
+        connect_proxy(server, &params, socks_port_arg, http_port_arg)?;
     } else {
         connect_direct(server, &params, backend, config)?;
     }
@@ -349,9 +352,7 @@ fn connect_direct(
 
     // Check if a direct connection already exists
     if wireguard::connection::ConnectionState::exists(DIRECT_INSTANCE) {
-        anyhow::bail!(
-            "Already connected via direct VPN. Disconnect first."
-        );
+        anyhow::bail!("Already connected via direct VPN. Disconnect first.");
     }
     if wireguard::wg_quick::is_interface_active(INTERFACE_NAME) {
         anyhow::bail!("Already connected. Run `tunmux proton disconnect` first.");
@@ -417,7 +418,11 @@ fn cmd_disconnect(instance: Option<String>, all: bool) -> anyhow::Result<()> {
         let conn = wireguard::connection::ConnectionState::load(name)?
             .ok_or_else(|| anyhow::anyhow!("no connection with instance {:?}", name))?;
         if conn.provider != provider_name {
-            anyhow::bail!("instance {:?} belongs to provider {:?}, not proton", name, conn.provider);
+            anyhow::bail!(
+                "instance {:?} belongs to provider {:?}, not proton",
+                name,
+                conn.provider
+            );
         }
         disconnect_one(&conn)?;
         println!("Disconnected {}", name);
@@ -447,7 +452,10 @@ fn cmd_disconnect(instance: Option<String>, all: bool) -> anyhow::Result<()> {
                     (Some(s), Some(h)) => format!("SOCKS5 :{}, HTTP :{}", s, h),
                     _ => "-".to_string(),
                 };
-                println!("  {}  {}  {}", conn.instance_name, conn.server_display_name, ports);
+                println!(
+                    "  {}  {}  {}",
+                    conn.instance_name, conn.server_display_name, ports
+                );
             }
             println!("\nUsage: tunmux proton disconnect <instance>");
             println!("       tunmux proton disconnect --all");
@@ -472,13 +480,7 @@ fn disconnect_one(state: &wireguard::connection::ConnectionState) -> anyhow::Res
     // Delete namespace if set
     if let Some(ref ns) = state.namespace_name {
         netns::delete(ns)?;
-        // Remove /etc/netns/<ns>/ directory
-        let netns_etc = format!("/etc/netns/{}", ns);
-        if std::path::Path::new(&netns_etc).exists() {
-            let _ = std::process::Command::new("sudo")
-                .args(["rm", "-rf", &netns_etc])
-                .output();
-        }
+        let _ = netns::remove_namespace_dir(ns);
     }
 
     // Tear down WireGuard

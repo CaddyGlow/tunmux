@@ -173,10 +173,10 @@ mod tests {
     #[test]
     fn test_server_filtering() {
         let servers = vec![
-            make_server("US#1", "US", 0, 4, 30, 1.0, 1),  // Free, P2P
-            make_server("US#2", "US", 2, 0, 50, 2.0, 1),  // Plus
-            make_server("CH#1", "CH", 0, 0, 20, 0.5, 1),  // Free
-            make_server("JP#1", "JP", 2, 1, 10, 0.3, 0),  // Plus, SecureCore, disabled
+            make_server("US#1", "US", 0, 4, 30, 1.0, 1), // Free, P2P
+            make_server("US#2", "US", 2, 0, 50, 2.0, 1), // Plus
+            make_server("CH#1", "CH", 0, 0, 20, 0.5, 1), // Free
+            make_server("JP#1", "JP", 2, 1, 10, 0.3, 0), // Plus, SecureCore, disabled
         ];
 
         // Filter by country
@@ -234,9 +234,7 @@ mod tests {
                 exit_ip: "1.2.3.5".to_string(),
                 domain: format!("{}.protonvpn.net", name.to_lowercase()),
                 status: 1,
-                x25519_public_key: Some(
-                    "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=".to_string(),
-                ),
+                x25519_public_key: Some("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=".to_string()),
             }],
             location: Some(Location {
                 lat: Some(0.0),

@@ -46,7 +46,7 @@ location and its own port pair. Host traffic is unaffected.
 
 - Rust 2021 edition (latest stable)
 - Linux (uses ip/wg-quick commands and network namespaces)
-- sudo access for WireGuard and namespace operations
+- A systemd `tunmux-privileged` service for privileged WireGuard/namespace operations
 
 ## Build
 

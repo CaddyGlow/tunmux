@@ -1,20 +1,26 @@
-use std::fs;
-use std::io::Write;
-use std::process::{Command, Stdio};
-
-use tracing::info;
+use std::process::Command;
 
 use crate::error::{AppError, Result};
 use crate::netns;
+use crate::privileged_client::PrivilegedClient;
 
 use super::backend::WgBackend;
 use super::config::WgConfigParams;
 use super::connection::{ConnectionState, DIRECT_INSTANCE};
 
 /// Bring up a WireGuard tunnel using kernel ip/wg commands (host routing).
-pub fn up(params: &WgConfigParams<'_>, interface_name: &str, provider: &str, server_display_name: &str) -> Result<()> {
+pub fn up(
+    params: &WgConfigParams<'_>,
+    interface_name: &str,
+    provider: &str,
+    server_display_name: &str,
+) -> Result<()> {
     let (gw_ip, gw_iface) = get_default_gateway()?;
-    let original_resolv = fs::read_to_string("/etc/resolv.conf").ok();
+    let original_resolv = if should_manage_global_resolv_conf() {
+        std::fs::read_to_string("/etc/resolv.conf").ok()
+    } else {
+        None
+    };
 
     let state = ConnectionState {
         instance_name: DIRECT_INSTANCE.to_string(),
@@ -33,9 +39,14 @@ pub fn up(params: &WgConfigParams<'_>, interface_name: &str, provider: &str, ser
     };
     state.save()?;
 
-    if let Err(e) = bring_up(params, interface_name, &gw_ip, &gw_iface) {
-        // Clean up on failure
-        let _ = sudo_run(&["ip", "link", "del", "dev", interface_name]);
+    if let Err(e) = bring_up(
+        params,
+        interface_name,
+        &gw_ip,
+        &gw_iface,
+        should_manage_global_resolv_conf(),
+    ) {
+        let _ = PrivilegedClient::new().interface_delete(interface_name);
         ConnectionState::remove(DIRECT_INSTANCE)?;
         return Err(e);
     }
@@ -49,68 +60,93 @@ pub fn up_in_netns(
     interface_name: &str,
     namespace: &str,
 ) -> Result<()> {
-    // 1. Create WG interface in host namespace
-    sudo_run(&["ip", "link", "add", "dev", interface_name, "type", "wireguard"])?;
+    let client = PrivilegedClient::new();
 
-    // 2. Configure WG keys/peer (must happen before move -- wg command works on host interface)
+    client.interface_create_wireguard(interface_name)?;
+
     let endpoint = format!("{}:{}", params.server_ip, params.server_port);
     let allowed_ips_wg = params.allowed_ips.replace(", ", ",");
-    if let Err(e) = wg_set(
+    if let Err(e) = client.wireguard_set(
         interface_name,
         params.private_key,
         params.server_public_key,
         &endpoint,
         &allowed_ips_wg,
-        params.preshared_key,
     ) {
-        let _ = sudo_run(&["ip", "link", "del", "dev", interface_name]);
+        let _ = client.interface_delete(interface_name);
+        return Err(e);
+    }
+    if let Some(psk) = params.preshared_key {
+        client.wireguard_set_psk(interface_name, params.server_public_key, psk)?;
+    }
+    if let Err(e) = client.interface_move_to_netns(interface_name, namespace) {
+        let _ = client.interface_delete(interface_name);
         return Err(e);
     }
 
-    // 3. Move interface to namespace
-    if let Err(e) = netns::move_interface(interface_name, namespace) {
-        let _ = sudo_run(&["ip", "link", "del", "dev", interface_name]);
-        return Err(e);
-    }
-
-    // 4. Configure inside namespace
     for addr in params.addresses {
-        netns::exec(namespace, &["ip", "addr", "add", addr, "dev", interface_name])?;
+        if let Err(e) = netns::exec(
+            namespace,
+            &["ip", "addr", "add", addr, "dev", interface_name],
+        ) {
+            let _ = netns::delete(namespace);
+            let _ = client.interface_delete(interface_name);
+            return Err(e);
+        }
     }
-    netns::exec(namespace, &["ip", "link", "set", "up", "dev", interface_name])?;
-    netns::exec(namespace, &["ip", "route", "add", "default", "dev", interface_name])?;
 
-    // Add IPv6 default route if any assigned address is IPv6
+    if let Err(e) = netns::exec(
+        namespace,
+        &["ip", "link", "set", "up", "dev", interface_name],
+    ) {
+        let _ = netns::delete(namespace);
+        let _ = client.interface_delete(interface_name);
+        return Err(e);
+    }
+    if let Err(e) = netns::exec(
+        namespace,
+        &["ip", "route", "add", "default", "dev", interface_name],
+    ) {
+        let _ = netns::delete(namespace);
+        let _ = client.interface_delete(interface_name);
+        return Err(e);
+    }
+
     let has_ipv6 = params.addresses.iter().any(|a| a.contains(':'));
     if has_ipv6 {
-        netns::exec(namespace, &["ip", "-6", "route", "add", "default", "dev", interface_name])?;
+        if let Err(e) = netns::exec(
+            namespace,
+            &["ip", "-6", "route", "add", "default", "dev", interface_name],
+        ) {
+            let _ = netns::delete(namespace);
+            let _ = client.interface_delete(interface_name);
+            return Err(e);
+        }
     }
 
-    // 5. Set DNS inside namespace: /etc/netns/<ns>/resolv.conf
     let netns_etc = format!("/etc/netns/{}", namespace);
-    sudo_run(&["mkdir", "-p", &netns_etc])?;
+    client.ensure_dir(&netns_etc, 0o700)?;
     let dns_content: String = params
         .dns_servers
         .iter()
         .map(|d| format!("nameserver {}\n", d))
         .collect();
-    sudo_tee(&format!("{}/resolv.conf", netns_etc), &dns_content)?;
+    client.write_file(
+        &format!("{}/resolv.conf", netns_etc),
+        dns_content.as_bytes(),
+        0o644,
+    )?;
 
-    info!(
-        "Kernel WireGuard tunnel brought up on {} in namespace {}",
-        interface_name, namespace
-    );
     Ok(())
 }
 
 /// Tear down a kernel WireGuard tunnel.
 pub fn down(state: &ConnectionState) -> Result<()> {
     let iface = &state.interface_name;
+    let client = PrivilegedClient::new();
 
-    // Removing the interface also removes its routes and addresses
-    sudo_run(&["ip", "link", "del", "dev", iface])?;
+    let _ = client.interface_delete(iface);
 
-    // Remove the endpoint host route
     if let (Some(gw_ip), Some(gw_iface)) =
         (&state.original_gateway_ip, &state.original_gateway_iface)
     {
@@ -120,184 +156,71 @@ pub fn down(state: &ConnectionState) -> Result<()> {
             .next()
             .unwrap_or(&state.server_endpoint);
         let host_route = format!("{}/32", endpoint_ip);
-        // Best-effort: route may already be gone
-        let _ = sudo_run(&["ip", "route", "del", &host_route, "via", gw_ip, "dev", gw_iface]);
+        let _ = client.host_ip_route_del(&host_route, Some(gw_ip), gw_iface);
     }
 
-    // Restore /etc/resolv.conf
     if let Some(ref original) = state.original_resolv_conf {
-        sudo_tee("/etc/resolv.conf", original)?;
-        info!("Restored /etc/resolv.conf");
+        if should_manage_global_resolv_conf() {
+            client.write_file("/etc/resolv.conf", original.as_bytes(), 0o644)?;
+        }
     }
 
     ConnectionState::remove(&state.instance_name)?;
     Ok(())
 }
 
-fn bring_up(params: &WgConfigParams<'_>, interface_name: &str, gw_ip: &str, gw_iface: &str) -> Result<()> {
-    // 1. Create interface
-    sudo_run(&["ip", "link", "add", "dev", interface_name, "type", "wireguard"])?;
+fn bring_up(
+    params: &WgConfigParams<'_>,
+    interface_name: &str,
+    gw_ip: &str,
+    gw_iface: &str,
+    manage_resolv_conf: bool,
+) -> Result<()> {
+    let client = PrivilegedClient::new();
+    client.interface_create_wireguard(interface_name)?;
 
-    // 2. Configure wireguard (pipe private key via stdin)
     let endpoint = format!("{}:{}", params.server_ip, params.server_port);
-    // wg set expects comma-separated allowed-ips without spaces
     let allowed_ips_wg = params.allowed_ips.replace(", ", ",");
-    wg_set(interface_name, params.private_key, params.server_public_key, &endpoint, &allowed_ips_wg, params.preshared_key)?;
+    client.wireguard_set(
+        interface_name,
+        params.private_key,
+        params.server_public_key,
+        &endpoint,
+        &allowed_ips_wg,
+    )?;
 
-    // 3. Assign addresses
     for addr in params.addresses {
-        sudo_run(&["ip", "addr", "add", addr, "dev", interface_name])?;
+        client.host_ip_addr_add(interface_name, addr)?;
     }
 
-    // 4. Bring interface up
-    sudo_run(&["ip", "link", "set", "up", "dev", interface_name])?;
+    client.host_ip_link_set_up(interface_name)?;
 
-    // 5. Add host route for the server endpoint via original gateway
     let host_route = format!("{}/32", params.server_ip);
-    sudo_run(&[
-        "ip", "route", "add", &host_route, "via", gw_ip, "dev", gw_iface,
-    ])?;
+    client.host_ip_route_add(&host_route, Some(gw_ip), gw_iface)?;
+    client.host_ip_route_add("0.0.0.0/1", None, interface_name)?;
+    client.host_ip_route_add("128.0.0.0/1", None, interface_name)?;
 
-    // 6. Split-route trick: 0/1 + 128/1 covers all traffic without replacing the default route
-    sudo_run(&["ip", "route", "add", "0.0.0.0/1", "dev", interface_name])?;
-    sudo_run(&["ip", "route", "add", "128.0.0.0/1", "dev", interface_name])?;
-
-    // 7. Set DNS
     let dns_content: String = params
         .dns_servers
         .iter()
         .map(|d| format!("nameserver {}\n", d))
         .collect();
-    sudo_tee("/etc/resolv.conf", &dns_content)?;
-
-    info!("Kernel WireGuard tunnel brought up on {}", interface_name);
-    Ok(())
-}
-
-fn wg_set(interface_name: &str, private_key: &str, peer_pubkey: &str, endpoint: &str, allowed_ips: &str, preshared_key: Option<&str>) -> Result<()> {
-    info!("Running: sudo wg set {} ...", interface_name);
-
-    let args = vec![
-        "wg", "set", interface_name,
-        "private-key", "/dev/stdin",
-        "peer", peer_pubkey,
-        "allowed-ips", allowed_ips,
-        "endpoint", endpoint,
-    ];
-
-    let mut child = Command::new("sudo")
-        .args(&args)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .map_err(|e| AppError::WireGuard(format!("failed to run wg set: {}", e)))?;
-
-    if let Some(ref mut stdin) = child.stdin {
-        stdin
-            .write_all(private_key.as_bytes())
-            .map_err(|e| AppError::WireGuard(format!("failed to write private key: {}", e)))?;
-    }
-
-    let output = child
-        .wait_with_output()
-        .map_err(|e| AppError::WireGuard(format!("wg set failed: {}", e)))?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(AppError::WireGuard(format!(
-            "wg set failed: {}",
-            stderr.trim()
-        )));
-    }
-
-    // Handle preshared key as a separate wg set call if needed
-    if let Some(psk) = preshared_key {
-        set_preshared_key(interface_name, peer_pubkey, psk)?;
+    if manage_resolv_conf {
+        client.write_file("/etc/resolv.conf", dns_content.as_bytes(), 0o644)?;
     }
 
     Ok(())
 }
 
-fn set_preshared_key(interface_name: &str, peer_pubkey: &str, psk: &str) -> Result<()> {
-    let mut child = Command::new("sudo")
-        .args([
-            "wg", "set", interface_name,
-            "peer", peer_pubkey,
-            "preshared-key", "/dev/stdin",
-        ])
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .map_err(|e| AppError::WireGuard(format!("failed to set preshared key: {}", e)))?;
-
-    if let Some(ref mut stdin) = child.stdin {
-        stdin
-            .write_all(psk.as_bytes())
-            .map_err(|e| AppError::WireGuard(format!("failed to write preshared key: {}", e)))?;
-    }
-
-    let output = child
-        .wait_with_output()
-        .map_err(|e| AppError::WireGuard(format!("wg set preshared-key failed: {}", e)))?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(AppError::WireGuard(format!(
-            "wg set preshared-key failed: {}",
-            stderr.trim()
-        )));
-    }
-
-    Ok(())
+fn should_manage_global_resolv_conf() -> bool {
+    !is_systemd_resolved_managed_resolv_conf("/etc/resolv.conf")
 }
 
-fn sudo_run(args: &[&str]) -> Result<()> {
-    info!("Running: sudo {}", args.join(" "));
-    let output = Command::new("sudo")
-        .args(args)
-        .output()
-        .map_err(|e| AppError::WireGuard(format!("failed to run sudo {}: {}", args[0], e)))?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(AppError::WireGuard(format!(
-            "sudo {} failed: {}",
-            args.join(" "),
-            stderr.trim()
-        )));
+fn is_systemd_resolved_managed_resolv_conf(path: &str) -> bool {
+    match std::fs::canonicalize(path) {
+        Ok(real_path) => real_path.starts_with("/run/systemd/resolve/"),
+        Err(_) => false,
     }
-
-    Ok(())
-}
-
-fn sudo_tee(path: &str, content: &str) -> Result<()> {
-    let mut child = Command::new("sudo")
-        .args(["tee", path])
-        .stdin(Stdio::piped())
-        .stdout(Stdio::null())
-        .spawn()
-        .map_err(|e| AppError::WireGuard(format!("failed to run sudo tee {}: {}", path, e)))?;
-
-    if let Some(ref mut stdin) = child.stdin {
-        stdin
-            .write_all(content.as_bytes())
-            .map_err(|e| AppError::WireGuard(format!("failed to write to {}: {}", path, e)))?;
-    }
-
-    let status = child
-        .wait()
-        .map_err(|e| AppError::WireGuard(format!("sudo tee {} failed: {}", path, e)))?;
-
-    if !status.success() {
-        return Err(AppError::WireGuard(format!(
-            "sudo tee {} exited with {}",
-            path, status
-        )));
-    }
-
-    Ok(())
 }
 
 /// Parse the default gateway IP and interface from `ip route show default`.
@@ -327,7 +250,6 @@ fn parse_default_route(output: &str) -> Result<(String, String)> {
     let gateway = tokens
         .get(via_pos + 1)
         .ok_or_else(|| AppError::WireGuard("no gateway IP after 'via'".into()))?;
-
     let dev_pos = tokens
         .iter()
         .position(|&t| t == "dev")

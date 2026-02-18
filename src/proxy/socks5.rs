@@ -109,9 +109,7 @@ pub async fn handle_socks5(
 
     match cmd {
         CMD_CONNECT => handle_connect(client, atyp).await,
-        CMD_UDP_ASSOCIATE => {
-            handle_udp_associate(client, atyp, associations, udp_relay).await
-        }
+        CMD_UDP_ASSOCIATE => handle_udp_associate(client, atyp, associations, udp_relay).await,
         _ => {
             send_reply(&mut client, REP_CMD_NOT_SUPPORTED, None).await?;
             anyhow::bail!("unsupported SOCKS command: {}", cmd);
@@ -120,10 +118,7 @@ pub async fn handle_socks5(
 }
 
 /// Parse the address (ATYP-dependent) and port from the SOCKS5 request stream.
-async fn parse_address(
-    client: &mut TcpStream,
-    atyp: u8,
-) -> anyhow::Result<(String, u16)> {
+async fn parse_address(client: &mut TcpStream, atyp: u8) -> anyhow::Result<(String, u16)> {
     let addr = match atyp {
         ATYP_IPV4 => {
             let mut buf = [0u8; 4];
@@ -405,7 +400,13 @@ fn build_connect_ipv4(ip: [u8; 4], port: u16) -> Vec<u8> {
 /// Build a SOCKS5 CONNECT request for a domain name and port.
 #[cfg(test)]
 fn build_connect_domain(domain: &[u8], port: u16) -> Vec<u8> {
-    let mut req = vec![SOCKS_VERSION, CMD_CONNECT, 0x00, ATYP_DOMAIN, domain.len() as u8];
+    let mut req = vec![
+        SOCKS_VERSION,
+        CMD_CONNECT,
+        0x00,
+        ATYP_DOMAIN,
+        domain.len() as u8,
+    ];
     req.extend_from_slice(domain);
     req.extend_from_slice(&port.to_be_bytes());
     req
@@ -493,18 +494,16 @@ mod tests {
     ) {
         tokio::spawn(async move {
             let (stream, _) = proxy_listener.accept().await.unwrap();
-            let _ = handle_socks5(
-                stream,
-                associations,
-                Some((relay_socket, relay_addr)),
-            )
-            .await;
+            let _ = handle_socks5(stream, associations, Some((relay_socket, relay_addr))).await;
         });
     }
 
     /// Perform the SOCKS5 no-auth greeting handshake on a client stream.
     async fn socks5_greet(client: &mut TcpStream) {
-        client.write_all(&[SOCKS_VERSION, 0x01, AUTH_NONE]).await.unwrap();
+        client
+            .write_all(&[SOCKS_VERSION, 0x01, AUTH_NONE])
+            .await
+            .unwrap();
         let mut resp = [0u8; 2];
         client.read_exact(&mut resp).await.unwrap();
         assert_eq!(resp, [SOCKS_VERSION, AUTH_NONE]);
@@ -645,7 +644,12 @@ mod tests {
 
         let (proxy_listener, associations, relay_socket, relay_addr) = setup_socks5().await;
         let proxy_addr = proxy_listener.local_addr().unwrap();
-        spawn_socks5_handler(proxy_listener, associations.clone(), relay_socket, relay_addr);
+        spawn_socks5_handler(
+            proxy_listener,
+            associations.clone(),
+            relay_socket,
+            relay_addr,
+        );
 
         let mut tcp = TcpStream::connect(proxy_addr).await.unwrap();
         socks5_greet(&mut tcp).await;
@@ -677,7 +681,10 @@ mod tests {
 
         // Verify the associations map is empty
         let map = associations.inner.read().await;
-        assert!(map.is_empty(), "associations should be cleaned up after TCP close");
+        assert!(
+            map.is_empty(),
+            "associations should be cleaned up after TCP close"
+        );
     }
 
     #[tokio::test]

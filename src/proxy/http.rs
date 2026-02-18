@@ -30,10 +30,7 @@ pub async fn handle_http(client: TcpStream) -> anyhow::Result<()> {
 }
 
 /// HTTP CONNECT tunneling (e.g., for HTTPS)
-async fn handle_connect(
-    mut buf_client: BufReader<TcpStream>,
-    target: &str,
-) -> anyhow::Result<()> {
+async fn handle_connect(mut buf_client: BufReader<TcpStream>, target: &str) -> anyhow::Result<()> {
     debug!("HTTP CONNECT to {}", target);
 
     // Read and discard remaining headers
@@ -108,9 +105,7 @@ async fn handle_plain(
         }
         let lower = line.to_lowercase();
         // Skip proxy-only and connection headers; we inject our own
-        if lower.starts_with("proxy-connection:")
-            || lower.starts_with("connection:")
-        {
+        if lower.starts_with("proxy-connection:") || lower.starts_with("connection:") {
             continue;
         }
         if lower.starts_with("host:") {
@@ -310,7 +305,11 @@ mod tests {
         let mut resp_buf = vec![0u8; 256];
         let n = client.read(&mut resp_buf).await.unwrap();
         let resp = String::from_utf8_lossy(&resp_buf[..n]);
-        assert!(resp.starts_with("HTTP/1.1 200"), "expected 200, got: {}", resp);
+        assert!(
+            resp.starts_with("HTTP/1.1 200"),
+            "expected 200, got: {}",
+            resp
+        );
 
         // Tunnel is established -- echo test
         client.write_all(b"tunnel data").await.unwrap();
@@ -337,7 +336,11 @@ mod tests {
         let mut resp_buf = vec![0u8; 256];
         let n = client.read(&mut resp_buf).await.unwrap();
         let resp = String::from_utf8_lossy(&resp_buf[..n]);
-        assert!(resp.starts_with("HTTP/1.1 502"), "expected 502, got: {}", resp);
+        assert!(
+            resp.starts_with("HTTP/1.1 502"),
+            "expected 502, got: {}",
+            resp
+        );
     }
 
     #[tokio::test]
@@ -364,7 +367,15 @@ mod tests {
         let mut resp = Vec::new();
         client.read_to_end(&mut resp).await.unwrap();
         let resp_str = String::from_utf8_lossy(&resp);
-        assert!(resp_str.contains("200 OK"), "expected 200, got: {}", resp_str);
-        assert!(resp_str.contains("hello from server"), "body missing: {}", resp_str);
+        assert!(
+            resp_str.contains("200 OK"),
+            "expected 200, got: {}",
+            resp_str
+        );
+        assert!(
+            resp_str.contains("hello from server"),
+            "body missing: {}",
+            resp_str
+        );
     }
 }

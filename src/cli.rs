@@ -42,6 +42,17 @@ pub enum TopCommand {
         #[arg(long)]
         log_file: String,
     },
+
+    /// Internal privileged service mode (hidden)
+    #[command(hide = true)]
+    Privileged {
+        #[arg(long)]
+        serve: bool,
+
+        /// Optional group name for privileged socket authorization.
+        #[arg(long)]
+        authorized_group: Option<String>,
+    },
 }
 
 #[derive(Subcommand)]

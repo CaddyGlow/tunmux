@@ -27,7 +27,12 @@ pub async fn dispatch(command: AirVpnCommand, config: &AppConfig) -> anyhow::Res
             proxy,
             socks_port,
             http_port,
-        } => cmd_connect(server, country, key, backend, proxy, socks_port, http_port, config).await,
+        } => {
+            cmd_connect(
+                server, country, key, backend, proxy, socks_port, http_port, config,
+            )
+            .await
+        }
         AirVpnCommand::Disconnect { instance, all } => cmd_disconnect(instance, all),
         AirVpnCommand::Sessions => cmd_sessions(config).await,
         AirVpnCommand::Ports { action } => cmd_ports(action, config).await,
@@ -44,8 +49,10 @@ pub async fn dispatch(command: AirVpnCommand, config: &AppConfig) -> anyhow::Res
             output,
             format,
         } => {
-            cmd_generate(&server, &protocol, device, &entry, &exit, mtu, keepalive, output, &format, config)
-                .await
+            cmd_generate(
+                &server, &protocol, device, &entry, &exit, mtu, keepalive, output, &format, config,
+            )
+            .await
         }
     }
 }
@@ -99,7 +106,10 @@ fn cmd_info(config: &AppConfig) -> anyhow::Result<()> {
     println!("Username:   {}", session.username);
     println!("WG keys:    {}", session.keys.len());
     for key in &session.keys {
-        println!("  Key {:?}: IPv4={}, IPv6={}", key.name, key.wg_ipv4, key.wg_ipv6);
+        println!(
+            "  Key {:?}: IPv4={}, IPv6={}",
+            key.name, key.wg_ipv4, key.wg_ipv6
+        );
     }
     Ok(())
 }
@@ -134,12 +144,7 @@ fn cmd_servers(country: Option<String>) -> anyhow::Result<()> {
         let bw_mbps = s.bandwidth / 1_000_000;
         println!(
             "{:<20} {:>2}  {:>9} Mb  {:>4}/{:<4}  {}",
-            s.name,
-            s.country_code,
-            bw_mbps,
-            s.users,
-            s.users_max,
-            s.location,
+            s.name, s.country_code, bw_mbps, s.users, s.users_max, s.location,
         );
     }
 
@@ -158,8 +163,7 @@ async fn cmd_connect(
     http_port_arg: Option<u16>,
     config: &AppConfig,
 ) -> anyhow::Result<()> {
-    let backend_str = backend_arg.as_deref()
-        .unwrap_or(&config.general.backend);
+    let backend_str = backend_arg.as_deref().unwrap_or(&config.general.backend);
 
     if use_proxy && backend_str == "wg-quick" {
         anyhow::bail!("--proxy requires kernel backend (incompatible with --backend wg-quick)");
@@ -292,9 +296,24 @@ async fn cmd_connect(
     };
 
     if use_proxy {
-        connect_proxy(&server.name, &server.country_code, server_ip, wg_mode.port, &params, socks_port_arg, http_port_arg)?;
+        connect_proxy(
+            &server.name,
+            &server.country_code,
+            server_ip,
+            wg_mode.port,
+            &params,
+            socks_port_arg,
+            http_port_arg,
+        )?;
     } else {
-        connect_direct(&server.name, &server.country_code, server_ip, wg_mode.port, &params, backend)?;
+        connect_direct(
+            &server.name,
+            &server.country_code,
+            server_ip,
+            wg_mode.port,
+            &params,
+            backend,
+        )?;
     }
 
     Ok(())
@@ -456,7 +475,11 @@ fn cmd_disconnect(instance: Option<String>, all: bool) -> anyhow::Result<()> {
         let conn = wireguard::connection::ConnectionState::load(name)?
             .ok_or_else(|| anyhow::anyhow!("no connection with instance {:?}", name))?;
         if conn.provider != provider_name {
-            anyhow::bail!("instance {:?} belongs to provider {:?}, not airvpn", name, conn.provider);
+            anyhow::bail!(
+                "instance {:?} belongs to provider {:?}, not airvpn",
+                name,
+                conn.provider
+            );
         }
         disconnect_one(&conn)?;
         println!("Disconnected {}", name);
@@ -486,7 +509,10 @@ fn cmd_disconnect(instance: Option<String>, all: bool) -> anyhow::Result<()> {
                     (Some(s), Some(h)) => format!("SOCKS5 :{}, HTTP :{}", s, h),
                     _ => "-".to_string(),
                 };
-                println!("  {}  {}  {}", conn.instance_name, conn.server_display_name, ports);
+                println!(
+                    "  {}  {}  {}",
+                    conn.instance_name, conn.server_display_name, ports
+                );
             }
             println!("\nUsage: tunmux airvpn disconnect <instance>");
             println!("       tunmux airvpn disconnect --all");
@@ -513,9 +539,7 @@ fn disconnect_one(state: &wireguard::connection::ConnectionState) -> anyhow::Res
         netns::delete(ns)?;
         let netns_etc = format!("/etc/netns/{}", ns);
         if std::path::Path::new(&netns_etc).exists() {
-            let _ = std::process::Command::new("sudo")
-                .args(["rm", "-rf", &netns_etc])
-                .output();
+            let _ = netns::remove_namespace_dir(ns);
         }
     }
 
@@ -568,14 +592,8 @@ async fn cmd_sessions(config: &AppConfig) -> anyhow::Result<()> {
         let rx_speed = format_speed(s.speed_read);
 
         println!("{} on {} ({})", s.device_name, server, location);
-        println!(
-            "  VPN:   {} / {}",
-            s.vpn_ipv4, s.vpn_ipv6
-        );
-        println!(
-            "  Exit:  {} / {}",
-            s.exit_ipv4, s.exit_ipv6
-        );
+        println!("  VPN:   {} / {}", s.vpn_ipv4, s.vpn_ipv6);
+        println!("  Exit:  {} / {}", s.exit_ipv4, s.exit_ipv6);
         println!(
             "  Up {} -- TX {} ({}/s) / RX {} ({}/s)",
             uptime, tx, tx_speed, rx, rx_speed
@@ -588,9 +606,7 @@ async fn cmd_sessions(config: &AppConfig) -> anyhow::Result<()> {
     }
 
     // Strip HTML tags from message
-    let clean_msg = message
-        .replace("<b>", "")
-        .replace("</b>", "");
+    let clean_msg = message.replace("<b>", "").replace("</b>", "");
     println!("{}", clean_msg);
     Ok(())
 }
@@ -751,10 +767,7 @@ async fn cmd_ports_info(web: &AirVpnWeb, port: u16) -> anyhow::Result<()> {
             s.server_location,
             s.server_country.to_uppercase(),
         );
-        println!(
-            "    Server: {}  Client: {}",
-            s.server_ip, s.client_ip
-        );
+        println!("    Server: {}  Client: {}", s.server_ip, s.client_ip);
         println!(
             "    Device: {}  Local: {}  DDNS: {}",
             s.device_name, local_port, ddns
@@ -783,7 +796,9 @@ async fn cmd_ports_check(web: &AirVpnWeb, port: u16) -> anyhow::Result<()> {
         }
         tested.push(key);
 
-        let result = web.test_port(&s.server_ip, port, s.pool, &s.protocol).await?;
+        let result = web
+            .test_port(&s.server_ip, port, s.pool, &s.protocol)
+            .await?;
         println!(
             "{} {} {} ({}): {}",
             s.server_name,
@@ -852,10 +867,7 @@ async fn cmd_devices_list(web: &AirVpnWeb) -> anyhow::Result<()> {
         return Ok(());
     }
 
-    println!(
-        "{:<16} {:<18} {:<44} Public Key",
-        "Name", "IPv4", "IPv6"
-    );
+    println!("{:<16} {:<18} {:<44} Public Key", "Name", "IPv4", "IPv6");
     println!("{}", "-".repeat(110));
     for d in &devices {
         let key_short = if d.wg_public_key.len() > 20 {
@@ -1133,10 +1145,9 @@ fn save_manifest(manifest: &AirManifest) -> anyhow::Result<()> {
 }
 
 fn load_manifest() -> anyhow::Result<AirManifest> {
-    let data = config::load_provider_file(PROVIDER, MANIFEST_FILE)?
-        .ok_or_else(|| error::AppError::Other(
-            "no cached manifest -- run `tunmux airvpn login` first".into(),
-        ))?;
+    let data = config::load_provider_file(PROVIDER, MANIFEST_FILE)?.ok_or_else(|| {
+        error::AppError::Other("no cached manifest -- run `tunmux airvpn login` first".into())
+    })?;
     let manifest: AirManifest = serde_json::from_slice(&data)?;
     Ok(manifest)
 }

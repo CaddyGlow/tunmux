@@ -1,0 +1,763 @@
+use std::collections::HashSet;
+use std::io::{BufRead, BufReader, Write};
+use std::os::unix::fs::PermissionsExt;
+use std::os::unix::io::FromRawFd;
+use std::os::unix::net::UnixStream;
+use std::process::{Command, Stdio};
+use std::time::{Duration, Instant};
+
+use nix::sys::signal::{kill, Signal};
+use nix::sys::socket::{getsockopt, sockopt::PeerCredentials};
+use nix::unistd::{chown, Gid, Pid};
+use tracing::{info, warn};
+
+use crate::config;
+use crate::error::{AppError, Result};
+use crate::privileged_api::{KillSignal, PrivilegedRequest, PrivilegedResponse, WgQuickAction};
+
+const AUTH_GROUP_NAME: &str = "tunmux";
+
+pub fn serve(cli_authorized_group: Option<String>) -> anyhow::Result<()> {
+    let authorized_group = resolve_authorized_group(cli_authorized_group);
+    config::ensure_privileged_socket_dir()?;
+    config::ensure_privileged_runtime_dir()?;
+
+    // Resolve group GID for chown of socket dir and file.
+    let group_gid = authorized_group
+        .as_deref()
+        .and_then(read_group_gid)
+        .or_else(|| read_group_gid(AUTH_GROUP_NAME));
+
+    // Chown socket directory so group members can traverse it (mode 0750).
+    if let Some(gid) = group_gid {
+        let socket_dir = config::privileged_socket_dir();
+        chown(&socket_dir, None, Some(Gid::from_raw(gid)))?;
+        info!("socket dir {} chowned to gid {}", socket_dir.display(), gid);
+    }
+
+    let listener = match systemd_activated_listener()? {
+        Some(listener) => {
+            info!("privileged service using systemd socket activation");
+            listener
+        }
+        None => {
+            let socket_path = config::privileged_socket_path();
+            if socket_path.exists() {
+                let _ = std::fs::remove_file(&socket_path);
+            }
+
+            let listener = std::os::unix::net::UnixListener::bind(&socket_path)?;
+            let perms = std::fs::Permissions::from_mode(0o660);
+            std::fs::set_permissions(&socket_path, perms)?;
+
+            // Chown socket file so group members can connect (mode 0660).
+            if let Some(gid) = group_gid {
+                chown(&socket_path, None, Some(Gid::from_raw(gid)))?;
+                info!("socket {} chowned to gid {}", socket_path.display(), gid);
+            }
+
+            info!("privileged service listening on {}", socket_path.display());
+            listener
+        }
+    };
+
+    let mut managed_pids = HashSet::new();
+    loop {
+        let (stream, _) = listener.accept()?;
+        let mut stream = stream;
+        let response = handle_client(&mut stream, &mut managed_pids, authorized_group.as_deref());
+        let mut buffer = serde_json::to_vec(&response)?;
+        buffer.push(b'\n');
+        if let Err(e) = stream.write_all(&buffer) {
+            warn!("failed to write privileged response: {}", e);
+        }
+    }
+}
+
+fn systemd_activated_listener() -> anyhow::Result<Option<std::os::unix::net::UnixListener>> {
+    let Some(listen_pid) = std::env::var("LISTEN_PID").ok() else {
+        return Ok(None);
+    };
+    let listen_pid: u32 = match listen_pid.parse() {
+        Ok(pid) => pid,
+        Err(_) => return Ok(None),
+    };
+    if listen_pid != std::process::id() {
+        return Ok(None);
+    }
+
+    let listen_fds: usize = match std::env::var("LISTEN_FDS")
+        .ok()
+        .and_then(|value| value.parse().ok())
+    {
+        Some(fds) if fds > 0 => fds,
+        _ => return Ok(None),
+    };
+    let _ = listen_fds;
+
+    // First inherited descriptor starts at fd 3 as defined by socket activation protocol.
+    let listener = unsafe { std::os::unix::net::UnixListener::from_raw_fd(3) };
+
+    // Prevent reused descriptors by descendants from accidentally consuming this fd.
+    std::env::remove_var("LISTEN_FDS");
+    std::env::remove_var("LISTEN_PID");
+
+    Ok(Some(listener))
+}
+
+fn handle_client(
+    stream: &mut UnixStream,
+    managed_pids: &mut HashSet<u32>,
+    authorized_group: Option<&str>,
+) -> PrivilegedResponse {
+    let mut reader = BufReader::new(&mut *stream);
+    let mut payload = String::new();
+    if let Err(e) = reader.read_line(&mut payload) {
+        return PrivilegedResponse::Error {
+            code: "Protocol".into(),
+            message: format!("failed to read request: {}", e),
+        };
+    }
+
+    let peer = match getsockopt(&*stream, PeerCredentials) {
+        Ok(peer) => {
+            let peer_uid = peer.uid();
+            let peer_gid = peer.gid();
+            if !is_authorized(peer_uid, peer_gid, authorized_group) {
+                let message = format!("peer uid={} gid={} not authorized", peer_uid, peer_gid);
+                warn!("{}", message);
+                return PrivilegedResponse::Error {
+                    code: "Auth".into(),
+                    message,
+                };
+            }
+            (peer_uid, peer_gid)
+        }
+        Err(e) => {
+            return PrivilegedResponse::Error {
+                code: "Auth".into(),
+                message: format!("SO_PEERCRED failed: {}", e),
+            };
+        }
+    };
+
+    if payload.trim().is_empty() {
+        return PrivilegedResponse::Error {
+            code: "Protocol".into(),
+            message: "empty privileged request".into(),
+        };
+    }
+
+    let request: PrivilegedRequest = match serde_json::from_str::<PrivilegedRequest>(&payload) {
+        Ok(req) => req,
+        Err(e) => {
+            return PrivilegedResponse::Error {
+                code: "Protocol".into(),
+                message: format!("invalid request format: {}", e),
+            };
+        }
+    };
+    let request_kind = describe_request(&request);
+    info!(
+        "privileged request from uid={} gid={} => {}",
+        peer.0, peer.1, request_kind
+    );
+
+    if let Err(e) = request.validate() {
+        return PrivilegedResponse::Error {
+            code: "Validation".into(),
+            message: e,
+        };
+    }
+
+    dispatch(request, managed_pids)
+}
+
+fn describe_request(request: &PrivilegedRequest) -> &'static str {
+    match request {
+        PrivilegedRequest::NamespaceCreate { .. } => "NamespaceCreate",
+        PrivilegedRequest::NamespaceDelete { .. } => "NamespaceDelete",
+        PrivilegedRequest::NamespaceExists { .. } => "NamespaceExists",
+        PrivilegedRequest::InterfaceCreateWireguard { .. } => "InterfaceCreateWireguard",
+        PrivilegedRequest::InterfaceDelete { .. } => "InterfaceDelete",
+        PrivilegedRequest::InterfaceMoveToNetns { .. } => "InterfaceMoveToNetns",
+        PrivilegedRequest::NetnsExec { .. } => "NetnsExec",
+        PrivilegedRequest::HostIpAddrAdd { .. } => "HostIpAddrAdd",
+        PrivilegedRequest::HostIpLinkSetUp { .. } => "HostIpLinkSetUp",
+        PrivilegedRequest::HostIpRouteAdd { .. } => "HostIpRouteAdd",
+        PrivilegedRequest::HostIpRouteDel { .. } => "HostIpRouteDel",
+        PrivilegedRequest::WireguardSet { .. } => "WireguardSet",
+        PrivilegedRequest::WireguardSetPsk { .. } => "WireguardSetPsk",
+        PrivilegedRequest::WgQuickRun { .. } => "WgQuickRun",
+        PrivilegedRequest::EnsureDir { .. } => "EnsureDir",
+        PrivilegedRequest::WriteFile { .. } => "WriteFile",
+        PrivilegedRequest::RemoveDirAll { .. } => "RemoveDirAll",
+        PrivilegedRequest::KillPid { .. } => "KillPid",
+        PrivilegedRequest::SpawnProxyDaemon { .. } => "SpawnProxyDaemon",
+    }
+}
+
+fn dispatch(request: PrivilegedRequest, managed_pids: &mut HashSet<u32>) -> PrivilegedResponse {
+    match request {
+        PrivilegedRequest::NamespaceCreate { name } => {
+            execute_unit(run(&["ip", "netns", "add", name.as_str()]))
+        }
+
+        PrivilegedRequest::NamespaceDelete { name } => {
+            execute_unit(run(&["ip", "netns", "del", name.as_str()]))
+        }
+
+        PrivilegedRequest::NamespaceExists { name } => {
+            let path = std::path::Path::new("/run/netns").join(name);
+            PrivilegedResponse::Bool(path.exists())
+        }
+
+        PrivilegedRequest::InterfaceCreateWireguard { name } => execute_unit(run(&[
+            "ip",
+            "link",
+            "add",
+            "dev",
+            name.as_str(),
+            "type",
+            "wireguard",
+        ])),
+
+        PrivilegedRequest::InterfaceDelete { name } => {
+            execute_unit(run(&["ip", "link", "del", "dev", name.as_str()]))
+        }
+
+        PrivilegedRequest::InterfaceMoveToNetns {
+            interface,
+            namespace,
+        } => execute_unit(run(&[
+            "ip",
+            "link",
+            "set",
+            interface.as_str(),
+            "netns",
+            namespace.as_str(),
+        ])),
+
+        PrivilegedRequest::NetnsExec { namespace, args } => {
+            if args.is_empty() {
+                return PrivilegedResponse::Error {
+                    code: "Validation".into(),
+                    message: "empty args".into(),
+                };
+            }
+
+            let mut command_args: Vec<&str> = vec!["ip", "netns", "exec", namespace.as_str()];
+            command_args.extend(args.iter().map(String::as_str));
+
+            let output = Command::new(command_args[0])
+                .args(&command_args[1..])
+                .output();
+            match output {
+                Ok(out) if out.status.success() => PrivilegedResponse::Unit,
+                Ok(out) => PrivilegedResponse::Error {
+                    code: "Kernel".into(),
+                    message: String::from_utf8_lossy(&out.stderr).trim().to_string(),
+                },
+                Err(e) => PrivilegedResponse::Error {
+                    code: "Kernel".into(),
+                    message: format!("ip netns exec failed: {}", e),
+                },
+            }
+        }
+
+        PrivilegedRequest::HostIpAddrAdd { interface, cidr } => execute_unit(run(&[
+            "ip",
+            "addr",
+            "add",
+            cidr.as_str(),
+            "dev",
+            interface.as_str(),
+        ])),
+
+        PrivilegedRequest::HostIpLinkSetUp { interface } => {
+            execute_unit(run(&["ip", "link", "set", "up", "dev", interface.as_str()]))
+        }
+
+        PrivilegedRequest::HostIpRouteAdd {
+            destination,
+            via,
+            dev,
+        } => execute_route("add", destination.as_str(), via.as_deref(), dev.as_str()),
+
+        PrivilegedRequest::HostIpRouteDel {
+            destination,
+            via,
+            dev,
+        } => execute_route("del", destination.as_str(), via.as_deref(), dev.as_str()),
+
+        PrivilegedRequest::WireguardSet {
+            interface,
+            private_key,
+            peer_public_key,
+            endpoint,
+            allowed_ips,
+        } => execute_unit(wg_set(
+            interface.as_str(),
+            private_key.as_str(),
+            peer_public_key.as_str(),
+            endpoint.as_str(),
+            allowed_ips.as_str(),
+        )),
+
+        PrivilegedRequest::WireguardSetPsk {
+            interface,
+            peer_public_key,
+            psk,
+        } => execute_unit(set_preshared_key(
+            interface.as_str(),
+            peer_public_key.as_str(),
+            psk.as_str(),
+        )),
+
+        PrivilegedRequest::WgQuickRun {
+            action,
+            interface,
+            provider,
+            config_content,
+        } => {
+            let base = config::privileged_wg_dir().join(provider.as_str());
+            if let Err(e) = config::ensure_privileged_directory(&base) {
+                return PrivilegedResponse::Error {
+                    code: "IO".into(),
+                    message: format!("failed creating wg dir: {}", e),
+                };
+            }
+
+            let config_path = base.join(format!("{interface}.conf"));
+            match action {
+                WgQuickAction::Up => match run_wg_quick_up(&config_path, config_content.as_bytes())
+                {
+                    Ok(()) => PrivilegedResponse::Unit,
+                    Err(e) => PrivilegedResponse::Error {
+                        code: categorize_error(&e),
+                        message: format!("{}", e),
+                    },
+                },
+                WgQuickAction::Down => {
+                    let result = run_wg_quick_down(&config_path);
+                    let _ = std::fs::remove_file(&config_path);
+                    match result {
+                        Ok(()) => PrivilegedResponse::Unit,
+                        Err(e) => PrivilegedResponse::Error {
+                            code: categorize_error(&e),
+                            message: format!("{}", e),
+                        },
+                    }
+                }
+            }
+        }
+
+        PrivilegedRequest::EnsureDir { path, mode } => match std::fs::create_dir_all(&path) {
+            Err(e) => PrivilegedResponse::Error {
+                code: "IO".into(),
+                message: format!("create dir {} failed: {}", path, e),
+            },
+            Ok(()) => {
+                match std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode)) {
+                    Ok(()) => PrivilegedResponse::Unit,
+                    Err(e) => PrivilegedResponse::Error {
+                        code: "IO".into(),
+                        message: format!("set permissions {} failed: {}", path, e),
+                    },
+                }
+            }
+        },
+
+        PrivilegedRequest::WriteFile {
+            path,
+            contents,
+            mode,
+        } => {
+            if let Err(e) = std::fs::write(&path, contents) {
+                PrivilegedResponse::Error {
+                    code: "IO".into(),
+                    message: format!("write {} failed: {}", path, e),
+                }
+            } else if let Err(e) =
+                std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode))
+            {
+                PrivilegedResponse::Error {
+                    code: "IO".into(),
+                    message: format!("chmod {} failed: {}", path, e),
+                }
+            } else {
+                PrivilegedResponse::Unit
+            }
+        }
+
+        PrivilegedRequest::RemoveDirAll { path } => match std::fs::remove_dir_all(&path) {
+            Ok(()) => PrivilegedResponse::Unit,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => PrivilegedResponse::Unit,
+            Err(e) => PrivilegedResponse::Error {
+                code: "IO".into(),
+                message: format!("remove_dir_all {} failed: {}", path, e),
+            },
+        },
+
+        PrivilegedRequest::KillPid { pid, signal } => {
+            if !managed_pids.contains(&pid) {
+                return PrivilegedResponse::Error {
+                    code: "Authorization".into(),
+                    message: format!("pid {} is not managed by privileged service", pid),
+                };
+            }
+            if let Ok(exe) = std::fs::read_link(format!("/proc/{}/exe", pid)) {
+                if !exe.to_string_lossy().ends_with("/tunmux") {
+                    return PrivilegedResponse::Error {
+                        code: "Authorization".into(),
+                        message: "target pid not tunmux".into(),
+                    };
+                }
+            } else {
+                return PrivilegedResponse::Error {
+                    code: "Kernel".into(),
+                    message: "failed reading /proc/<pid>/exe".into(),
+                };
+            }
+
+            let signal = match signal {
+                KillSignal::Term => Signal::SIGTERM,
+                KillSignal::Kill => Signal::SIGKILL,
+            };
+            let target = Pid::from_raw(pid as i32);
+            match kill(target, signal) {
+                Ok(()) => {
+                    managed_pids.remove(&pid);
+                    PrivilegedResponse::Unit
+                }
+                Err(e) => PrivilegedResponse::Error {
+                    code: "Kernel".into(),
+                    message: format!("kill {} failed: {}", pid, e),
+                },
+            }
+        }
+
+        PrivilegedRequest::SpawnProxyDaemon {
+            netns,
+            socks_port,
+            http_port,
+            pid_file,
+            log_file,
+        } => match spawn_proxy_daemon(
+            netns.as_str(),
+            socks_port,
+            http_port,
+            pid_file.as_str(),
+            log_file.as_str(),
+        ) {
+            Ok(pid) => {
+                managed_pids.insert(pid);
+                PrivilegedResponse::Pid(pid)
+            }
+            Err(e) => PrivilegedResponse::Error {
+                code: "Proxy".into(),
+                message: e.to_string(),
+            },
+        },
+    }
+}
+
+fn execute_unit(result: Result<()>) -> PrivilegedResponse {
+    match result {
+        Ok(()) => PrivilegedResponse::Unit,
+        Err(e) => PrivilegedResponse::Error {
+            code: categorize_error(&e),
+            message: format!("{}", e),
+        },
+    }
+}
+
+fn execute_route(op: &str, destination: &str, via: Option<&str>, dev: &str) -> PrivilegedResponse {
+    let mut args = vec!["ip", "route", op, destination, "dev", dev];
+    if let Some(gw) = via {
+        args.insert(3, gw);
+        args.insert(4, "via");
+    }
+
+    execute_unit(run(&args))
+}
+
+fn run(args: &[&str]) -> Result<()> {
+    let status = Command::new(args[0]).args(&args[1..]).status()?;
+    if !status.success() {
+        return Err(AppError::Other(format!(
+            "command {} failed: {}",
+            args[0], status
+        )));
+    }
+    Ok(())
+}
+
+fn run_wg_quick_up(path: &std::path::Path, config_content: &[u8]) -> Result<()> {
+    std::fs::write(path, config_content)?;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+
+    let status = Command::new("wg-quick")
+        .args(["up", path.to_string_lossy().as_ref()])
+        .status()
+        .map_err(|e| AppError::Other(format!("wg-quick up failed: {}", e)))?;
+    if !status.success() {
+        let _ = std::fs::remove_file(path);
+        return Err(AppError::WireGuard(format!(
+            "wg-quick up exited {}",
+            status
+        )));
+    }
+    Ok(())
+}
+
+fn run_wg_quick_down(path: &std::path::Path) -> Result<()> {
+    let status = Command::new("wg-quick")
+        .args(["down", path.to_string_lossy().as_ref()])
+        .status()
+        .map_err(|e| AppError::Other(format!("wg-quick down failed: {}", e)))?;
+    if !status.success() {
+        return Err(AppError::WireGuard(format!(
+            "wg-quick down exited {}",
+            status
+        )));
+    }
+    Ok(())
+}
+
+fn wg_set(
+    interface: &str,
+    private_key: &str,
+    peer_public_key: &str,
+    endpoint: &str,
+    allowed_ips: &str,
+) -> Result<()> {
+    let mut child = Command::new("wg")
+        .args([
+            "set",
+            interface,
+            "private-key",
+            "/dev/stdin",
+            "peer",
+            peer_public_key,
+            "allowed-ips",
+            allowed_ips,
+            "endpoint",
+            endpoint,
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    {
+        let stdin = child
+            .stdin
+            .as_mut()
+            .ok_or_else(|| AppError::WireGuard("failed to open stdin for wg set".into()))?;
+        stdin.write_all(private_key.as_bytes())?;
+    }
+
+    let output = child.wait_with_output()?;
+    if !output.status.success() {
+        return Err(AppError::WireGuard(format!(
+            "wg set failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        )));
+    }
+    Ok(())
+}
+
+fn set_preshared_key(interface: &str, peer_public_key: &str, psk: &str) -> Result<()> {
+    let mut child = Command::new("wg")
+        .args([
+            "set",
+            interface,
+            "peer",
+            peer_public_key,
+            "preshared-key",
+            "/dev/stdin",
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    {
+        let stdin = child.stdin.as_mut().ok_or_else(|| {
+            AppError::WireGuard("failed to open stdin for wg set preshared-key".into())
+        })?;
+        stdin.write_all(psk.as_bytes())?;
+    }
+
+    let output = child.wait_with_output()?;
+    if !output.status.success() {
+        return Err(AppError::WireGuard(format!(
+            "wg set preshared-key failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        )));
+    }
+    Ok(())
+}
+
+fn spawn_proxy_daemon(
+    netns: &str,
+    socks_port: u16,
+    http_port: u16,
+    pid_file: &str,
+    log_file: &str,
+) -> Result<u32> {
+    let exe = std::env::current_exe()?;
+    let exe = exe.to_string_lossy();
+
+    // Ensure the proxy directory exists (e.g. /var/lib/tunmux/proxy/).
+    if let Some(parent) = std::path::Path::new(pid_file).parent() {
+        config::ensure_privileged_directory(parent)?;
+    }
+
+    let _ = std::fs::remove_file(pid_file);
+    let _ = std::fs::remove_file(log_file);
+
+    let socks = socks_port.to_string();
+    let http = http_port.to_string();
+
+    let mut child = Command::new(exe.as_ref())
+        .args([
+            "proxy-daemon",
+            "--netns",
+            netns,
+            "--socks-port",
+            socks.as_str(),
+            "--http-port",
+            http.as_str(),
+            "--pid-file",
+            pid_file,
+            "--log-file",
+            log_file,
+        ])
+        .stderr(Stdio::piped())
+        .stdout(Stdio::null())
+        .spawn()
+        .map_err(|e| AppError::Other(format!("failed to spawn proxy-daemon: {}", e)))?;
+
+    // The proxy-daemon double-forks and the intermediate process exits quickly.
+    // Wait for it so we don't leave a zombie and can capture early failures.
+    let stderr = child.stderr.take();
+    let status = child
+        .wait()
+        .map_err(|e| AppError::Other(format!("failed to wait on proxy-daemon: {}", e)))?;
+    if !status.success() {
+        let detail = stderr
+            .and_then(|mut s| {
+                let mut buf = String::new();
+                std::io::Read::read_to_string(&mut s, &mut buf).ok()?;
+                Some(buf)
+            })
+            .unwrap_or_default();
+        return Err(AppError::Proxy(format!(
+            "proxy-daemon exited {}: {}",
+            status,
+            detail.trim()
+        )));
+    }
+
+    let pid = wait_for_pid_file(pid_file, Duration::from_secs(5))?;
+    Ok(pid)
+}
+
+fn wait_for_pid_file(pid_file: &str, timeout: Duration) -> Result<u32> {
+    let start = Instant::now();
+    while Instant::now().duration_since(start) < timeout {
+        if let Ok(pid_text) = std::fs::read_to_string(pid_file) {
+            if let Ok(pid) = pid_text.trim().parse::<u32>() {
+                if std::path::Path::new(&format!("/proc/{}/exe", pid)).exists() {
+                    return Ok(pid);
+                }
+            }
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+
+    // If the launcher returns before creating pid file, capture a useful error.
+    Err(AppError::Other(
+        "proxy daemon did not write a valid pid".into(),
+    ))
+}
+
+fn resolve_authorized_group(cli_group: Option<String>) -> Option<String> {
+    if let Some(group) = cli_group {
+        let trimmed = group.trim();
+        if !trimmed.is_empty() {
+            return Some(trimmed.to_string());
+        }
+    }
+
+    if let Ok(group) = std::env::var("TUNMUX_PRIVILEGED_GROUP") {
+        let trimmed = group.trim().to_string();
+        if !trimmed.is_empty() {
+            return Some(trimmed);
+        }
+    }
+
+    Some(AUTH_GROUP_NAME.to_string())
+}
+
+fn is_authorized(peer_uid: u32, peer_gid: u32, authorized_group: Option<&str>) -> bool {
+    if peer_uid == 0 {
+        return true;
+    }
+
+    if let Ok(uids) = std::env::var("TUNMUX_PRIVILEGED_UIDS") {
+        let allowed = uids
+            .split(',')
+            .filter_map(|value| value.parse::<u32>().ok())
+            .any(|uid| uid == peer_uid);
+        if allowed {
+            return true;
+        }
+    }
+
+    let allowed_gid = std::env::var("TUNMUX_PRIVILEGED_GID")
+        .ok()
+        .and_then(|value| value.parse::<u32>().ok())
+        .or_else(|| authorized_group.and_then(read_group_gid))
+        .or_else(|| read_group_gid(AUTH_GROUP_NAME));
+    if let Some(gid) = allowed_gid {
+        if gid == peer_gid {
+            return true;
+        }
+    }
+
+    false
+}
+
+
+fn read_group_gid(group_name: &str) -> Option<u32> {
+    match std::fs::read_to_string("/etc/group") {
+        Ok(group_file) => {
+            let mut group_gid = None;
+            for line in group_file.lines() {
+                let mut parts = line.split(':');
+                let name = parts.next()?;
+                let _ = parts.next();
+                let gid = parts.next()?;
+                if name == group_name {
+                    group_gid = gid.parse::<u32>().ok();
+                    break;
+                }
+            }
+            group_gid
+        }
+        Err(_) => None,
+    }
+}
+
+fn categorize_error(error: &AppError) -> String {
+    if matches!(error, AppError::WireGuard(_)) {
+        "WireGuard".into()
+    } else if matches!(error, AppError::Namespace(_)) {
+        "Namespace".into()
+    } else if matches!(error, AppError::Proxy(_)) {
+        "Proxy".into()
+    } else {
+        "Kernel".into()
+    }
+}

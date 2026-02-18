@@ -17,7 +17,10 @@ impl WgBackend {
             "auto" => Ok(Self::auto_detect()),
             "wg-quick" => Ok(Self::WgQuick),
             "kernel" => Ok(Self::Kernel),
-            other => anyhow::bail!("unknown backend {:?} (expected auto, wg-quick, kernel)", other),
+            other => anyhow::bail!(
+                "unknown backend {:?} (expected auto, wg-quick, kernel)",
+                other
+            ),
         }
     }
 

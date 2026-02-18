@@ -243,7 +243,10 @@ impl AirVpnWeb {
         let cookie_store = Arc::new(CookieStoreMutex::new(store));
         let client = Self::build_client(cookie_store.clone()).ok()?;
 
-        debug!("restored saved web session ({} ecsrf tokens cached)", saved.ecsrf.len());
+        debug!(
+            "restored saved web session ({} ecsrf tokens cached)",
+            saved.ecsrf.len()
+        );
 
         Some(Self {
             client,
@@ -291,9 +294,7 @@ impl AirVpnWeb {
 
     /// Full web login: GET homepage for csrfKey, POST credentials, extract ecsrf.
     pub async fn login(username: &str, password: &str) -> anyhow::Result<Self> {
-        let cookie_store = Arc::new(CookieStoreMutex::new(
-            CookieStore::new(None),
-        ));
+        let cookie_store = Arc::new(CookieStoreMutex::new(CookieStore::new(None)));
         let client = Self::build_client(cookie_store.clone())?;
 
         // Step 1: GET /login/ to extract csrfKey from the login form.
@@ -305,8 +306,8 @@ impl AirVpnWeb {
         let body = resp.text().await?;
         let doc = Html::parse_document(&body);
 
-        let csrf_key = extract_input_value(&doc, "csrfKey")
-            .context("could not find csrfKey in login form")?;
+        let csrf_key =
+            extract_input_value(&doc, "csrfKey").context("could not find csrfKey in login form")?;
         debug!("extracted csrfKey from login form");
 
         let ref_value = extract_input_value(&doc, "ref").unwrap_or_default();
@@ -521,9 +522,7 @@ impl AirVpnWeb {
         let (port_str, pool_str) = self.lookup_port_pool(port).await?;
 
         // Strip .airdns.org suffix if the user included it
-        let prefix = name
-            .trim_end_matches(".airdns.org")
-            .trim_end_matches('.');
+        let prefix = name.trim_end_matches(".airdns.org").trim_end_matches('.');
 
         let _: serde_json::Value = self
             .ajax_post(
@@ -792,7 +791,12 @@ impl AirVpnWeb {
             bail!("AJAX request failed with status {}: {}", status, body);
         }
 
-        debug!("AJAX response ({} {}B): {}", status, body.len(), &body[..body.len().min(500)]);
+        debug!(
+            "AJAX response ({} {}B): {}",
+            status,
+            body.len(),
+            &body[..body.len().min(500)]
+        );
 
         // Detect server-side error responses (e.g. expired CSRF token).
         if let Ok(obj) = serde_json::from_str::<serde_json::Value>(&body) {
@@ -970,7 +974,10 @@ impl AirVpnWebApi {
 
     /// Build from a stored session, falling back to web provisioning.
     /// Updates the session's api_key field if a new key was provisioned.
-    pub async fn from_session(session: &mut super::models::AirSession, config: &AppConfig) -> anyhow::Result<Self> {
+    pub async fn from_session(
+        session: &mut super::models::AirSession,
+        config: &AppConfig,
+    ) -> anyhow::Result<Self> {
         // Try stored key first.
         if let Some(ref key) = session.api_key {
             if !key.is_empty() {
@@ -1038,11 +1045,7 @@ impl AirVpnWebApi {
     }
 
     /// POST form data to an API endpoint, returning the raw text body.
-    pub async fn post_text(
-        &self,
-        path: &str,
-        form: &[(&str, &str)],
-    ) -> anyhow::Result<String> {
+    pub async fn post_text(&self, path: &str, form: &[(&str, &str)]) -> anyhow::Result<String> {
         let url = format!("{}/{}/", API_BASE_URL, path.trim_matches('/'));
         debug!("API POST {}", url);
 
@@ -1060,7 +1063,12 @@ impl AirVpnWebApi {
         let body = resp.text().await?;
 
         if !status.is_success() {
-            bail!("API {} returned {}: {}", path, status, &body[..body.len().min(500)]);
+            bail!(
+                "API {} returned {}: {}",
+                path,
+                status,
+                &body[..body.len().min(500)]
+            );
         }
 
         debug!("API response ({} {}B)", status, body.len());
@@ -1111,11 +1119,21 @@ impl AirVpnWebApi {
 
         if !status.is_success() {
             let body = resp.text().await?;
-            bail!("API {} returned {}: {}", path, status, &body[..body.len().min(500)]);
+            bail!(
+                "API {} returned {}: {}",
+                path,
+                status,
+                &body[..body.len().min(500)]
+            );
         }
 
         let data = resp.bytes().await?.to_vec();
-        debug!("API response ({} {}B, {})", status, data.len(), content_type);
+        debug!(
+            "API response ({} {}B, {})",
+            status,
+            data.len(),
+            content_type
+        );
 
         // If the server returned JSON, check for errors.
         if content_type.contains("json") || data.first() == Some(&b'{') {
@@ -1145,13 +1163,21 @@ impl AirVpnWebApi {
         let body = resp.text().await?;
 
         if !status.is_success() {
-            bail!("API {} returned {}: {}", path, status, &body[..body.len().min(500)]);
+            bail!(
+                "API {} returned {}: {}",
+                path,
+                status,
+                &body[..body.len().min(500)]
+            );
         }
 
         debug!("API response ({} {}B)", status, body.len());
 
         serde_json::from_str(&body).with_context(|| {
-            format!("failed to parse API response: {}", &body[..body.len().min(300)])
+            format!(
+                "failed to parse API response: {}",
+                &body[..body.len().min(300)]
+            )
         })
     }
 }

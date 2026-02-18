@@ -1,4 +1,6 @@
-use aes::cipher::{block_padding::Pkcs7, BlockDecryptMut, BlockEncryptMut, BlockSizeUser, KeyIvInit};
+use aes::cipher::{
+    block_padding::Pkcs7, BlockDecryptMut, BlockEncryptMut, BlockSizeUser, KeyIvInit,
+};
 use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
 use rand::RngCore;
 use rsa::{pkcs1v15::Pkcs1v15Encrypt, BigUint, RsaPublicKey};
