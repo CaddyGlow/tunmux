@@ -8,6 +8,9 @@ pub struct AirSession {
     pub password: String,
     pub wg_public_key: String,
     pub keys: Vec<AirWgKey>,
+    /// REST API key (from /apisettings/). Optional -- auto-provisioned on first use.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub api_key: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

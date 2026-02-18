@@ -118,6 +118,37 @@ pub enum AirVpnCommand {
     /// Show active VPN sessions
     Sessions,
 
+    /// Generate a WireGuard config file via the AirVPN API
+    Generate {
+        /// Server name or country code (repeatable, e.g., -s be -s nl)
+        #[arg(short, long, required = true)]
+        server: Vec<String>,
+
+        /// Device/key name (default: first device)
+        #[arg(short, long)]
+        device: Option<String>,
+
+        /// Entry IP layer: ipv4, ipv6
+        #[arg(long, default_value = "ipv4")]
+        entry: String,
+
+        /// Exit IP layer: both, ipv4, ipv6
+        #[arg(long, default_value = "both")]
+        exit: String,
+
+        /// WireGuard MTU
+        #[arg(long, default_value = "1320")]
+        mtu: u16,
+
+        /// WireGuard persistent keepalive (seconds)
+        #[arg(long, default_value = "15")]
+        keepalive: u16,
+
+        /// Output file (default: stdout)
+        #[arg(short, long)]
+        output: Option<String>,
+    },
+
     /// Manage forwarded ports
     Ports {
         #[command(subcommand)]

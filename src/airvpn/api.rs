@@ -187,6 +187,7 @@ fn parse_user_response(xml: &str, username: &str, password: &str) -> Result<AirS
         password: password.to_string(),
         wg_public_key,
         keys,
+        api_key: None,
     })
 }
 

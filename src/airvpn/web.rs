@@ -922,3 +922,236 @@ async fn follow_redirects(
     }
     bail!("too many redirects following {}", url)
 }
+
+// ── REST API client (API key auth) ──────────────────────────────
+
+const API_BASE_URL: &str = "https://airvpn.org/api";
+const API_KEY_NAME: &str = "vpncli";
+
+pub struct AirVpnWebApi {
+    client: reqwest::Client,
+    api_key: String,
+}
+
+impl AirVpnWebApi {
+    /// Create with an explicit API key.
+    pub fn with_key(api_key: &str) -> anyhow::Result<Self> {
+        let client = reqwest::Client::builder()
+            .user_agent("vpncli/0.1")
+            .build()
+            .context("failed to build HTTP client")?;
+        Ok(Self {
+            client,
+            api_key: api_key.to_string(),
+        })
+    }
+
+    /// Recover an existing API key via web session, or create one if none exist.
+    pub async fn from_web(web: &AirVpnWeb) -> anyhow::Result<Self> {
+        let keys = web.list_api_keys().await?;
+
+        let secret = if let Some(k) = keys.first() {
+            debug!("using existing API key {:?}", k.name);
+            k.secret.clone()
+        } else {
+            debug!("no API keys found, creating one");
+            let id = web.add_api_key().await?;
+            web.rename_api_key(&id, API_KEY_NAME).await?;
+            let keys = web.list_api_keys().await?;
+            keys.iter()
+                .find(|k| k.id == id)
+                .context("failed to find newly created API key")?
+                .secret
+                .clone()
+        };
+
+        Self::with_key(&secret)
+    }
+
+    /// Build from a stored session, falling back to web provisioning.
+    /// Updates the session's api_key field if a new key was provisioned.
+    pub async fn from_session(session: &mut super::models::AirSession) -> anyhow::Result<Self> {
+        // Try stored key first.
+        if let Some(ref key) = session.api_key {
+            if !key.is_empty() {
+                debug!("using stored API key");
+                return Self::with_key(key);
+            }
+        }
+
+        // Fall back to web provisioning.
+        let web = AirVpnWeb::login_or_restore(&session.username, &session.password).await?;
+        let api = Self::from_web(&web).await?;
+        web.save();
+
+        // Persist the key in the session for next time.
+        session.api_key = Some(api.api_key.clone());
+        config::save_session(Provider::AirVpn, session)?;
+
+        Ok(api)
+    }
+
+    /// GET an API endpoint, returning the parsed JSON response.
+    #[allow(dead_code)]
+    pub async fn get<T: serde::de::DeserializeOwned>(
+        &self,
+        path: &str,
+        query: &[(&str, &str)],
+    ) -> anyhow::Result<T> {
+        let url = format!("{}/{}/", API_BASE_URL, path.trim_matches('/'));
+        debug!("API GET {}", url);
+
+        let resp = self
+            .client
+            .get(&url)
+            .header("api-key", &self.api_key)
+            .header("x-requested-with", "XMLHttpRequest")
+            .query(query)
+            .send()
+            .await
+            .context("API request failed")?;
+
+        self.parse_response(path, resp).await
+    }
+
+    /// POST form data to an API endpoint, returning the parsed JSON response.
+    #[allow(dead_code)]
+    pub async fn post<T: serde::de::DeserializeOwned>(
+        &self,
+        path: &str,
+        form: &[(&str, &str)],
+    ) -> anyhow::Result<T> {
+        let url = format!("{}/{}/", API_BASE_URL, path.trim_matches('/'));
+        debug!("API POST {}", url);
+
+        let resp = self
+            .client
+            .post(&url)
+            .header("api-key", &self.api_key)
+            .header("x-requested-with", "XMLHttpRequest")
+            .form(form)
+            .send()
+            .await
+            .context("API request failed")?;
+
+        self.parse_response(path, resp).await
+    }
+
+    /// POST form data to an API endpoint, returning the raw text body.
+    pub async fn post_text(
+        &self,
+        path: &str,
+        form: &[(&str, &str)],
+    ) -> anyhow::Result<String> {
+        let url = format!("{}/{}/", API_BASE_URL, path.trim_matches('/'));
+        debug!("API POST {}", url);
+
+        let resp = self
+            .client
+            .post(&url)
+            .header("api-key", &self.api_key)
+            .header("x-requested-with", "XMLHttpRequest")
+            .form(form)
+            .send()
+            .await
+            .context("API request failed")?;
+
+        let status = resp.status();
+        let body = resp.text().await?;
+
+        if !status.is_success() {
+            bail!("API {} returned {}: {}", path, status, &body[..body.len().min(500)]);
+        }
+
+        debug!("API response ({} {}B)", status, body.len());
+
+        // Check for JSON error responses.
+        if body.starts_with('{') {
+            if let Ok(obj) = serde_json::from_str::<serde_json::Value>(&body) {
+                if let Some(err) = obj.get("error").and_then(|v| v.as_str()) {
+                    bail!("API error: {}", err);
+                }
+                if let Some(result) = obj.get("result").and_then(|v| v.as_str()) {
+                    if result != "ok" {
+                        bail!("generator: {}", result);
+                    }
+                }
+            }
+        }
+
+        Ok(body)
+    }
+
+    /// POST form data to an API endpoint, returning raw bytes and content-type.
+    pub async fn post_bytes(
+        &self,
+        path: &str,
+        form: &[(&str, &str)],
+    ) -> anyhow::Result<(Vec<u8>, String)> {
+        let url = format!("{}/{}/", API_BASE_URL, path.trim_matches('/'));
+        debug!("API POST {} (bytes)", url);
+
+        let resp = self
+            .client
+            .post(&url)
+            .header("api-key", &self.api_key)
+            .header("x-requested-with", "XMLHttpRequest")
+            .form(form)
+            .send()
+            .await
+            .context("API request failed")?;
+
+        let status = resp.status();
+        let content_type = resp
+            .headers()
+            .get("content-type")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("")
+            .to_string();
+
+        if !status.is_success() {
+            let body = resp.text().await?;
+            bail!("API {} returned {}: {}", path, status, &body[..body.len().min(500)]);
+        }
+
+        let data = resp.bytes().await?.to_vec();
+        debug!("API response ({} {}B, {})", status, data.len(), content_type);
+
+        // If the server returned JSON, check for errors.
+        if content_type.contains("json") || data.first() == Some(&b'{') {
+            if let Ok(text) = std::str::from_utf8(&data) {
+                if let Ok(obj) = serde_json::from_str::<serde_json::Value>(text) {
+                    if let Some(err) = obj.get("error").and_then(|v| v.as_str()) {
+                        bail!("API error: {}", err);
+                    }
+                    if let Some(result) = obj.get("result").and_then(|v| v.as_str()) {
+                        if result != "ok" {
+                            bail!("generator: {}", result);
+                        }
+                    }
+                }
+            }
+        }
+
+        Ok((data, content_type))
+    }
+
+    async fn parse_response<T: serde::de::DeserializeOwned>(
+        &self,
+        path: &str,
+        resp: reqwest::Response,
+    ) -> anyhow::Result<T> {
+        let status = resp.status();
+        let body = resp.text().await?;
+
+        if !status.is_success() {
+            bail!("API {} returned {}: {}", path, status, &body[..body.len().min(500)]);
+        }
+
+        debug!("API response ({} {}B)", status, body.len());
+
+        serde_json::from_str(&body).with_context(|| {
+            format!("failed to parse API response: {}", &body[..body.len().min(300)])
+        })
+    }
+}
