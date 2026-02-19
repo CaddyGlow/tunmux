@@ -10,6 +10,12 @@ use crate::wireguard;
 
 const PROVIDER: Provider = Provider::Proton;
 const INTERFACE_NAME: &str = "proton0";
+const MANIFEST_FILE: &str = "manifest.json";
+
+#[derive(serde::Deserialize, serde::Serialize)]
+struct ProtonManifest {
+    logical_servers: Vec<models::server::LogicalServer>,
+}
 
 pub async fn dispatch(command: ProtonCommand, config: &AppConfig) -> anyhow::Result<()> {
     match command {
@@ -90,6 +96,13 @@ async fn cmd_logout(config: &AppConfig) -> anyhow::Result<()> {
     }
 
     config::delete_session(PROVIDER, config)?;
+
+    // Also remove cached server list
+    let manifest_path = config::config_dir(PROVIDER).join(MANIFEST_FILE);
+    if manifest_path.exists() {
+        std::fs::remove_file(&manifest_path)?;
+    }
+
     println!("Logged out");
     Ok(())
 }
@@ -113,10 +126,7 @@ async fn cmd_servers(
     config: &AppConfig,
 ) -> anyhow::Result<()> {
     let session: models::session::Session = config::load_session(PROVIDER, config)?;
-    let client = api::http::ProtonClient::authenticated(&session.uid, &session.access_token)?;
-
-    let resp = api::servers::fetch_server_list(&client).await?;
-    let mut servers = resp.logical_servers;
+    let mut servers = load_servers_cached_or_fetch(&session).await?;
 
     // Filter enabled servers
     servers.retain(|s| s.is_enabled());
@@ -180,8 +190,11 @@ async fn cmd_connect(
 
     if use_proxy {
         // Proxy mode requires kernel backend
-        if backend_str == "wg-quick" {
-            anyhow::bail!("--proxy requires kernel backend (incompatible with --backend wg-quick)");
+        if matches!(backend_str, "wg-quick" | "userspace" | "user-space") {
+            anyhow::bail!(
+                "--proxy requires kernel backend (incompatible with --backend {})",
+                backend_str
+            );
         }
     }
 
@@ -195,11 +208,7 @@ async fn cmd_connect(
     let effective_country = country.or_else(|| config.proton.default_country.clone());
 
     let session: models::session::Session = config::load_session(PROVIDER, config)?;
-    let client = api::http::ProtonClient::authenticated(&session.uid, &session.access_token)?;
-
-    // Fetch servers
-    let resp = api::servers::fetch_server_list(&client).await?;
-    let mut servers = resp.logical_servers;
+    let mut servers = load_servers_cached_or_fetch(&session).await?;
 
     // Filter enabled servers with WireGuard support
     servers.retain(|s| s.is_enabled() && s.best_physical().is_some());
@@ -368,7 +377,28 @@ fn connect_direct(
     match backend {
         wireguard::backend::WgBackend::WgQuick => {
             let wg_config = wireguard::config::generate_config(params);
-            wireguard::wg_quick::up(&wg_config, INTERFACE_NAME, PROVIDER)?;
+            wireguard::wg_quick::up(&wg_config, INTERFACE_NAME, PROVIDER, false)?;
+
+            let state = wireguard::connection::ConnectionState {
+                instance_name: DIRECT_INSTANCE.to_string(),
+                provider: PROVIDER.dir_name().to_string(),
+                interface_name: INTERFACE_NAME.to_string(),
+                backend,
+                server_endpoint: format!("{}:{}", params.server_ip, params.server_port),
+                server_display_name: server.name.clone(),
+                original_gateway_ip: None,
+                original_gateway_iface: None,
+                original_resolv_conf: None,
+                namespace_name: None,
+                proxy_pid: None,
+                socks_port: None,
+                http_port: None,
+            };
+            state.save()?;
+        }
+        wireguard::backend::WgBackend::Userspace => {
+            let wg_config = wireguard::config::generate_config(params);
+            wireguard::wg_quick::up(&wg_config, INTERFACE_NAME, PROVIDER, true)?;
 
             let state = wireguard::connection::ConnectionState {
                 instance_name: DIRECT_INSTANCE.to_string(),
@@ -499,7 +529,7 @@ fn disconnect_one(state: &wireguard::connection::ConnectionState) -> anyhow::Res
             wireguard::backend::WgBackend::Kernel => {
                 wireguard::kernel::down(state)?;
             }
-            wireguard::backend::WgBackend::WgQuick => {
+            wireguard::backend::WgBackend::WgQuick | wireguard::backend::WgBackend::Userspace => {
                 wireguard::wg_quick::down(&state.interface_name, PROVIDER)?;
                 wireguard::connection::ConnectionState::remove(&state.instance_name)?;
             }
@@ -516,4 +546,34 @@ fn disconnect_instance_direct() -> anyhow::Result<()> {
         disconnect_one(&state)?;
     }
     Ok(())
+}
+
+async fn load_servers_cached_or_fetch(
+    session: &models::session::Session,
+) -> anyhow::Result<Vec<models::server::LogicalServer>> {
+    if let Ok(logical_servers) = load_manifest() {
+        return Ok(logical_servers);
+    }
+
+    let client = api::http::ProtonClient::authenticated(&session.uid, &session.access_token)?;
+    let resp = api::servers::fetch_server_list(&client).await?;
+    save_manifest(&resp.logical_servers)?;
+    Ok(resp.logical_servers)
+}
+
+fn save_manifest(logical_servers: &[models::server::LogicalServer]) -> anyhow::Result<()> {
+    let manifest = ProtonManifest {
+        logical_servers: logical_servers.to_vec(),
+    };
+    let json = serde_json::to_string_pretty(&manifest)?;
+    config::save_provider_file(PROVIDER, MANIFEST_FILE, json.as_bytes())?;
+    Ok(())
+}
+
+fn load_manifest() -> anyhow::Result<Vec<models::server::LogicalServer>> {
+    let data = config::load_provider_file(PROVIDER, MANIFEST_FILE)?.ok_or_else(|| {
+        error::AppError::Other("no cached manifest -- run `tunmux proton servers` first".into())
+    })?;
+    let manifest: ProtonManifest = serde_json::from_slice(&data)?;
+    Ok(manifest.logical_servers)
 }

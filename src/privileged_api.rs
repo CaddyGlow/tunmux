@@ -80,6 +80,8 @@ pub enum PrivilegedRequest {
         interface: String,
         provider: String,
         config_content: String,
+        #[serde(default)]
+        prefer_userspace: bool,
     },
 
     EnsureDir {

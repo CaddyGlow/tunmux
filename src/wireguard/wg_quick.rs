@@ -2,21 +2,28 @@ use crate::config;
 use crate::error::Result;
 use crate::privileged_api::WgQuickAction;
 use crate::privileged_client::PrivilegedClient;
-use slog_scope::info;
+use tracing::info;
 
 /// Write the WireGuard config and bring up the interface.
-pub fn up(config_content: &str, interface_name: &str, provider: config::Provider) -> Result<()> {
+pub fn up(
+    config_content: &str,
+    interface_name: &str,
+    provider: config::Provider,
+    prefer_userspace: bool,
+) -> Result<()> {
     let client = PrivilegedClient::new();
     info!(
-        "Requesting privileged wg-quick up for {} ({})",
+        "Requesting privileged wg-quick up for {} ({}) [userspace={}]",
         interface_name,
-        provider.dir_name()
+        provider.dir_name(),
+        prefer_userspace
     );
     client.wg_quick_run(
         WgQuickAction::Up,
         interface_name,
         provider.dir_name(),
         config_content,
+        prefer_userspace,
     )
 }
 
@@ -28,7 +35,13 @@ pub fn down(interface_name: &str, provider: config::Provider) -> Result<()> {
         interface_name,
         provider.dir_name()
     );
-    client.wg_quick_run(WgQuickAction::Down, interface_name, provider.dir_name(), "")
+    client.wg_quick_run(
+        WgQuickAction::Down,
+        interface_name,
+        provider.dir_name(),
+        "",
+        false,
+    )
 }
 
 /// Check if a WireGuard interface is currently active.

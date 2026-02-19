@@ -24,7 +24,7 @@ mod proxy;
 mod wireguard;
 
 use clap::Parser;
-use slog_scope::error;
+use tracing::error;
 
 use cli::{Cli, TopCommand};
 use wireguard::connection::ConnectionState;
@@ -41,6 +41,7 @@ fn main() {
             idle_timeout_ms,
             autostarted,
         } => {
+            init_logging(cli.verbose);
             if !serve {
                 eprintln!("privileged mode requires --serve");
                 std::process::exit(1);
@@ -75,7 +76,7 @@ fn main() {
         TopCommand::Status => {
             init_logging(cli.verbose);
             if let Err(e) = cmd_status() {
-                error!("command_failed"; "command" => "status", "error" => e.to_string());
+                error!( command = ?"status", error = ?e.to_string(), "command_failed");
                 std::process::exit(1);
             }
         }
@@ -90,7 +91,7 @@ fn main() {
 
             let rt = tokio::runtime::Runtime::new().expect("failed to create tokio runtime");
             if let Err(e) = rt.block_on(run(other, config)) {
-                error!("command_failed"; "error" => e.to_string());
+                error!( error = ?e.to_string(), "command_failed");
                 std::process::exit(1);
             }
         }
@@ -120,7 +121,7 @@ fn cmd_status() -> anyhow::Result<()> {
     }
 
     println!(
-        "{:<12} {:<9} {:<10} {:<5} {:<8} {:<16} HTTP",
+        "{:<12} {:<9} {:<10} {:<5} {:<9} {:<16} HTTP",
         "Instance", "Provider", "Server", "Exit", "Backend", "SOCKS5"
     );
     println!("{}", "-".repeat(76));
@@ -145,7 +146,7 @@ fn cmd_status() -> anyhow::Result<()> {
             .unwrap_or_else(|| "-".to_string());
 
         println!(
-            "{:<12} {:<9} {:<10} {:<5} {:<8} {:<16} {}",
+            "{:<12} {:<9} {:<10} {:<5} {:<9} {:<16} {}",
             conn.instance_name,
             conn.provider,
             conn.server_display_name,

@@ -1,5 +1,5 @@
 use serde_json::json;
-use slog_scope::info;
+use tracing::info;
 
 use crate::api::http::{check_api_response, ProtonClient};
 use crate::error::Result;
@@ -29,6 +29,6 @@ pub async fn fetch_certificate(
     check_api_response(&json)?;
 
     let cert: CertificateResponse = serde_json::from_value(json)?;
-    info!("certificate_fetched"; "serial" => cert.serial_number.as_str());
+    info!( serial = ?cert.serial_number.as_str(), "certificate_fetched");
     Ok(cert)
 }

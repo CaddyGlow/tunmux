@@ -11,7 +11,7 @@ use nix::sys::signal::{kill, Signal};
 #[cfg(target_os = "linux")]
 use nix::sys::socket::{getsockopt, sockopt::PeerCredentials};
 use nix::unistd::{chown, Gid, Pid};
-use slog_scope::{debug, info, warn};
+use tracing::{debug, info, warn};
 
 use crate::config;
 use crate::error::{AppError, Result};
@@ -54,10 +54,8 @@ pub fn serve(
     let authorized_group = resolve_authorized_group(cli_authorized_group);
     let idle_timeout = cli_idle_timeout_ms.map(|ms| Duration::from_millis(ms.max(100)));
     debug!(
-        "privileged_service_start";
-        "autostarted" => cli_autostarted,
-        "idle_timeout_ms" => idle_timeout.map(|d| d.as_millis()).unwrap_or(0) as u64
-    );
+        autostarted = ?cli_autostarted,
+        idle_timeout_ms = ?idle_timeout.map(|d| d.as_millis()).unwrap_or(0) as u64, "privileged_service_start");
     config::ensure_privileged_socket_dir()?;
     config::ensure_privileged_runtime_dir()?;
     ensure_managed_pid_registry_dir()?;
@@ -74,10 +72,8 @@ pub fn serve(
         let socket_dir = config::privileged_socket_dir();
         chown(&socket_dir, None, Some(Gid::from_raw(gid)))?;
         info!(
-            "socket_dir_chowned";
-            "path" => socket_dir.display().to_string(),
-            "gid" => gid
-        );
+            path = ?socket_dir.display().to_string(),
+            gid = ?gid, "socket_dir_chowned");
     }
 
     let listener = match systemd_activated_listener()? {
@@ -99,16 +95,12 @@ pub fn serve(
             if let Some(gid) = group_gid {
                 chown(&socket_path, None, Some(Gid::from_raw(gid)))?;
                 info!(
-                    "socket_file_chowned";
-                    "path" => socket_path.display().to_string(),
-                    "gid" => gid
-                );
+                    path = ?socket_path.display().to_string(),
+                    gid = ?gid, "socket_file_chowned");
             }
 
             info!(
-                "privileged_service_listening";
-                "socket" => socket_path.display().to_string()
-            );
+                socket = ?socket_path.display().to_string(), "privileged_service_listening");
             listener
         }
     };
@@ -116,9 +108,7 @@ pub fn serve(
     if idle_timeout.is_some() {
         listener.set_nonblocking(true)?;
         info!(
-            "privileged_service_idle_timeout_enabled";
-            "idle_timeout_ms" => idle_timeout.map(|d| d.as_millis()).unwrap_or_default() as u64
-        );
+            idle_timeout_ms = ?idle_timeout.map(|d| d.as_millis()).unwrap_or_default() as u64, "privileged_service_idle_timeout_enabled");
     }
 
     let mut control_state = ControlState::new(cli_autostarted);
@@ -138,7 +128,7 @@ pub fn serve(
                             let mut buffer = serde_json::to_vec(&response)?;
                             buffer.push(b'\n');
                             if let Err(e) = stream.write_all(&buffer) {
-                                warn!("privileged_response_write_failed"; "error" => e.to_string());
+                                warn!( error = ?e.to_string(), "privileged_response_write_failed");
                                 break;
                             }
                             last_activity = Instant::now();
@@ -158,9 +148,7 @@ pub fn serve(
                     if last_activity.elapsed() >= timeout {
                         debug!("privileged_service_stop_condition_idle_timeout_elapsed");
                         info!(
-                            "privileged_service_exiting_idle_timeout";
-                            "idle_timeout_ms" => timeout.as_millis() as u64
-                        );
+                            idle_timeout_ms = ?timeout.as_millis() as u64, "privileged_service_exiting_idle_timeout");
                         return Ok(());
                     }
                     std::thread::sleep(Duration::from_millis(50));
@@ -175,10 +163,8 @@ pub fn serve(
 
 pub fn serve_stdio(cli_idle_timeout_ms: Option<u64>, cli_autostarted: bool) -> anyhow::Result<()> {
     debug!(
-        "privileged_stdio_service_start";
-        "autostarted" => cli_autostarted,
-        "idle_timeout_ms" => cli_idle_timeout_ms.unwrap_or(0)
-    );
+        autostarted = ?cli_autostarted,
+        idle_timeout_ms = ?cli_idle_timeout_ms.unwrap_or(0), "privileged_stdio_service_start");
     config::ensure_privileged_runtime_dir()?;
     ensure_managed_pid_registry_dir()?;
     cleanup_stale_managed_pid_registry_entries()?;
@@ -276,10 +262,8 @@ fn handle_client(
                         let message =
                             format!("peer uid={} gid={} not authorized", peer_uid, peer_gid);
                         warn!(
-                            "peer_not_authorized";
-                            "uid" => peer_uid,
-                            "gid" => peer_gid
-                        );
+                            uid = ?peer_uid,
+                            gid = ?peer_gid, "peer_not_authorized");
                         return ClientReadResult::Response(PrivilegedResponse::Error {
                             code: "Auth".into(),
                             message,
@@ -333,18 +317,14 @@ fn process_request_payload(
     let request_kind = describe_request(&request);
     if let Some((uid, gid)) = peer {
         info!(
-            "privileged_request_received";
-            "transport" => "socket",
-            "uid" => uid,
-            "gid" => gid,
-            "request" => request_kind
-        );
+            transport = ?"socket",
+            uid = ?uid,
+            gid = ?gid,
+            request = ?request_kind, "privileged_request_received");
     } else {
         info!(
-            "privileged_request_received";
-            "transport" => "stdio",
-            "request" => request_kind
-        );
+            transport = ?"stdio",
+            request = ?request_kind, "privileged_request_received");
     }
 
     if let Err(e) = request.validate() {
@@ -442,6 +422,7 @@ fn dispatch(request: PrivilegedRequest, control_state: &mut ControlState) -> Pri
             let mut command_args: Vec<&str> = vec!["ip", "netns", "exec", namespace.as_str()];
             command_args.extend(args.iter().map(String::as_str));
 
+            debug!(cmd = command_args.join(" "), "exec");
             let output = Command::new(command_args[0])
                 .args(&command_args[1..])
                 .output();
@@ -512,6 +493,7 @@ fn dispatch(request: PrivilegedRequest, control_state: &mut ControlState) -> Pri
             interface,
             provider,
             config_content,
+            prefer_userspace,
         } => {
             let base = config::privileged_wg_dir().join(provider.as_str());
             if let Err(e) = config::ensure_privileged_directory(&base) {
@@ -523,14 +505,16 @@ fn dispatch(request: PrivilegedRequest, control_state: &mut ControlState) -> Pri
 
             let config_path = base.join(format!("{interface}.conf"));
             match action {
-                WgQuickAction::Up => match run_wg_quick_up(&config_path, config_content.as_bytes())
-                {
-                    Ok(()) => PrivilegedResponse::Unit,
-                    Err(e) => PrivilegedResponse::Error {
-                        code: categorize_error(&e),
-                        message: format!("{}", e),
-                    },
-                },
+                WgQuickAction::Up => {
+                    match run_wg_quick_up(&config_path, config_content.as_bytes(), prefer_userspace)
+                    {
+                        Ok(()) => PrivilegedResponse::Unit,
+                        Err(e) => PrivilegedResponse::Error {
+                            code: categorize_error(&e),
+                            message: format!("{}", e),
+                        },
+                    }
+                }
                 WgQuickAction::Down => {
                     let result = run_wg_quick_down(&config_path);
                     let _ = std::fs::remove_file(&config_path);
@@ -675,9 +659,7 @@ fn dispatch(request: PrivilegedRequest, control_state: &mut ControlState) -> Pri
             control_state.prune_stale_leases();
             control_state.leases.insert(token);
             debug!(
-                "privileged_lease_acquired";
-                "lease_count" => control_state.leases.len()
-            );
+                lease_count = ?control_state.leases.len(), "privileged_lease_acquired");
             PrivilegedResponse::Unit
         }
 
@@ -685,9 +667,7 @@ fn dispatch(request: PrivilegedRequest, control_state: &mut ControlState) -> Pri
             control_state.leases.remove(token.as_str());
             control_state.prune_stale_leases();
             debug!(
-                "privileged_lease_released";
-                "lease_count" => control_state.leases.len()
-            );
+                lease_count = ?control_state.leases.len(), "privileged_lease_released");
             PrivilegedResponse::Unit
         }
 
@@ -701,9 +681,7 @@ fn dispatch(request: PrivilegedRequest, control_state: &mut ControlState) -> Pri
             control_state.shutdown_requested = true;
             control_state.prune_stale_leases();
             debug!(
-                "privileged_shutdown_if_idle_requested";
-                "remaining_leases" => control_state.leases.len()
-            );
+                remaining_leases = ?control_state.leases.len(), "privileged_shutdown_if_idle_requested");
             PrivilegedResponse::Bool(control_state.leases.is_empty())
         }
     }
@@ -730,6 +708,7 @@ fn execute_route(op: &str, destination: &str, via: Option<&str>, dev: &str) -> P
 }
 
 fn run(args: &[&str]) -> Result<()> {
+    debug!(cmd = args.join(" "), "exec");
     let status = Command::new(args[0]).args(&args[1..]).status()?;
     if !status.success() {
         return Err(AppError::Other(format!(
@@ -740,11 +719,21 @@ fn run(args: &[&str]) -> Result<()> {
     Ok(())
 }
 
-fn run_wg_quick_up(path: &std::path::Path, config_content: &[u8]) -> Result<()> {
+fn run_wg_quick_up(
+    path: &std::path::Path,
+    config_content: &[u8],
+    prefer_userspace: bool,
+) -> Result<()> {
     std::fs::write(path, config_content)?;
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
 
-    let status = Command::new("wg-quick")
+    let mut command = Command::new("wg-quick");
+    if prefer_userspace {
+        command.env("WG_I_PREFER_BUGGY_USERSPACE_TO_POLISHED_KMOD", "1");
+    }
+
+    debug!(cmd = format!("wg-quick up {}", path.display()), "exec");
+    let status = command
         .args(["up", path.to_string_lossy().as_ref()])
         .status()
         .map_err(|e| AppError::Other(format!("wg-quick up failed: {}", e)))?;
@@ -759,6 +748,7 @@ fn run_wg_quick_up(path: &std::path::Path, config_content: &[u8]) -> Result<()> 
 }
 
 fn run_wg_quick_down(path: &std::path::Path) -> Result<()> {
+    debug!(cmd = format!("wg-quick down {}", path.display()), "exec");
     let status = Command::new("wg-quick")
         .args(["down", path.to_string_lossy().as_ref()])
         .status()
@@ -779,6 +769,7 @@ fn wg_set(
     endpoint: &str,
     allowed_ips: &str,
 ) -> Result<()> {
+    debug!(cmd = format!("wg set {} peer {} allowed-ips {} endpoint {}", interface, peer_public_key, allowed_ips, endpoint), "exec");
     let mut child = Command::new("wg")
         .args([
             "set",
@@ -815,6 +806,7 @@ fn wg_set(
 }
 
 fn set_preshared_key(interface: &str, peer_public_key: &str, psk: &str) -> Result<()> {
+    debug!(cmd = format!("wg set {} peer {} preshared-key", interface, peer_public_key), "exec");
     let mut child = Command::new("wg")
         .args([
             "set",
@@ -854,10 +846,8 @@ fn spawn_proxy_daemon(
 ) -> Result<u32> {
     let exe = self_executable_for_spawn()?;
     info!(
-        "spawning proxy-daemon via {} for netns {}",
-        exe.display(),
-        netns
-    );
+        exe = ?exe.display().to_string(),
+        netns = ?netns, "spawn_proxy_daemon");
 
     // Ensure the proxy directory exists (e.g. /var/lib/tunmux/proxy/).
     if let Some(parent) = std::path::Path::new(pid_file).parent() {

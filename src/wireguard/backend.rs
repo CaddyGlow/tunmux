@@ -7,6 +7,7 @@ use serde::{Deserialize, Serialize};
 #[serde(rename_all = "kebab-case")]
 pub enum WgBackend {
     WgQuick,
+    Userspace,
     Kernel,
 }
 
@@ -16,18 +17,24 @@ impl WgBackend {
         match s {
             "auto" => Ok(Self::auto_detect()),
             "wg-quick" => Ok(Self::WgQuick),
+            "userspace" | "user-space" => Ok(Self::Userspace),
             "kernel" => Ok(Self::Kernel),
             other => anyhow::bail!(
-                "unknown backend {:?} (expected auto, wg-quick, kernel)",
+                "unknown backend {:?} (expected auto, wg-quick, userspace, kernel)",
                 other
             ),
         }
     }
 
-    /// Pick a backend automatically: use wg-quick if available, otherwise kernel.
+    /// Pick a backend automatically.
+    ///
+    /// - macOS: userspace
+    /// - Other platforms: wg-quick when available, otherwise kernel
     #[must_use]
     pub fn auto_detect() -> Self {
-        if wg_quick_on_path() {
+        if cfg!(target_os = "macos") {
+            Self::Userspace
+        } else if wg_quick_on_path() {
             Self::WgQuick
         } else {
             Self::Kernel
@@ -39,6 +46,7 @@ impl fmt::Display for WgBackend {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::WgQuick => write!(f, "wg-quick"),
+            Self::Userspace => write!(f, "userspace"),
             Self::Kernel => write!(f, "kernel"),
         }
     }

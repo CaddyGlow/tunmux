@@ -5,13 +5,13 @@ use std::path::Path;
 
 use crate::privileged_client::PrivilegedClient;
 use nix::sched::CloneFlags;
-use slog_scope::info;
+use tracing::info;
 
 /// Create a network namespace. If a stale namespace with the same name
 /// exists (e.g., from a previous failed run), it is deleted first.
 pub fn create(name: &str) -> Result<()> {
     if exists(name) {
-        info!("removing_stale_namespace"; "namespace" => name);
+        info!( namespace = ?name, "removing_stale_namespace");
         let _ = PrivilegedClient::new().namespace_delete(name);
     }
     PrivilegedClient::new().namespace_create(name)
@@ -53,6 +53,6 @@ pub fn enter(name: &str) -> Result<()> {
         .map_err(|e| AppError::Namespace(format!("failed to open {}: {}", path, e)))?;
     nix::sched::setns(&file, CloneFlags::CLONE_NEWNET)
         .map_err(|e| AppError::Namespace(format!("setns failed for {}: {}", name, e)))?;
-    info!("entered_network_namespace"; "namespace" => name);
+    info!( namespace = ?name, "entered_network_namespace");
     Ok(())
 }

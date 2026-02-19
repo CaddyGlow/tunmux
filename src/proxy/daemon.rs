@@ -5,7 +5,7 @@ use std::net::TcpListener;
 use std::os::unix::fs::PermissionsExt;
 use std::sync::Arc;
 
-use slog_scope::info;
+use tracing::info;
 
 use crate::logging;
 use crate::netns;
@@ -94,11 +94,9 @@ pub fn run(
         bound.push(format!("http=[::1]:{}", http_port));
     }
     info!(
-        "proxy_daemon_started";
-        "pid" => pid,
-        "listeners" => bound.join(", "),
-        "netns" => netns_name
-    );
+        pid = ?pid,
+        listeners = ?bound.join(", "),
+        netns = ?netns_name, "proxy_daemon_started");
 
     // 5. Enter VPN namespace -- all subsequent socket connections go through the VPN.
     //    setns(CLONE_NEWNET) only switches the network namespace; it does NOT
@@ -106,10 +104,8 @@ pub fn run(
     //    userspace convention of `ip netns exec`).  We replicate it here so that
     //    getaddrinfo inside the daemon uses the VPN's DNS servers.
     if let Err(e) = nix::sched::unshare(nix::sched::CloneFlags::CLONE_NEWNS) {
-        slog_scope::error!(
-            "mount_namespace_unshare_failed";
-            "error" => e.to_string()
-        );
+        tracing::error!(
+            error = ?e.to_string(), "mount_namespace_unshare_failed");
         anyhow::bail!("unshare(CLONE_NEWNS) failed: {}", e);
     }
 
@@ -124,19 +120,15 @@ pub fn run(
         nix::mount::MsFlags::MS_SLAVE | nix::mount::MsFlags::MS_REC,
         None::<&str>,
     ) {
-        slog_scope::error!(
-            "mount_root_make_rslave_failed";
-            "error" => e.to_string()
-        );
+        tracing::error!(
+            error = ?e.to_string(), "mount_root_make_rslave_failed");
         anyhow::bail!("mount --make-rslave / failed: {}", e);
     }
 
     if let Err(e) = netns::enter(netns_name) {
-        slog_scope::error!(
-            "network_namespace_enter_failed";
-            "namespace" => netns_name,
-            "error" => e.to_string()
-        );
+        tracing::error!(
+            namespace = ?netns_name,
+            error = ?e.to_string(), "network_namespace_enter_failed");
         return Err(e.into());
     }
 
@@ -159,19 +151,15 @@ pub fn run(
                 nix::mount::MsFlags::MS_NOSUID | nix::mount::MsFlags::MS_NODEV,
                 Some("size=1m,mode=0755"),
             ) {
-                slog_scope::error!(
-                    "systemd_resolve_tmpfs_mount_failed";
-                    "error" => e.to_string()
-                );
+                tracing::error!(
+                    error = ?e.to_string(), "systemd_resolve_tmpfs_mount_failed");
                 anyhow::bail!("tmpfs over /run/systemd/resolve failed: {}", e);
             }
             std::fs::write("/run/systemd/resolve/stub-resolv.conf", &dns_content)
                 .map_err(|e| anyhow::anyhow!("failed to write stub-resolv.conf: {}", e))?;
             info!(
-                "systemd_resolve_stub_replaced";
-                "path" => "/run/systemd/resolve/stub-resolv.conf",
-                "source" => ns_resolv.as_str()
-            );
+                path = ?"/run/systemd/resolve/stub-resolv.conf",
+                source = ?ns_resolv.as_str(), "systemd_resolve_stub_replaced");
         } else {
             // No systemd-resolved; try direct bind-mount over /etc/resolv.conf.
             if let Err(e) = nix::mount::mount(
@@ -181,12 +169,10 @@ pub fn run(
                 nix::mount::MsFlags::MS_BIND,
                 None::<&str>,
             ) {
-                slog_scope::error!(
-                    "resolv_conf_bind_mount_failed";
-                    "source" => ns_resolv.as_str(),
-                    "target" => "/etc/resolv.conf",
-                    "error" => e.to_string()
-                );
+                tracing::error!(
+                    source = ?ns_resolv.as_str(),
+                    target = ?"/etc/resolv.conf",
+                    error = ?e.to_string(), "resolv_conf_bind_mount_failed");
                 anyhow::bail!(
                     "bind-mount {} over /etc/resolv.conf failed: {}",
                     ns_resolv,
@@ -194,17 +180,13 @@ pub fn run(
                 );
             }
             info!(
-                "resolv_conf_bind_mounted";
-                "source" => ns_resolv.as_str(),
-                "target" => "/etc/resolv.conf"
-            );
+                source = ?ns_resolv.as_str(),
+                target = ?"/etc/resolv.conf", "resolv_conf_bind_mounted");
         }
     } else {
-        slog_scope::warn!(
-            "resolv_conf_missing";
-            "namespace" => netns_name,
-            "path" => ns_resolv.as_str()
-        );
+        tracing::warn!(
+            namespace = ?netns_name,
+            path = ?ns_resolv.as_str(), "resolv_conf_missing");
     }
 
     // On systemd-resolved hosts, glibc's nss-resolve module talks to
@@ -221,13 +203,11 @@ pub fn run(
             nix::mount::MsFlags::MS_BIND,
             None::<&str>,
         ) {
-            slog_scope::warn!(
-                "dbus_socket_mask_failed";
-                "path" => dbus_socket,
-                "error" => e.to_string()
-            );
+            tracing::warn!(
+                path = ?dbus_socket,
+                error = ?e.to_string(), "dbus_socket_mask_failed");
         } else {
-            info!("dbus_socket_masked"; "path" => dbus_socket);
+            info!( path = ?dbus_socket, "dbus_socket_masked");
         }
     }
 
@@ -238,7 +218,7 @@ pub fn run(
     {
         Ok(rt) => rt,
         Err(e) => {
-            slog_scope::error!("tokio_runtime_build_failed"; "error" => e.to_string());
+            tracing::error!( error = ?e.to_string(), "tokio_runtime_build_failed");
             return Err(e.into());
         }
     };
@@ -344,27 +324,21 @@ fn handle_accept<F, Fut>(
     let Some(result) = result else { return };
     match result {
         Ok((stream, addr)) => {
-            slog_scope::debug!(
-                "proxy_connection_accepted";
-                "listener" => label,
-                "peer_addr" => addr.to_string()
-            );
+            tracing::debug!(
+                listener = ?label,
+                peer_addr = ?addr.to_string(), "proxy_connection_accepted");
             tokio::spawn(async move {
                 if let Err(e) = handler(stream).await {
-                    slog_scope::debug!(
-                        "proxy_connection_handler_error";
-                        "listener" => label,
-                        "error" => e.to_string()
-                    );
+                    tracing::debug!(
+                        listener = ?label,
+                        error = ?e.to_string(), "proxy_connection_handler_error");
                 }
             });
         }
         Err(e) => {
-            slog_scope::warn!(
-                "proxy_listener_accept_error";
-                "listener" => label,
-                "error" => e.to_string()
-            );
+            tracing::warn!(
+                listener = ?label,
+                error = ?e.to_string(), "proxy_listener_accept_error");
         }
     }
 }

@@ -11,7 +11,7 @@ use std::{fs, thread};
 
 use nix::libc;
 use nix::unistd::Uid;
-use slog_scope::debug;
+use tracing::debug;
 
 use crate::config;
 use crate::config::{PrivilegedAutostopMode, PrivilegedTransport};
@@ -54,46 +54,36 @@ impl StdioSession {
 
     fn shutdown(mut self) {
         let pid = self.child.id();
-        debug!("privileged_stdio_helper_closing"; "pid" => pid);
+        debug!( pid = ?pid, "privileged_stdio_helper_closing");
         let _ = self.stdin.flush();
         drop(self.stdin);
         for _ in 0..10 {
             match self.child.try_wait() {
                 Ok(Some(status)) => {
                     debug!(
-                        "privileged_stdio_helper_exited";
-                        "pid" => pid,
-                        "status" => status.to_string()
-                    );
+                        pid = ?pid,
+                        status = ?status.to_string(), "privileged_stdio_helper_exited");
                     return;
                 }
                 Ok(None) => thread::sleep(Duration::from_millis(20)),
                 Err(e) => {
                     debug!(
-                        "privileged_stdio_helper_wait_failed";
-                        "pid" => pid,
-                        "error" => e.to_string()
-                    );
+                        pid = ?pid,
+                        error = ?e.to_string(), "privileged_stdio_helper_wait_failed");
                     return;
                 }
             }
         }
         debug!(
-            "privileged_stdio_helper_still_running_after_grace";
-            "pid" => pid
-        );
+            pid = ?pid, "privileged_stdio_helper_still_running_after_grace");
         let _ = self.child.kill();
         match self.child.wait() {
             Ok(status) => debug!(
-                "privileged_stdio_helper_exited_after_kill";
-                "pid" => pid,
-                "status" => status.to_string()
-            ),
+                pid = ?pid,
+                status = ?status.to_string(), "privileged_stdio_helper_exited_after_kill"),
             Err(e) => debug!(
-                "privileged_stdio_helper_wait_after_kill_failed";
-                "pid" => pid,
-                "error" => e.to_string()
-            ),
+                pid = ?pid,
+                error = ?e.to_string(), "privileged_stdio_helper_wait_after_kill_failed"),
         }
     }
 }
@@ -303,12 +293,14 @@ impl PrivilegedClient {
         interface: &str,
         provider: &str,
         config_content: &str,
+        prefer_userspace: bool,
     ) -> Result<()> {
         self.send_unit(PrivilegedRequest::WgQuickRun {
             action,
             interface: interface.to_string(),
             provider: provider.to_string(),
             config_content: config_content.to_string(),
+            prefer_userspace,
         })
     }
 
@@ -365,7 +357,7 @@ impl PrivilegedClient {
 
     fn send(&self, request: PrivilegedRequest) -> Result<PrivilegedResponse> {
         request.validate().map_err(AppError::Other)?;
-        slog_scope::trace!("privileged_ctl_request"; "request" => request_kind(&request));
+        tracing::trace!( request = ?request_kind(&request), "privileged_ctl_request");
         if self.command_session_enabled()? {
             return self.send_with_command_session(&request);
         }
@@ -443,12 +435,12 @@ impl PrivilegedClient {
     fn open_transport(&self) -> Result<CommandSessionTransport> {
         match self.transport {
             PrivilegedTransport::Socket => {
-                debug!("privileged_command_transport_open"; "mode" => "socket");
+                debug!( mode = ?"socket", "privileged_command_transport_open");
                 self.connect_or_autostart()
                     .map(CommandSessionTransport::Socket)
             }
             PrivilegedTransport::Stdio => {
-                debug!("privileged_command_transport_open"; "mode" => "stdio");
+                debug!( mode = ?"stdio", "privileged_command_transport_open");
                 self.spawn_privileged_stdio_session()
                     .map(CommandSessionTransport::Stdio)
             }
@@ -458,14 +450,12 @@ impl PrivilegedClient {
     fn close_transport(&self, transport: CommandSessionTransport) {
         match transport {
             CommandSessionTransport::Socket(_) => {
-                debug!("privileged_command_transport_closed"; "mode" => "socket");
+                debug!( mode = ?"socket", "privileged_command_transport_closed");
             }
             CommandSessionTransport::Stdio(session) => {
                 debug!(
-                    "privileged_command_transport_closed";
-                    "mode" => "stdio",
-                    "pid" => session.pid()
-                );
+                    mode = ?"stdio",
+                    pid = ?session.pid(), "privileged_command_transport_closed");
                 session.shutdown();
             }
         }
@@ -487,7 +477,7 @@ impl PrivilegedClient {
         stream: &mut UnixStream,
         request: &PrivilegedRequest,
     ) -> Result<PrivilegedResponse> {
-        slog_scope::trace!("privileged_ctl_write"; "request" => request_kind(request));
+        tracing::trace!( request = ?request_kind(request), "privileged_ctl_write");
         let request_bytes = serde_json::to_vec(request)
             .map_err(|e| AppError::Other(format!("serialize request: {}", e)))?;
         stream
@@ -512,7 +502,7 @@ impl PrivilegedClient {
         }
         let response: PrivilegedResponse = serde_json::from_str(&response_line)
             .map_err(|e| AppError::Other(format!("decode response: {}", e)))?;
-        slog_scope::trace!("privileged_ctl_response"; "request" => request_kind(request));
+        tracing::trace!( request = ?request_kind(request), "privileged_ctl_response");
 
         map_privileged_error(response)
     }
@@ -522,10 +512,8 @@ impl PrivilegedClient {
         session: &mut StdioSession,
         request: &PrivilegedRequest,
     ) -> Result<PrivilegedResponse> {
-        slog_scope::trace!(
-            "privileged_ctl_stdio_write";
-            "request" => request_kind(request)
-        );
+        tracing::trace!(
+            request = ?request_kind(request), "privileged_ctl_stdio_write");
         let request_bytes = serde_json::to_vec(request)
             .map_err(|e| AppError::Other(format!("serialize request: {}", e)))?;
         session
@@ -553,10 +541,8 @@ impl PrivilegedClient {
         }
         let response: PrivilegedResponse = serde_json::from_str(&response_line)
             .map_err(|e| AppError::Other(format!("decode response: {}", e)))?;
-        slog_scope::trace!(
-            "privileged_ctl_stdio_response";
-            "request" => request_kind(request)
-        );
+        tracing::trace!(
+            request = ?request_kind(request), "privileged_ctl_stdio_response");
         map_privileged_error(response)
     }
 
@@ -662,9 +648,9 @@ impl PrivilegedClient {
     }
 
     fn autostart_daemon(&self) -> Result<()> {
-        slog_scope::trace!("privileged_ctl_autostart_begin");
+        tracing::trace!("privileged_ctl_autostart_begin");
         let _lock = self.acquire_startup_lock()?;
-        slog_scope::trace!("privileged_ctl_autostart_lock_acquired");
+        tracing::trace!("privileged_ctl_autostart_lock_acquired");
 
         if self.try_connect_socket().is_ok() {
             return Ok(());
@@ -672,7 +658,7 @@ impl PrivilegedClient {
 
         self.spawn_privileged_daemon()?;
         self.wait_until_ready()?;
-        slog_scope::trace!("privileged_ctl_autostart_ready");
+        tracing::trace!("privileged_ctl_autostart_ready");
         Ok(())
     }
 
@@ -932,7 +918,7 @@ impl PrivilegedClient {
         let mut child = command
             .spawn()
             .map_err(|e| map_sudo_spawn_error(e, self.manual_start_command()))?;
-        debug!("privileged_stdio_helper_spawned"; "pid" => child.id());
+        debug!( pid = ?child.id(), "privileged_stdio_helper_spawned");
         let stdin = child
             .stdin
             .take()

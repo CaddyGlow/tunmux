@@ -1,4 +1,4 @@
-use slog_scope::info;
+use tracing::info;
 
 use crate::api::http::{check_api_response, ProtonClient};
 use crate::error::Result;
@@ -12,9 +12,7 @@ pub async fn fetch_vpn_info(client: &ProtonClient) -> Result<VpnInfoResponse> {
     check_api_response(&json)?;
     let info: VpnInfoResponse = serde_json::from_value(json)?;
     info!(
-        "vpn_info_fetched";
-        "plan" => info.vpn.plan_name.as_str(),
-        "tier" => info.vpn.max_tier
-    );
+        plan = ?info.vpn.plan_name.as_str(),
+        tier = ?info.vpn.max_tier, "vpn_info_fetched");
     Ok(info)
 }

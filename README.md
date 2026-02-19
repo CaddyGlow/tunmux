@@ -1,7 +1,7 @@
 # tunmux
 
 Multi-provider VPN CLI written in Rust. Supports Proton VPN and AirVPN with
-WireGuard connectivity, dual backends (wg-quick and kernel), and full account
+WireGuard connectivity, multiple backends (wg-quick, userspace, kernel), and full account
 management.
 
 ## Features
@@ -21,7 +21,7 @@ location and its own port pair. Host traffic is unaffected.
 ### Proton VPN
 - SRP authentication with 2FA (TOTP)
 - Ed25519/X25519 key generation and VPN certificate provisioning
-- Server listing with filters (country, free tier, P2P)
+- Server listing with filters (country, free tier, P2P) and cached manifest
 - WireGuard connect/disconnect (direct or proxy mode)
 
 ### AirVPN
@@ -36,8 +36,8 @@ location and its own port pair. Host traffic is unaffected.
 - Active session viewing with traffic stats
 
 ### WireGuard
-- Two backends: wg-quick (default) and kernel (ip/wg commands)
-- Auto-detection: uses wg-quick when available, falls back to kernel
+- Three backends: wg-quick, userspace (wg-quick + userspace preference), and kernel (ip/wg commands)
+- Auto-detection: uses wg-quick when available, falls back to kernel (on macOS: userspace when wg-quick is available)
 - Connection state tracking across providers
 - Kernel backend handles routing, DNS, and clean teardown
 - Namespace-aware kernel backend for proxy mode (no host route changes)
@@ -45,7 +45,8 @@ location and its own port pair. Host traffic is unaffected.
 ## Requirements
 
 - Rust 2021 edition (latest stable)
-- Linux (uses ip/wg-quick commands and network namespaces)
+- Linux for full feature set (kernel backend + proxy/netns)
+- macOS for direct userspace mode (`--backend userspace`, requires `wg-quick`)
 - `sudo` access to run `tunmux privileged --serve` for privileged WireGuard/namespace operations
 - Optional: systemd socket activation via `tunmux-privileged.socket`
 
@@ -197,7 +198,7 @@ tunmux reads `~/.config/tunmux/config.toml` for default preferences. All fields
 are optional; a missing file means all defaults apply.
 
     [general]
-    backend = "auto"              # default WireGuard backend: auto, wg-quick, kernel
+    backend = "auto"              # default WireGuard backend: auto, wg-quick, userspace, kernel
     credential_store = "keyring"  # "keyring" or "file" (requires --features keyring)
     privileged_transport = "socket"  # socket (default) or stdio
     privileged_autostart = true
@@ -213,7 +214,7 @@ are optional; a missing file means all defaults apply.
     default_country = "NL"
     default_device = "laptop"
 
-CLI flags always override config values. For example, `--backend wg-quick` takes
+CLI flags always override config values. For example, `--backend userspace` takes
 precedence over `backend = "kernel"` in the config file, and `--country US`
 overrides `default_country`.
 
@@ -281,6 +282,7 @@ User config/session/connection state stored in `~/.config/tunmux/`:
         _direct.json           # direct (non-proxy) connection state
       proton/
         session.json           # Proton VPN credentials and keys
+        manifest.json          # cached server list
       airvpn/
         session.json           # AirVPN credentials and WG keys
         manifest.json          # cached server list

@@ -8,7 +8,7 @@ use std::path::PathBuf;
 use std::thread;
 use std::time::Duration;
 
-use slog_scope::{debug, info, warn};
+use tracing::{debug, info, warn};
 
 use crate::config;
 use crate::privileged_api::KillSignal;
@@ -68,7 +68,7 @@ pub fn spawn_daemon(
         &log_path.to_string_lossy(),
     )?;
 
-    info!("spawned_proxy_daemon"; "pid" => pid, "namespace" => netns_name);
+    info!( pid = ?pid, namespace = ?netns_name, "spawned_proxy_daemon");
     Ok(pid)
 }
 
@@ -122,23 +122,23 @@ fn loopback_tcp_bind_available(port: u16) -> bool {
 pub fn stop_daemon(pid: u32) -> anyhow::Result<()> {
     let client = PrivilegedClient::new();
     if !pid_is_alive(pid) {
-        debug!("proxy_daemon_already_exited"; "pid" => pid);
+        debug!( pid = ?pid, "proxy_daemon_already_exited");
         return Ok(());
     }
 
-    debug!("proxy_daemon_signal_send"; "pid" => pid, "signal" => "SIGTERM");
+    debug!( pid = ?pid, signal = ?"SIGTERM", "proxy_daemon_signal_send");
     if let Err(e) = client.kill_pid(pid, KillSignal::Term) {
-        warn!("proxy_daemon_signal_request_failed"; "pid" => pid, "signal" => "SIGTERM", "error" => e.to_string());
+        warn!( pid = ?pid, signal = ?"SIGTERM", error = ?e.to_string(), "proxy_daemon_signal_request_failed");
     }
     for _ in 0..20 {
         thread::sleep(Duration::from_millis(100));
         if !pid_is_alive(pid) {
-            debug!("proxy_daemon_exited_after_signal"; "pid" => pid, "signal" => "SIGTERM");
+            debug!( pid = ?pid, signal = ?"SIGTERM", "proxy_daemon_exited_after_signal");
             return Ok(());
         }
     }
 
-    debug!("proxy_daemon_signal_send"; "pid" => pid, "signal" => "SIGKILL");
+    debug!( pid = ?pid, signal = ?"SIGKILL", "proxy_daemon_signal_send");
     client
         .kill_pid(pid, KillSignal::Kill)
         .map_err(|e| anyhow::anyhow!("failed to SIGKILL proxy daemon {}: {}", pid, e))?;
@@ -146,7 +146,7 @@ pub fn stop_daemon(pid: u32) -> anyhow::Result<()> {
     for _ in 0..20 {
         thread::sleep(Duration::from_millis(100));
         if !pid_is_alive(pid) {
-            debug!("proxy_daemon_exited_after_signal"; "pid" => pid, "signal" => "SIGKILL");
+            debug!( pid = ?pid, signal = ?"SIGKILL", "proxy_daemon_exited_after_signal");
             return Ok(());
         }
     }

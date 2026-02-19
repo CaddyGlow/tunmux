@@ -97,11 +97,9 @@ pub fn load_config() -> AppConfig {
     let path = app_config_dir().join("config.toml");
     match fs::read_to_string(&path) {
         Ok(text) => toml::from_str(&text).unwrap_or_else(|e| {
-            slog_scope::warn!(
-                "config_parse_failed";
-                "path" => path.display().to_string(),
-                "error" => e.to_string()
-            );
+            tracing::warn!(
+                path = ?path.display().to_string(),
+                error = ?e.to_string(), "config_parse_failed");
             AppConfig::default()
         }),
         Err(_) => AppConfig::default(),
@@ -274,7 +272,7 @@ fn save_session_file(provider: Provider, json: &str) -> Result<()> {
     let path = session_path(provider);
     fs::write(&path, json)?;
     fs::set_permissions(&path, fs::Permissions::from_mode(0o600))?;
-    slog_scope::info!("session_saved"; "path" => path.display().to_string());
+    tracing::info!( path = ?path.display().to_string(), "session_saved");
     Ok(())
 }
 
@@ -292,7 +290,7 @@ fn delete_session_file(provider: Provider) -> Result<()> {
     let path = session_path(provider);
     if path.exists() {
         fs::remove_file(&path)?;
-        slog_scope::info!("session_deleted"; "path" => path.display().to_string());
+        tracing::info!( path = ?path.display().to_string(), "session_deleted");
     }
     Ok(())
 }
@@ -306,7 +304,7 @@ fn save_session_keyring(provider: Provider, json: &str) -> Result<()> {
     entry
         .set_password(json)
         .map_err(|e| AppError::Other(format!("keyring set error: {}", e)))?;
-    slog_scope::info!("session_saved_keyring"; "provider" => provider.dir_name());
+    tracing::info!( provider = ?provider.dir_name(), "session_saved_keyring");
     Ok(())
 }
 
@@ -324,7 +322,7 @@ fn delete_session_keyring(provider: Provider) -> Result<()> {
     let entry = keyring::Entry::new("tunmux", provider.dir_name())
         .map_err(|e| AppError::Other(format!("keyring error: {}", e)))?;
     let _ = entry.delete_credential();
-    slog_scope::info!("session_deleted_keyring"; "provider" => provider.dir_name());
+    tracing::info!( provider = ?provider.dir_name(), "session_deleted_keyring");
     Ok(())
 }
 

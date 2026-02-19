@@ -1,6 +1,6 @@
 #![allow(dead_code)]
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::fmt;
 
 /// Feature bitmask values from the Proton API
@@ -44,7 +44,7 @@ impl fmt::Display for Tier {
 }
 
 /// Physical server within a logical server
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(rename_all = "PascalCase")]
 pub struct PhysicalServer {
     #[serde(rename = "ID")]
@@ -69,7 +69,7 @@ impl PhysicalServer {
 }
 
 /// Location nested object
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(rename_all = "PascalCase")]
 pub struct Location {
     pub lat: Option<f64>,
@@ -77,7 +77,7 @@ pub struct Location {
 }
 
 /// Logical server from GET /vpn/v1/logicals
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(rename_all = "PascalCase")]
 pub struct LogicalServer {
     #[serde(rename = "ID")]
@@ -159,7 +159,7 @@ impl fmt::Display for LogicalServer {
 }
 
 /// API response wrapper for GET /vpn/v1/logicals
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 #[serde(rename_all = "PascalCase")]
 pub struct LogicalsResponse {
     pub code: i64,

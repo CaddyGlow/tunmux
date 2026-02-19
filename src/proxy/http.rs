@@ -1,8 +1,8 @@
 #![cfg(all(feature = "proxy", target_os = "linux"))]
 
-use slog_scope::{debug, warn};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpStream;
+use tracing::{debug, warn};
 
 pub async fn handle_http(client: TcpStream) -> anyhow::Result<()> {
     let mut buf_client = BufReader::new(client);
@@ -33,7 +33,7 @@ pub async fn handle_http(client: TcpStream) -> anyhow::Result<()> {
 
 /// HTTP CONNECT tunneling (e.g., for HTTPS)
 async fn handle_connect(mut buf_client: BufReader<TcpStream>, target: &str) -> anyhow::Result<()> {
-    debug!("http_connect_start"; "target" => target);
+    debug!( target = ?target, "http_connect_start");
 
     // Read and discard remaining headers
     loop {
@@ -62,15 +62,13 @@ async fn handle_connect(mut buf_client: BufReader<TcpStream>, target: &str) -> a
             let mut client = buf_client.into_inner();
             let result = tokio::io::copy_bidirectional(&mut client, &mut remote).await;
             if let Err(e) = result {
-                debug!("http_connect_tunnel_closed"; "error" => e.to_string());
+                debug!( error = ?e.to_string(), "http_connect_tunnel_closed");
             }
         }
         Err(e) => {
             warn!(
-                "http_connect_failed";
-                "addr" => addr,
-                "error" => e.to_string()
-            );
+                addr = ?addr,
+                error = ?e.to_string(), "http_connect_failed");
             buf_client
                 .get_mut()
                 .write_all(b"HTTP/1.1 502 Bad Gateway\r\n\r\n")
@@ -88,7 +86,7 @@ async fn handle_plain(
     target: &str,
     version: &str,
 ) -> anyhow::Result<()> {
-    debug!("http_plain_start"; "method" => method, "target" => target);
+    debug!( method = ?method, target = ?target, "http_plain_start");
 
     // Parse absolute URI to extract host and relative path
     let (host, path) = parse_absolute_uri(target)?;
@@ -168,11 +166,9 @@ async fn handle_plain(
         }
         Err(e) => {
             warn!(
-                "http_plain_connect_failed";
-                "method" => method,
-                "addr" => addr,
-                "error" => e.to_string()
-            );
+                method = ?method,
+                addr = ?addr,
+                error = ?e.to_string(), "http_plain_connect_failed");
             buf_client
                 .get_mut()
                 .write_all(b"HTTP/1.1 502 Bad Gateway\r\n\r\n")

@@ -1,4 +1,4 @@
-use slog_scope::warn;
+use tracing::warn;
 
 use crate::error::{AppError, Result};
 
@@ -51,11 +51,9 @@ impl AirVpnClient {
                             .await
                             .unwrap_or_else(|_| "<unreadable>".to_string());
                         warn!(
-                            "airvpn_bootstrap_http_error";
-                            "status" => status.as_u16(),
-                            "url" => *url,
-                            "body" => body
-                        );
+                            status = ?status.as_u16(),
+                            url = ?*url,
+                            body = ?body, "airvpn_bootstrap_http_error");
                         last_err =
                             Some(AppError::AirVpnApi(format!("HTTP {} from {}", status, url)));
                         continue;

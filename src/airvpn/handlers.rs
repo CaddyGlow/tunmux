@@ -170,8 +170,11 @@ async fn cmd_connect(
         anyhow::bail!("--proxy is available only on Linux");
     }
 
-    if use_proxy && backend_str == "wg-quick" {
-        anyhow::bail!("--proxy requires kernel backend (incompatible with --backend wg-quick)");
+    if use_proxy && matches!(backend_str, "wg-quick" | "userspace" | "user-space") {
+        anyhow::bail!(
+            "--proxy requires kernel backend (incompatible with --backend {})",
+            backend_str
+        );
     }
 
     let backend = if use_proxy {
@@ -425,7 +428,28 @@ fn connect_direct(
     match backend {
         wireguard::backend::WgBackend::WgQuick => {
             let wg_config = wireguard::config::generate_config(params);
-            wireguard::wg_quick::up(&wg_config, INTERFACE_NAME, PROVIDER)?;
+            wireguard::wg_quick::up(&wg_config, INTERFACE_NAME, PROVIDER, false)?;
+
+            let state = wireguard::connection::ConnectionState {
+                instance_name: DIRECT_INSTANCE.to_string(),
+                provider: PROVIDER.dir_name().to_string(),
+                interface_name: INTERFACE_NAME.to_string(),
+                backend,
+                server_endpoint: format!("{}:{}", server_ip, server_port),
+                server_display_name: server_name.to_string(),
+                original_gateway_ip: None,
+                original_gateway_iface: None,
+                original_resolv_conf: None,
+                namespace_name: None,
+                proxy_pid: None,
+                socks_port: None,
+                http_port: None,
+            };
+            state.save()?;
+        }
+        wireguard::backend::WgBackend::Userspace => {
+            let wg_config = wireguard::config::generate_config(params);
+            wireguard::wg_quick::up(&wg_config, INTERFACE_NAME, PROVIDER, true)?;
 
             let state = wireguard::connection::ConnectionState {
                 instance_name: DIRECT_INSTANCE.to_string(),
@@ -557,7 +581,7 @@ fn disconnect_one(state: &wireguard::connection::ConnectionState) -> anyhow::Res
             wireguard::backend::WgBackend::Kernel => {
                 wireguard::kernel::down(state)?;
             }
-            wireguard::backend::WgBackend::WgQuick => {
+            wireguard::backend::WgBackend::WgQuick | wireguard::backend::WgBackend::Userspace => {
                 wireguard::wg_quick::down(&state.interface_name, PROVIDER)?;
                 wireguard::connection::ConnectionState::remove(&state.instance_name)?;
             }

@@ -4,11 +4,11 @@ use std::collections::HashMap;
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::{Arc, Mutex};
 
-use slog_scope::{debug, warn};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpStream, UdpSocket};
 use tokio::sync::RwLock;
 use tokio::task::AbortHandle;
+use tracing::{debug, warn};
 
 // SOCKS5 constants
 const SOCKS_VERSION: u8 = 0x05;
@@ -150,22 +150,20 @@ async fn parse_address(client: &mut TcpStream, atyp: u8) -> anyhow::Result<(Stri
 async fn handle_connect(mut client: TcpStream, atyp: u8) -> anyhow::Result<()> {
     let (addr, port) = parse_address(&mut client, atyp).await?;
     let target = format!("{}:{}", addr, port);
-    debug!("socks5_connect_start"; "target" => target.as_str());
+    debug!( target = ?target.as_str(), "socks5_connect_start");
 
     match TcpStream::connect(&target).await {
         Ok(mut remote) => {
             send_reply(&mut client, REP_SUCCESS, None).await?;
             let result = tokio::io::copy_bidirectional(&mut client, &mut remote).await;
             if let Err(e) = result {
-                debug!("socks5_tunnel_closed"; "error" => e.to_string());
+                debug!( error = ?e.to_string(), "socks5_tunnel_closed");
             }
         }
         Err(e) => {
             warn!(
-                "socks5_connect_failed";
-                "target" => target.as_str(),
-                "error" => e.to_string()
-            );
+                target = ?target.as_str(),
+                error = ?e.to_string(), "socks5_connect_failed");
             send_reply(&mut client, REP_GENERAL_FAILURE, None).await?;
         }
     }
@@ -199,7 +197,7 @@ async fn handle_udp_associate(
         declared
     };
 
-    debug!("socks5_udp_associate_start"; "key" => assoc_key.to_string());
+    debug!( key = ?assoc_key.to_string(), "socks5_udp_associate_start");
 
     // Create outbound socket in VPN namespace (current namespace after setns)
     let outbound = Arc::new(UdpSocket::bind("0.0.0.0:0").await?);
@@ -237,7 +235,7 @@ async fn handle_udp_associate(
 
     // Cleanup: read the (possibly upgraded) key and remove the association
     let key = *client_addr.lock().unwrap();
-    debug!("socks5_udp_associate_closed"; "key" => key.to_string());
+    debug!( key = ?key.to_string(), "socks5_udp_associate_closed");
     associations.remove(&key).await;
 
     Ok(())
@@ -278,7 +276,7 @@ pub async fn run_udp_relay(relay_socket: Arc<UdpSocket>, associations: Arc<UdpAs
         let (n, client_src) = match relay_socket.recv_from(&mut buf).await {
             Ok(r) => r,
             Err(e) => {
-                warn!("udp_relay_recv_from_error"; "error" => e.to_string());
+                warn!( error = ?e.to_string(), "udp_relay_recv_from_error");
                 continue;
             }
         };
@@ -286,23 +284,19 @@ pub async fn run_udp_relay(relay_socket: Arc<UdpSocket>, associations: Arc<UdpAs
         let data = &buf[..n];
         let Some((dst_addr, payload)) = parse_udp_header(data) else {
             debug!(
-                "udp_relay_malformed_header";
-                "client_src" => client_src.to_string()
-            );
+                client_src = ?client_src.to_string(), "udp_relay_malformed_header");
             continue;
         };
 
         let Some(outbound) = associations.lookup(&client_src).await else {
-            debug!("udp_relay_association_missing"; "client_src" => client_src.to_string());
+            debug!( client_src = ?client_src.to_string(), "udp_relay_association_missing");
             continue;
         };
 
         if let Err(e) = outbound.send_to(payload, dst_addr).await {
             debug!(
-                "udp_relay_forward_failed";
-                "dst_addr" => dst_addr.to_string(),
-                "error" => e.to_string()
-            );
+                dst_addr = ?dst_addr.to_string(),
+                error = ?e.to_string(), "udp_relay_forward_failed");
         }
     }
 }
@@ -333,10 +327,8 @@ async fn relay_vpn_to_client(
 
         if let Err(e) = relay_socket.send_to(&packet, addr).await {
             debug!(
-                "udp_relay_send_to_client_failed";
-                "client_addr" => addr.to_string(),
-                "error" => e.to_string()
-            );
+                client_addr = ?addr.to_string(),
+                error = ?e.to_string(), "udp_relay_send_to_client_failed");
             break;
         }
     }

@@ -1,4 +1,4 @@
-use slog_scope::info;
+use tracing::info;
 
 use crate::api::http::{check_api_response, ProtonClient};
 use crate::error::Result;
@@ -15,6 +15,6 @@ pub async fn fetch_server_list(client: &ProtonClient) -> Result<LogicalsResponse
     check_api_response(&json)?;
 
     let logicals: LogicalsResponse = serde_json::from_value(json)?;
-    info!("servers_fetched"; "count" => logicals.logical_servers.len());
+    info!( count = ?logicals.logical_servers.len(), "servers_fetched");
     Ok(logicals)
 }

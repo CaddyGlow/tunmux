@@ -1,5 +1,5 @@
 use serde_json::json;
-use slog_scope::{debug, info};
+use tracing::{debug, info};
 
 use crate::api::http::{check_api_response, ProtonClient};
 use crate::api::srp;
@@ -15,7 +15,7 @@ pub async fn login(
     password: &str,
 ) -> Result<AuthResponse> {
     // Step 1: Get auth info (salt, server ephemeral, modulus)
-    info!("fetching_auth_info"; "username" => username);
+    info!( username = ?username, "fetching_auth_info");
     let info_body = json!({ "Username": username });
 
     let info_resp = client.post("/auth/v4/info").json(&info_body).send().await?;
@@ -23,7 +23,7 @@ pub async fn login(
     check_api_response(&info_json)?;
 
     let auth_info: AuthInfoResponse = serde_json::from_value(info_json)?;
-    debug!("srp_version"; "version" => auth_info.version);
+    debug!( version = ?auth_info.version, "srp_version");
 
     // Step 2: Decode modulus, hash password, compute SRP proof
     let (modulus, modulus_le) = srp::decode_modulus(&auth_info.modulus)?;

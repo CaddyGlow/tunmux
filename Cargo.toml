@@ -25,11 +25,11 @@ toml = "0.8"
 
 # Logging
 log = "0.4"
-slog = "2"
-slog-async = "2"
-slog-term = "2"
-slog-scope = "4"
-slog-stdlog = "4"
+tracing = "0.1"
+tracing-appender = "0.2"
+tracing-log = "0.2"
+tracing-subscriber = { version = "0.3", features = ["fmt", "time"] }
+time = { version = "0.3", features = ["macros"] }
 
 # Crypto - SRP
 num-bigint = { version = "0.4", features = ["rand"] }
