@@ -1,3 +1,5 @@
+#![cfg(all(feature = "proxy", target_os = "linux"))]
+
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpStream;
 use tracing::{debug, warn};

@@ -1,3 +1,5 @@
+#![cfg(all(feature = "proxy", target_os = "linux"))]
+
 use std::fs;
 use std::net::TcpListener;
 use std::os::unix::fs::PermissionsExt;
@@ -165,13 +167,24 @@ pub fn run(
                 nix::mount::MsFlags::MS_BIND,
                 None::<&str>,
             ) {
-                tracing::error!("bind-mount {} over /etc/resolv.conf failed: {}", ns_resolv, e);
-                anyhow::bail!("bind-mount {} over /etc/resolv.conf failed: {}", ns_resolv, e);
+                tracing::error!(
+                    "bind-mount {} over /etc/resolv.conf failed: {}",
+                    ns_resolv,
+                    e
+                );
+                anyhow::bail!(
+                    "bind-mount {} over /etc/resolv.conf failed: {}",
+                    ns_resolv,
+                    e
+                );
             }
             info!("Bind-mounted {} over /etc/resolv.conf", ns_resolv);
         }
     } else {
-        tracing::warn!("/etc/netns/{}/resolv.conf not found, DNS may leak", netns_name);
+        tracing::warn!(
+            "/etc/netns/{}/resolv.conf not found, DNS may leak",
+            netns_name
+        );
     }
 
     // On systemd-resolved hosts, glibc's nss-resolve module talks to

@@ -173,6 +173,11 @@ async fn cmd_connect(
 ) -> anyhow::Result<()> {
     let backend_str = backend_arg.as_deref().unwrap_or(&config.general.backend);
 
+    #[cfg(not(target_os = "linux"))]
+    if use_proxy {
+        anyhow::bail!("--proxy is available only on Linux");
+    }
+
     if use_proxy {
         // Proxy mode requires kernel backend
         if backend_str == "wg-quick" {

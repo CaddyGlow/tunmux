@@ -7,6 +7,7 @@ use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
 use nix::sys::signal::{kill, Signal};
+#[cfg(target_os = "linux")]
 use nix::sys::socket::{getsockopt, sockopt::PeerCredentials};
 use nix::unistd::{chown, Gid, Pid};
 use tracing::{info, warn};
@@ -16,9 +17,43 @@ use crate::error::{AppError, Result};
 use crate::privileged_api::{KillSignal, PrivilegedRequest, PrivilegedResponse, WgQuickAction};
 
 const AUTH_GROUP_NAME: &str = "tunmux";
+struct ControlState {
+    managed_pids: HashSet<u32>,
+    leases: HashSet<String>,
+    allow_shutdown: bool,
+    shutdown_requested: bool,
+}
 
-pub fn serve(cli_authorized_group: Option<String>) -> anyhow::Result<()> {
+impl ControlState {
+    fn new(allow_shutdown: bool) -> Self {
+        Self {
+            managed_pids: HashSet::new(),
+            leases: HashSet::new(),
+            allow_shutdown,
+            shutdown_requested: false,
+        }
+    }
+
+    fn prune_stale_leases(&mut self) {
+        self.leases.retain(|token| lease_token_is_live(token));
+    }
+
+    fn should_exit_now(&mut self) -> bool {
+        if !self.allow_shutdown || !self.shutdown_requested {
+            return false;
+        }
+        self.prune_stale_leases();
+        self.leases.is_empty()
+    }
+}
+
+pub fn serve(
+    cli_authorized_group: Option<String>,
+    cli_idle_timeout_ms: Option<u64>,
+    cli_autostarted: bool,
+) -> anyhow::Result<()> {
     let authorized_group = resolve_authorized_group(cli_authorized_group);
+    let idle_timeout = cli_idle_timeout_ms.map(|ms| Duration::from_millis(ms.max(100)));
     config::ensure_privileged_socket_dir()?;
     config::ensure_privileged_runtime_dir()?;
 
@@ -61,15 +96,48 @@ pub fn serve(cli_authorized_group: Option<String>) -> anyhow::Result<()> {
         }
     };
 
-    let mut managed_pids = HashSet::new();
+    if idle_timeout.is_some() {
+        listener.set_nonblocking(true)?;
+        info!(
+            "privileged service idle timeout enabled: {} ms",
+            idle_timeout.map(|d| d.as_millis()).unwrap_or_default()
+        );
+    }
+
+    let mut control_state = ControlState::new(cli_autostarted);
+    let mut last_activity = Instant::now();
     loop {
-        let (stream, _) = listener.accept()?;
-        let mut stream = stream;
-        let response = handle_client(&mut stream, &mut managed_pids, authorized_group.as_deref());
-        let mut buffer = serde_json::to_vec(&response)?;
-        buffer.push(b'\n');
-        if let Err(e) = stream.write_all(&buffer) {
-            warn!("failed to write privileged response: {}", e);
+        match listener.accept() {
+            Ok((stream, _)) => {
+                let mut stream = stream;
+                let response =
+                    handle_client(&mut stream, &mut control_state, authorized_group.as_deref());
+                let mut buffer = serde_json::to_vec(&response)?;
+                buffer.push(b'\n');
+                if let Err(e) = stream.write_all(&buffer) {
+                    warn!("failed to write privileged response: {}", e);
+                }
+                last_activity = Instant::now();
+                if control_state.should_exit_now() {
+                    info!("privileged service exiting after explicit shutdown request");
+                    return Ok(());
+                }
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                if let Some(timeout) = idle_timeout {
+                    if last_activity.elapsed() >= timeout {
+                        info!(
+                            "privileged service exiting after {} ms idle timeout",
+                            timeout.as_millis()
+                        );
+                        return Ok(());
+                    }
+                    std::thread::sleep(Duration::from_millis(50));
+                    continue;
+                }
+                return Err(e.into());
+            }
+            Err(e) => return Err(e.into()),
         }
     }
 }
@@ -107,7 +175,7 @@ fn systemd_activated_listener() -> anyhow::Result<Option<std::os::unix::net::Uni
 
 fn handle_client(
     stream: &mut UnixStream,
-    managed_pids: &mut HashSet<u32>,
+    control_state: &mut ControlState,
     authorized_group: Option<&str>,
 ) -> PrivilegedResponse {
     let mut reader = BufReader::new(&mut *stream);
@@ -119,25 +187,36 @@ fn handle_client(
         };
     }
 
-    let peer = match getsockopt(&*stream, PeerCredentials) {
-        Ok(peer) => {
-            let peer_uid = peer.uid();
-            let peer_gid = peer.gid();
-            if !is_authorized(peer_uid, peer_gid, authorized_group) {
-                let message = format!("peer uid={} gid={} not authorized", peer_uid, peer_gid);
-                warn!("{}", message);
-                return PrivilegedResponse::Error {
-                    code: "Auth".into(),
-                    message,
-                };
+    let peer = {
+        #[cfg(target_os = "linux")]
+        {
+            match getsockopt(&*stream, PeerCredentials) {
+                Ok(peer) => {
+                    let peer_uid = peer.uid();
+                    let peer_gid = peer.gid();
+                    if !is_authorized(peer_uid, peer_gid, authorized_group) {
+                        let message =
+                            format!("peer uid={} gid={} not authorized", peer_uid, peer_gid);
+                        warn!("{}", message);
+                        return PrivilegedResponse::Error {
+                            code: "Auth".into(),
+                            message,
+                        };
+                    }
+                    (peer_uid, peer_gid)
+                }
+                Err(e) => {
+                    return PrivilegedResponse::Error {
+                        code: "Auth".into(),
+                        message: format!("SO_PEERCRED failed: {}", e),
+                    };
+                }
             }
-            (peer_uid, peer_gid)
         }
-        Err(e) => {
-            return PrivilegedResponse::Error {
-                code: "Auth".into(),
-                message: format!("SO_PEERCRED failed: {}", e),
-            };
+
+        #[cfg(not(target_os = "linux"))]
+        {
+            (0u32, 0u32)
         }
     };
 
@@ -170,7 +249,7 @@ fn handle_client(
         };
     }
 
-    dispatch(request, managed_pids)
+    dispatch(request, control_state)
 }
 
 fn describe_request(request: &PrivilegedRequest) -> &'static str {
@@ -194,10 +273,13 @@ fn describe_request(request: &PrivilegedRequest) -> &'static str {
         PrivilegedRequest::RemoveDirAll { .. } => "RemoveDirAll",
         PrivilegedRequest::KillPid { .. } => "KillPid",
         PrivilegedRequest::SpawnProxyDaemon { .. } => "SpawnProxyDaemon",
+        PrivilegedRequest::LeaseAcquire { .. } => "LeaseAcquire",
+        PrivilegedRequest::LeaseRelease { .. } => "LeaseRelease",
+        PrivilegedRequest::ShutdownIfIdle => "ShutdownIfIdle",
     }
 }
 
-fn dispatch(request: PrivilegedRequest, managed_pids: &mut HashSet<u32>) -> PrivilegedResponse {
+fn dispatch(request: PrivilegedRequest, control_state: &mut ControlState) -> PrivilegedResponse {
     match request {
         PrivilegedRequest::NamespaceCreate { name } => {
             execute_unit(run(&["ip", "netns", "add", name.as_str()]))
@@ -400,7 +482,7 @@ fn dispatch(request: PrivilegedRequest, managed_pids: &mut HashSet<u32>) -> Priv
         },
 
         PrivilegedRequest::KillPid { pid, signal } => {
-            if !managed_pids.contains(&pid) {
+            if !control_state.managed_pids.contains(&pid) {
                 return PrivilegedResponse::Error {
                     code: "Authorization".into(),
                     message: format!("pid {} is not managed by privileged service", pid),
@@ -427,7 +509,7 @@ fn dispatch(request: PrivilegedRequest, managed_pids: &mut HashSet<u32>) -> Priv
             let target = Pid::from_raw(pid as i32);
             match kill(target, signal) {
                 Ok(()) => {
-                    managed_pids.remove(&pid);
+                    control_state.managed_pids.remove(&pid);
                     PrivilegedResponse::Unit
                 }
                 Err(e) => PrivilegedResponse::Error {
@@ -451,7 +533,7 @@ fn dispatch(request: PrivilegedRequest, managed_pids: &mut HashSet<u32>) -> Priv
             log_file.as_str(),
         ) {
             Ok(pid) => {
-                managed_pids.insert(pid);
+                control_state.managed_pids.insert(pid);
                 PrivilegedResponse::Pid(pid)
             }
             Err(e) => PrivilegedResponse::Error {
@@ -459,6 +541,30 @@ fn dispatch(request: PrivilegedRequest, managed_pids: &mut HashSet<u32>) -> Priv
                 message: e.to_string(),
             },
         },
+
+        PrivilegedRequest::LeaseAcquire { token } => {
+            control_state.prune_stale_leases();
+            control_state.leases.insert(token);
+            PrivilegedResponse::Unit
+        }
+
+        PrivilegedRequest::LeaseRelease { token } => {
+            control_state.leases.remove(token.as_str());
+            control_state.prune_stale_leases();
+            PrivilegedResponse::Unit
+        }
+
+        PrivilegedRequest::ShutdownIfIdle => {
+            if !control_state.allow_shutdown {
+                return PrivilegedResponse::Error {
+                    code: "Control".into(),
+                    message: "shutdown control is disabled for this daemon instance".into(),
+                };
+            }
+            control_state.shutdown_requested = true;
+            control_state.prune_stale_leases();
+            PrivilegedResponse::Bool(control_state.leases.is_empty())
+        }
     }
 }
 
@@ -729,7 +835,6 @@ fn is_authorized(peer_uid: u32, peer_gid: u32, authorized_group: Option<&str>) -
     false
 }
 
-
 fn read_group_gid(group_name: &str) -> Option<u32> {
     match std::fs::read_to_string("/etc/group") {
         Ok(group_file) => {
@@ -750,6 +855,30 @@ fn read_group_gid(group_name: &str) -> Option<u32> {
     }
 }
 
+fn lease_token_is_live(token: &str) -> bool {
+    let mut parts = token.split(':');
+    let pid = match parts.next().and_then(|p| p.parse::<u32>().ok()) {
+        Some(pid) => pid,
+        None => return false,
+    };
+    let start_ticks = match parts.next().and_then(|s| s.parse::<u64>().ok()) {
+        Some(start) => start,
+        None => return false,
+    };
+    process_start_ticks(pid)
+        .map(|current| current == start_ticks)
+        .unwrap_or(false)
+}
+
+fn process_start_ticks(pid: u32) -> Option<u64> {
+    let path = format!("/proc/{}/stat", pid);
+    let stat = std::fs::read_to_string(path).ok()?;
+    let close = stat.rfind(')')?;
+    let rest = stat.get(close + 2..)?;
+    let fields: Vec<&str> = rest.split_whitespace().collect();
+    fields.get(19)?.parse::<u64>().ok()
+}
+
 fn categorize_error(error: &AppError) -> String {
     if matches!(error, AppError::WireGuard(_)) {
         "WireGuard".into()
@@ -759,5 +888,56 @@ fn categorize_error(error: &AppError) -> String {
         "Proxy".into()
     } else {
         "Kernel".into()
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn shutdown_if_idle_rejected_when_control_disabled() {
+        let mut state = ControlState::new(false);
+        let response = dispatch(PrivilegedRequest::ShutdownIfIdle, &mut state);
+        match response {
+            PrivilegedResponse::Error { code, .. } => assert_eq!(code, "Control"),
+            other => panic!("expected control error, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn lease_refcount_blocks_then_allows_shutdown() {
+        let mut state = ControlState::new(true);
+        let token = live_token();
+
+        let acquired = dispatch(
+            PrivilegedRequest::LeaseAcquire {
+                token: token.clone(),
+            },
+            &mut state,
+        );
+        assert!(matches!(acquired, PrivilegedResponse::Unit));
+
+        let shutdown_while_leased = dispatch(PrivilegedRequest::ShutdownIfIdle, &mut state);
+        assert!(matches!(shutdown_while_leased, PrivilegedResponse::Bool(false)));
+        assert!(!state.should_exit_now());
+
+        let released = dispatch(PrivilegedRequest::LeaseRelease { token }, &mut state);
+        assert!(matches!(released, PrivilegedResponse::Unit));
+        assert!(state.should_exit_now());
+    }
+
+    #[test]
+    fn lease_token_liveness_checks_pid_start_ticks() {
+        let token = live_token();
+        assert!(lease_token_is_live(&token));
+        assert!(!lease_token_is_live("999999:1"));
+        assert!(!lease_token_is_live("invalid-token"));
+    }
+
+    fn live_token() -> String {
+        let pid = std::process::id();
+        let start = process_start_ticks(pid).expect("must read current process start ticks");
+        format!("{}:{}", pid, start)
     }
 }

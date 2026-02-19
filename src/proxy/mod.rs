@@ -1,3 +1,5 @@
+#![cfg(all(feature = "proxy", target_os = "linux"))]
+
 pub mod daemon;
 pub mod http;
 pub mod socks5;
@@ -123,7 +125,6 @@ pub fn stop_daemon(pid: u32) -> anyhow::Result<()> {
     thread::sleep(Duration::from_millis(100));
     Ok(())
 }
-
 fn pid_is_alive(pid: u32) -> bool {
     std::path::Path::new(&format!("/proc/{}", pid)).exists()
 }

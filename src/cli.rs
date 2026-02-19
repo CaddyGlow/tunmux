@@ -52,6 +52,14 @@ pub enum TopCommand {
         /// Optional group name for privileged socket authorization.
         #[arg(long)]
         authorized_group: Option<String>,
+
+        /// Exit after this many idle milliseconds without requests.
+        #[arg(long)]
+        idle_timeout_ms: Option<u64>,
+
+        /// Internal marker: daemon was launched by client autostart logic.
+        #[arg(long, hide = true)]
+        autostarted: bool,
     },
 }
 
@@ -97,7 +105,7 @@ pub enum ProtonCommand {
         #[arg(long)]
         backend: Option<String>,
 
-        /// Start a SOCKS5/HTTP proxy (VPN traffic isolated in network namespace)
+        /// Start a SOCKS5/HTTP proxy (Linux only; VPN traffic isolated in network namespace)
         #[arg(long)]
         proxy: bool,
 
@@ -160,7 +168,7 @@ pub enum AirVpnCommand {
         #[arg(long)]
         backend: Option<String>,
 
-        /// Start a SOCKS5/HTTP proxy (VPN traffic isolated in network namespace)
+        /// Start a SOCKS5/HTTP proxy (Linux only; VPN traffic isolated in network namespace)
         #[arg(long)]
         proxy: bool,
 

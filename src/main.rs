@@ -5,11 +5,20 @@ mod config;
 mod crypto;
 mod error;
 mod models;
+#[cfg(target_os = "linux")]
+mod netns;
+#[cfg(not(target_os = "linux"))]
+#[path = "netns_stub.rs"]
 mod netns;
 mod privileged;
 mod privileged_api;
 mod privileged_client;
 mod proton;
+#[cfg(all(feature = "proxy", target_os = "linux"))]
+#[path = "proxy/mod.rs"]
+mod proxy;
+#[cfg(not(all(feature = "proxy", target_os = "linux")))]
+#[path = "proxy_stub.rs"]
 mod proxy;
 mod wireguard;
 
@@ -27,12 +36,14 @@ fn main() {
         TopCommand::Privileged {
             serve,
             authorized_group,
+            idle_timeout_ms,
+            autostarted,
         } => {
             if !serve {
                 eprintln!("privileged mode requires --serve");
                 std::process::exit(1);
             }
-            if let Err(e) = privileged::serve(authorized_group) {
+            if let Err(e) = privileged::serve(authorized_group, idle_timeout_ms, autostarted) {
                 eprintln!("privileged service error: {}", e);
                 std::process::exit(1);
             }
@@ -66,6 +77,9 @@ fn main() {
         other => {
             init_tracing(cli.verbose);
             let config = config::load_config();
+            let _command_scope = privileged_client::CommandScopeGuard::begin(
+                config.general.privileged_autostop_mode,
+            );
 
             let rt = tokio::runtime::Runtime::new().expect("failed to create tokio runtime");
             if let Err(e) = rt.block_on(run(other, config)) {

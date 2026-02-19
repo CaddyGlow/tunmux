@@ -1,3 +1,5 @@
+#![cfg(all(feature = "proxy", target_os = "linux"))]
+
 use std::collections::HashMap;
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::{Arc, Mutex};

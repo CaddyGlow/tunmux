@@ -27,6 +27,11 @@ pub struct GeneralConfig {
     pub proxy: bool,
     pub socks_port: Option<u16>,
     pub http_port: Option<u16>,
+    pub privileged_autostart: bool,
+    pub privileged_autostart_timeout_ms: u64,
+    pub privileged_authorized_group: String,
+    pub privileged_autostop_mode: PrivilegedAutostopMode,
+    pub privileged_autostop_timeout_ms: u64,
 }
 
 impl Default for GeneralConfig {
@@ -37,7 +42,26 @@ impl Default for GeneralConfig {
             proxy: false,
             socks_port: None,
             http_port: None,
+            privileged_autostart: true,
+            privileged_autostart_timeout_ms: 5000,
+            privileged_authorized_group: "tunmux".to_string(),
+            privileged_autostop_mode: PrivilegedAutostopMode::Never,
+            privileged_autostop_timeout_ms: 30000,
         }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PrivilegedAutostopMode {
+    Never,
+    Command,
+    Timeout,
+}
+
+impl Default for PrivilegedAutostopMode {
+    fn default() -> Self {
+        Self::Never
     }
 }
 

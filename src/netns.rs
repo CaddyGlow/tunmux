@@ -1,10 +1,11 @@
-use std::path::Path;
-
-use nix::sched::CloneFlags;
-use tracing::info;
+#![cfg(target_os = "linux")]
 
 use crate::error::{AppError, Result};
+use std::path::Path;
+
 use crate::privileged_client::PrivilegedClient;
+use nix::sched::CloneFlags;
+use tracing::info;
 
 /// Create a network namespace. If a stale namespace with the same name
 /// exists (e.g., from a previous failed run), it is deleted first.

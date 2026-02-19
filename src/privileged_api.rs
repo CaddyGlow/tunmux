@@ -106,6 +106,13 @@ pub enum PrivilegedRequest {
         pid_file: String,
         log_file: String,
     },
+    LeaseAcquire {
+        token: String,
+    },
+    LeaseRelease {
+        token: String,
+    },
+    ShutdownIfIdle,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -225,6 +232,10 @@ impl PrivilegedRequest {
                 validate_write_path(log_file)?;
                 Ok(())
             }
+            Self::LeaseAcquire { token } | Self::LeaseRelease { token } => {
+                validate_lease_token(token)
+            }
+            Self::ShutdownIfIdle => Ok(()),
         }
     }
 }
@@ -275,6 +286,19 @@ fn validate_provider(provider: &str) -> Result<(), String> {
     } else {
         Err("provider must be proton or airvpn".into())
     }
+}
+
+fn validate_lease_token(token: &str) -> Result<(), String> {
+    if token.is_empty() || token.len() > 64 {
+        return Err("lease token must be 1..=64 chars".into());
+    }
+    if !token
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == ':' || c == '-' || c == '_')
+    {
+        return Err("lease token contains invalid characters".into());
+    }
+    Ok(())
 }
 
 fn validate_netns_exec_args(args: &[String]) -> Result<(), String> {

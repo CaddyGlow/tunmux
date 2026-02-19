@@ -46,7 +46,8 @@ location and its own port pair. Host traffic is unaffected.
 
 - Rust 2021 edition (latest stable)
 - Linux (uses ip/wg-quick commands and network namespaces)
-- A systemd `tunmux-privileged` service for privileged WireGuard/namespace operations
+- `sudo` access to run `tunmux privileged --serve` for privileged WireGuard/namespace operations
+- Optional: systemd socket activation via `tunmux-privileged.socket`
 
 ## Build
 
@@ -198,6 +199,11 @@ are optional; a missing file means all defaults apply.
     [general]
     backend = "auto"              # default WireGuard backend: auto, wg-quick, kernel
     credential_store = "keyring"  # "keyring" or "file" (requires --features keyring)
+    privileged_autostart = true
+    privileged_autostart_timeout_ms = 5000
+    privileged_authorized_group = "tunmux"
+    privileged_autostop_mode = "never"      # never, command, timeout
+    privileged_autostop_timeout_ms = 30000  # used when mode = "timeout"
 
     [proton]
     default_country = "CH"
@@ -209,6 +215,36 @@ are optional; a missing file means all defaults apply.
 CLI flags always override config values. For example, `--backend wg-quick` takes
 precedence over `backend = "kernel"` in the config file, and `--country US`
 overrides `default_country`.
+
+### Privileged daemon autostart
+
+When a privileged command is issued and `/run/tunmux/ctl.sock` is missing or not
+accepting connections, `tunmux` can autostart the daemon with:
+
+```bash
+sudo /usr/bin/tunmux privileged --serve --authorized-group <group>
+```
+
+Autostart behavior:
+- Uses `sudo -n -b` first (non-interactive).
+- If sudo needs a password and a TTY is available, runs `sudo -v` once, then retries background start.
+- Uses a per-user startup lock (`$XDG_RUNTIME_DIR/tunmux` or `/tmp/tunmux-$UID`) to avoid race-starting multiple daemons.
+- Optional autostop modes for autostarted daemons:
+  - `privileged_autostop_mode = "command"`: uses command-scope lease refcount and explicit `shutdown-if-idle` when the command exits.
+  - `privileged_autostop_mode = "timeout"`: exits after `privileged_autostop_timeout_ms` of idle time.
+
+Recommended sudoers entry (example):
+
+```bash
+<user-or-group> ALL=(root) NOPASSWD: /usr/bin/tunmux privileged --serve --authorized-group tunmux
+```
+
+Typical failures:
+- `autostart disabled and privileged socket unavailable`
+- `sudo not found in PATH`
+- `sudo password required but no TTY available`
+- `startup timeout waiting for privileged daemon readiness`
+- `authorization denied by privileged daemon`
 
 ### Keyring support
 
