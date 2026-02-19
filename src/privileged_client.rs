@@ -1082,7 +1082,11 @@ fn current_user_primary_group_name() -> Option<String> {
         .flatten()
         .and_then(|group| {
             let name = group.name.trim().to_string();
-            if name.is_empty() { None } else { Some(name) }
+            if name.is_empty() {
+                None
+            } else {
+                Some(name)
+            }
         })
 }
 

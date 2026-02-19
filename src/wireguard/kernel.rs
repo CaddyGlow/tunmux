@@ -1,9 +1,9 @@
 use std::process::Command;
 
 use crate::error::{AppError, Result};
-use tracing::debug;
 use crate::netns;
 use crate::privileged_client::PrivilegedClient;
+use tracing::debug;
 
 use super::backend::WgBackend;
 use super::config::WgConfigParams;

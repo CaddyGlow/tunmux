@@ -1,8 +1,11 @@
 # tunmux
 
-Multi-provider VPN CLI written in Rust. Supports Proton VPN and AirVPN with
+Multi-provider VPN CLI written in Rust. Supports Proton VPN, AirVPN, Mullvad,
+and IVPN with
 WireGuard connectivity, multiple backends (wg-quick, userspace, kernel), and full account
 management.
+
+Note: Mullvad and IVPN support is implemented but has not been tested yet.
 
 ## Features
 
@@ -34,6 +37,18 @@ location and its own port pair. Host traffic is unaffected.
 - API key management (add, rename, delete)
 - Config file generation (WireGuard and OpenVPN, single or archive)
 - Active session viewing with traffic stats
+
+### Mullvad
+- Status: implemented, not tested yet
+- Account-based login and device provisioning via API
+- Relay listing from Mullvad relay API
+- WireGuard connect/disconnect (direct or proxy mode)
+
+### IVPN
+- Status: implemented, not tested yet
+- Account login with WireGuard key provisioning (2FA prompt supported)
+- Server listing from IVPN servers API
+- WireGuard connect/disconnect (direct or proxy mode)
 
 ### WireGuard
 - Three backends: wg-quick, userspace (wg-quick + userspace preference), and kernel (ip/wg commands)
@@ -135,6 +150,32 @@ and proxy ports.
     tunmux airvpn disconnect castor
     tunmux airvpn disconnect --all
 
+### Mullvad
+
+Status: implemented, not tested yet.
+
+    tunmux mullvad login <account_number>
+    tunmux mullvad info
+    tunmux mullvad servers --country US
+    tunmux mullvad connect --country DE
+    tunmux mullvad connect us-nyc-wg-401
+    tunmux mullvad connect --proxy --country NL
+    tunmux mullvad disconnect
+    tunmux mullvad logout
+
+### IVPN
+
+Status: implemented, not tested yet.
+
+    tunmux ivpn login <account_id>
+    tunmux ivpn info
+    tunmux ivpn servers --country US
+    tunmux ivpn connect --country CH
+    tunmux ivpn connect us-ny4.wg.ivpn.net
+    tunmux ivpn connect --proxy --country NL
+    tunmux ivpn disconnect
+    tunmux ivpn logout
+
 ### Multi-instance disconnect
 
 When multiple connections are active for a provider, `disconnect` without
@@ -177,6 +218,8 @@ stays on the thread that entered the namespace.
 Auto-derived from the server name:
 - Proton `US#1` -> instance `us-1`, interface `wg-us-1`, namespace `tunmux_us-1`
 - AirVPN `Castor` -> instance `castor`, interface `wg-castor`, namespace `tunmux_castor`
+- Mullvad `us-nyc-wg-401` -> instance `us-nyc-wg-401`, interface `wg-us-nyc-wg-401`, namespace `tunmux_us-nyc-wg-401`
+- IVPN `us-ny4.wg.ivpn.net` -> instance `us-ny4-wg-ivpn-net`, interface `wg-us-ny4-wg-ivpn-net`, namespace `tunmux_us-ny4-wg-ivpn-net`
 
 ### Port assignment
 
@@ -218,6 +261,12 @@ are optional; a missing file means all defaults apply.
     [airvpn]
     default_country = "NL"
     default_device = "laptop"
+
+    [mullvad]
+    default_country = "SE"
+
+    [ivpn]
+    default_country = "CH"
 
 CLI flags always override config values. For example, `--backend userspace` takes
 precedence over `backend = "kernel"` in the config file, and `--country US`
@@ -292,6 +341,12 @@ User config/session/connection state stored in `~/.config/tunmux/`:
         session.json           # AirVPN credentials and WG keys
         manifest.json          # cached server list
         web_session.json       # web session cookies and CSRF tokens
+      mullvad/
+        session.json           # Mullvad account/device and WG keys
+        manifest.json          # cached relay list
+      ivpn/
+        session.json           # IVPN session and WG keys
+        manifest.json          # cached server list
 
 Privileged runtime state:
 

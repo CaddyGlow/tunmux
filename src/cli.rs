@@ -25,6 +25,18 @@ pub enum TopCommand {
         command: AirVpnCommand,
     },
 
+    /// Mullvad VPN commands
+    Mullvad {
+        #[command(subcommand)]
+        command: MullvadCommand,
+    },
+
+    /// IVPN commands
+    Ivpn {
+        #[command(subcommand)]
+        command: IvpnCommand,
+    },
+
     /// Show active VPN connections and proxy instances
     Status,
 
@@ -270,6 +282,132 @@ pub enum AirVpnCommand {
     ApiKeys {
         #[command(subcommand)]
         action: ApiKeyAction,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum MullvadCommand {
+    /// Sign in with Mullvad account number
+    Login {
+        /// Mullvad account number
+        account: String,
+    },
+
+    /// Sign out and remove credentials
+    Logout,
+
+    /// Display account information
+    Info,
+
+    /// List available VPN servers
+    Servers {
+        /// Filter by country code (e.g., US, CH, JP)
+        #[arg(short, long)]
+        country: Option<String>,
+    },
+
+    /// Connect to a VPN server
+    Connect {
+        /// Server hostname (e.g., us-nyc-wg-401)
+        server: Option<String>,
+
+        /// Connect to a server in this country
+        #[arg(short, long)]
+        country: Option<String>,
+
+        /// WireGuard backend: auto, wg-quick, userspace, kernel
+        #[arg(long)]
+        backend: Option<String>,
+
+        /// Start a SOCKS5/HTTP proxy (Linux only; VPN traffic isolated in network namespace)
+        #[arg(long)]
+        proxy: bool,
+
+        /// SOCKS5 proxy port (default: auto-assign from 1080)
+        #[arg(long)]
+        socks_port: Option<u16>,
+
+        /// HTTP proxy port (default: auto-assign from 8118)
+        #[arg(long)]
+        http_port: Option<u16>,
+
+        /// Enable proxy access logging to the instance log file
+        #[arg(long)]
+        proxy_access_log: bool,
+    },
+
+    /// Disconnect from VPN
+    Disconnect {
+        /// Instance name to disconnect (from `tunmux status`). If omitted,
+        /// disconnects the sole active connection or lists choices.
+        instance: Option<String>,
+
+        /// Disconnect all active connections for this provider
+        #[arg(long)]
+        all: bool,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum IvpnCommand {
+    /// Sign in with IVPN account ID
+    Login {
+        /// IVPN account ID (for example: i-XXXX-XXXX-XXXX)
+        account: String,
+    },
+
+    /// Sign out and remove credentials
+    Logout,
+
+    /// Display account information
+    Info,
+
+    /// List available VPN servers
+    Servers {
+        /// Filter by country code (e.g., US, CH, JP)
+        #[arg(short, long)]
+        country: Option<String>,
+    },
+
+    /// Connect to a VPN server
+    Connect {
+        /// Server hostname or gateway (e.g., us-ny4.wg.ivpn.net, us.wg.ivpn.net)
+        server: Option<String>,
+
+        /// Connect to a server in this country
+        #[arg(short, long)]
+        country: Option<String>,
+
+        /// WireGuard backend: auto, wg-quick, userspace, kernel
+        #[arg(long)]
+        backend: Option<String>,
+
+        /// Start a SOCKS5/HTTP proxy (Linux only; VPN traffic isolated in network namespace)
+        #[arg(long)]
+        proxy: bool,
+
+        /// SOCKS5 proxy port (default: auto-assign from 1080)
+        #[arg(long)]
+        socks_port: Option<u16>,
+
+        /// HTTP proxy port (default: auto-assign from 8118)
+        #[arg(long)]
+        http_port: Option<u16>,
+
+        /// Enable proxy access logging to the instance log file
+        #[arg(long)]
+        proxy_access_log: bool,
+    },
+
+    /// Disconnect from VPN
+    Disconnect {
+        /// Instance name to disconnect (from `tunmux status`). If omitted,
+        /// disconnects the sole active connection or lists choices.
+        instance: Option<String>,
+
+        /// Disconnect all active connections for this provider
+        #[arg(long)]
+        all: bool,
     },
 }
 

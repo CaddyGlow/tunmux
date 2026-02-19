@@ -17,6 +17,8 @@ pub struct AppConfig {
     pub general: GeneralConfig,
     pub proton: ProtonConfig,
     pub airvpn: AirVpnConfig,
+    pub mullvad: MullvadConfig,
+    pub ivpn: IvpnConfig,
 }
 
 #[derive(Debug, Deserialize)]
@@ -95,6 +97,18 @@ pub struct AirVpnConfig {
     pub default_device: Option<String>,
 }
 
+#[derive(Debug, Default, Deserialize)]
+#[serde(default)]
+pub struct MullvadConfig {
+    pub default_country: Option<String>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(default)]
+pub struct IvpnConfig {
+    pub default_country: Option<String>,
+}
+
 pub fn load_config() -> AppConfig {
     let path = app_config_dir().join("config.toml");
     match fs::read_to_string(&path) {
@@ -114,6 +128,8 @@ pub fn load_config() -> AppConfig {
 pub enum Provider {
     Proton,
     AirVpn,
+    Mullvad,
+    Ivpn,
 }
 
 impl Provider {
@@ -122,6 +138,8 @@ impl Provider {
         match self {
             Provider::Proton => "proton",
             Provider::AirVpn => "airvpn",
+            Provider::Mullvad => "mullvad",
+            Provider::Ivpn => "ivpn",
         }
     }
 }

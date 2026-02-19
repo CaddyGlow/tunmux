@@ -4,8 +4,10 @@ mod cli;
 mod config;
 mod crypto;
 mod error;
+mod ivpn;
 mod logging;
 mod models;
+mod mullvad;
 #[cfg(target_os = "linux")]
 mod netns;
 #[cfg(not(target_os = "linux"))]
@@ -113,6 +115,8 @@ async fn run(command: TopCommand, config: config::AppConfig) -> anyhow::Result<(
     match command {
         TopCommand::Proton { command } => proton::handlers::dispatch(command, &config).await,
         TopCommand::Airvpn { command } => airvpn::handlers::dispatch(command, &config).await,
+        TopCommand::Mullvad { command } => mullvad::handlers::dispatch(command, &config).await,
+        TopCommand::Ivpn { command } => ivpn::handlers::dispatch(command, &config).await,
         TopCommand::Status | TopCommand::ProxyDaemon { .. } | TopCommand::Privileged { .. } => {
             unreachable!()
         }
