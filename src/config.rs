@@ -48,7 +48,7 @@ impl Default for GeneralConfig {
             privileged_transport: PrivilegedTransport::Socket,
             privileged_autostart: true,
             privileged_autostart_timeout_ms: 5000,
-            privileged_authorized_group: "tunmux".to_string(),
+            privileged_authorized_group: String::new(),
             privileged_autostop_mode: PrivilegedAutostopMode::Never,
             privileged_autostop_timeout_ms: 30000,
         }

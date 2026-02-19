@@ -10,7 +10,7 @@ use std::time::{Duration, Instant};
 use std::{fs, thread};
 
 use nix::libc;
-use nix::unistd::Uid;
+use nix::unistd::{Gid, Group, Uid};
 use tracing::debug;
 
 use crate::config;
@@ -18,6 +18,8 @@ use crate::config::{PrivilegedAutostopMode, PrivilegedTransport};
 use crate::error::{AppError, Result};
 
 use crate::privileged_api::{KillSignal, PrivilegedRequest, PrivilegedResponse, WgQuickAction};
+
+const FALLBACK_AUTH_GROUP: &str = "tunmux";
 
 pub struct PrivilegedClient {
     socket_path: PathBuf,
@@ -183,7 +185,9 @@ impl PrivilegedClient {
             transport: cfg.general.privileged_transport,
             autostart_enabled: cfg.general.privileged_autostart,
             autostart_timeout: Duration::from_millis(timeout_ms),
-            authorized_group: cfg.general.privileged_authorized_group,
+            authorized_group: resolve_client_authorized_group(
+                cfg.general.privileged_authorized_group.as_str(),
+            ),
             autostop_mode,
             daemon_idle_timeout_ms,
         }
@@ -1061,6 +1065,25 @@ fn stderr_requires_password(stderr: &str) -> bool {
         || lower.contains("a password is required")
         || lower.contains("a terminal is required")
         || lower.contains("no tty")
+}
+
+fn resolve_client_authorized_group(configured_group: &str) -> String {
+    let configured = configured_group.trim();
+    if !configured.is_empty() {
+        return configured.to_string();
+    }
+
+    current_user_primary_group_name().unwrap_or_else(|| FALLBACK_AUTH_GROUP.to_string())
+}
+
+fn current_user_primary_group_name() -> Option<String> {
+    Group::from_gid(Gid::current())
+        .ok()
+        .flatten()
+        .and_then(|group| {
+            let name = group.name.trim().to_string();
+            if name.is_empty() { None } else { Some(name) }
+        })
 }
 
 fn startup_lock_dir() -> PathBuf {
