@@ -10,7 +10,7 @@ use std::time::{Duration, Instant};
 use nix::sys::signal::{kill, Signal};
 #[cfg(target_os = "linux")]
 use nix::sys::socket::{getsockopt, sockopt::PeerCredentials};
-use nix::unistd::{chown, Gid, Pid};
+use nix::unistd::{chown, Gid, Group, Pid};
 use tracing::{debug, info, warn};
 
 use crate::config;
@@ -1012,23 +1012,10 @@ fn is_authorized(peer_uid: u32, peer_gid: u32, authorized_group: Option<&str>) -
 }
 
 fn read_group_gid(group_name: &str) -> Option<u32> {
-    match std::fs::read_to_string("/etc/group") {
-        Ok(group_file) => {
-            let mut group_gid = None;
-            for line in group_file.lines() {
-                let mut parts = line.split(':');
-                let name = parts.next()?;
-                let _ = parts.next();
-                let gid = parts.next()?;
-                if name == group_name {
-                    group_gid = gid.parse::<u32>().ok();
-                    break;
-                }
-            }
-            group_gid
-        }
-        Err(_) => None,
-    }
+    Group::from_name(group_name)
+        .ok()
+        .flatten()
+        .map(|g| g.gid.as_raw())
 }
 
 fn managed_pid_registry_dir() -> std::path::PathBuf {
