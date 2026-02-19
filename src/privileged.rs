@@ -18,7 +18,6 @@ use crate::privileged_api::{KillSignal, PrivilegedRequest, PrivilegedResponse, W
 
 const AUTH_GROUP_NAME: &str = "tunmux";
 struct ControlState {
-    managed_pids: HashSet<u32>,
     leases: HashSet<String>,
     allow_shutdown: bool,
     shutdown_requested: bool,
@@ -27,7 +26,6 @@ struct ControlState {
 impl ControlState {
     fn new(allow_shutdown: bool) -> Self {
         Self {
-            managed_pids: HashSet::new(),
             leases: HashSet::new(),
             allow_shutdown,
             shutdown_requested: false,
@@ -56,6 +54,8 @@ pub fn serve(
     let idle_timeout = cli_idle_timeout_ms.map(|ms| Duration::from_millis(ms.max(100)));
     config::ensure_privileged_socket_dir()?;
     config::ensure_privileged_runtime_dir()?;
+    ensure_managed_pid_registry_dir()?;
+    cleanup_stale_managed_pid_registry_entries()?;
 
     // Resolve group GID for chown of socket dir and file.
     let group_gid = authorized_group
@@ -246,6 +246,12 @@ fn handle_client(
         return PrivilegedResponse::Error {
             code: "Validation".into(),
             message: e,
+        };
+    }
+    if let Err(e) = cleanup_stale_managed_pid_registry_entries() {
+        return PrivilegedResponse::Error {
+            code: "IO".into(),
+            message: format!("managed pid cleanup failed: {}", e),
         };
     }
 
@@ -482,7 +488,16 @@ fn dispatch(request: PrivilegedRequest, control_state: &mut ControlState) -> Pri
         },
 
         PrivilegedRequest::KillPid { pid, signal } => {
-            if !control_state.managed_pids.contains(&pid) {
+            let managed = match managed_pid_is_current(pid) {
+                Ok(managed) => managed,
+                Err(e) => {
+                    return PrivilegedResponse::Error {
+                        code: "IO".into(),
+                        message: format!("managed pid check failed: {}", e),
+                    };
+                }
+            };
+            if !managed {
                 return PrivilegedResponse::Error {
                     code: "Authorization".into(),
                     message: format!("pid {} is not managed by privileged service", pid),
@@ -509,8 +524,15 @@ fn dispatch(request: PrivilegedRequest, control_state: &mut ControlState) -> Pri
             let target = Pid::from_raw(pid as i32);
             match kill(target, signal) {
                 Ok(()) => {
-                    control_state.managed_pids.remove(&pid);
+                    let _ = unregister_managed_pid(pid);
                     PrivilegedResponse::Unit
+                }
+                Err(nix::errno::Errno::ESRCH) => {
+                    let _ = unregister_managed_pid(pid);
+                    PrivilegedResponse::Error {
+                        code: "Kernel".into(),
+                        message: format!("kill {} failed: process no longer exists", pid),
+                    }
                 }
                 Err(e) => PrivilegedResponse::Error {
                     code: "Kernel".into(),
@@ -532,10 +554,16 @@ fn dispatch(request: PrivilegedRequest, control_state: &mut ControlState) -> Pri
             pid_file.as_str(),
             log_file.as_str(),
         ) {
-            Ok(pid) => {
-                control_state.managed_pids.insert(pid);
-                PrivilegedResponse::Pid(pid)
-            }
+            Ok(pid) => match register_managed_pid(pid) {
+                Ok(()) => PrivilegedResponse::Pid(pid),
+                Err(e) => {
+                    let _ = kill(Pid::from_raw(pid as i32), Signal::SIGTERM);
+                    PrivilegedResponse::Error {
+                        code: "IO".into(),
+                        message: format!("failed to register managed pid {}: {}", pid, e),
+                    }
+                }
+            },
             Err(e) => PrivilegedResponse::Error {
                 code: "Proxy".into(),
                 message: e.to_string(),
@@ -855,6 +883,95 @@ fn read_group_gid(group_name: &str) -> Option<u32> {
     }
 }
 
+fn managed_pid_registry_dir() -> std::path::PathBuf {
+    if let Some(override_dir) = std::env::var_os("TUNMUX_MANAGED_PIDS_DIR") {
+        let path = std::path::PathBuf::from(override_dir);
+        if !path.as_os_str().is_empty() {
+            return path;
+        }
+    }
+    config::privileged_socket_dir().join("managed-pids")
+}
+
+fn managed_pid_entry_path(pid: u32) -> std::path::PathBuf {
+    managed_pid_registry_dir().join(format!("{}.start", pid))
+}
+
+fn ensure_managed_pid_registry_dir() -> Result<()> {
+    let dir = managed_pid_registry_dir();
+    if !dir.exists() {
+        std::fs::create_dir_all(&dir)?;
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))?;
+    }
+    Ok(())
+}
+
+fn register_managed_pid(pid: u32) -> Result<()> {
+    let start_ticks = process_start_ticks(pid)
+        .ok_or_else(|| AppError::Other(format!("failed reading /proc/{}/stat", pid)))?;
+    ensure_managed_pid_registry_dir()?;
+    let path = managed_pid_entry_path(pid);
+    std::fs::write(&path, format!("{}\n", start_ticks))?;
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
+    Ok(())
+}
+
+fn unregister_managed_pid(pid: u32) -> Result<()> {
+    let path = managed_pid_entry_path(pid);
+    if path.exists() {
+        std::fs::remove_file(path)?;
+    }
+    Ok(())
+}
+
+fn managed_pid_is_current(pid: u32) -> Result<bool> {
+    let path = managed_pid_entry_path(pid);
+    if !path.exists() {
+        return Ok(false);
+    }
+
+    let expected = match std::fs::read_to_string(&path)
+        .ok()
+        .and_then(|raw| raw.trim().parse::<u64>().ok())
+    {
+        Some(start) => start,
+        None => {
+            let _ = unregister_managed_pid(pid);
+            return Ok(false);
+        }
+    };
+
+    match process_start_ticks(pid) {
+        Some(current) if current == expected => Ok(true),
+        _ => {
+            let _ = unregister_managed_pid(pid);
+            Ok(false)
+        }
+    }
+}
+
+fn cleanup_stale_managed_pid_registry_entries() -> Result<()> {
+    ensure_managed_pid_registry_dir()?;
+    let dir = managed_pid_registry_dir();
+    for entry in std::fs::read_dir(&dir)? {
+        let entry = entry?;
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+
+        let Some(pid) = parse_managed_pid_entry_name(&name) else {
+            let _ = std::fs::remove_file(entry.path());
+            continue;
+        };
+
+        let _ = managed_pid_is_current(pid)?;
+    }
+    Ok(())
+}
+
+fn parse_managed_pid_entry_name(name: &str) -> Option<u32> {
+    name.strip_suffix(".start")?.parse::<u32>().ok()
+}
+
 fn lease_token_is_live(token: &str) -> bool {
     let mut parts = token.split(':');
     let pid = match parts.next().and_then(|p| p.parse::<u32>().ok()) {
@@ -894,6 +1011,8 @@ fn categorize_error(error: &AppError) -> String {
 #[cfg(all(test, target_os = "linux"))]
 mod tests {
     use super::*;
+    use std::sync::{Mutex, OnceLock};
+    use std::time::{SystemTime, UNIX_EPOCH};
 
     #[test]
     fn shutdown_if_idle_rejected_when_control_disabled() {
@@ -919,7 +1038,10 @@ mod tests {
         assert!(matches!(acquired, PrivilegedResponse::Unit));
 
         let shutdown_while_leased = dispatch(PrivilegedRequest::ShutdownIfIdle, &mut state);
-        assert!(matches!(shutdown_while_leased, PrivilegedResponse::Bool(false)));
+        assert!(matches!(
+            shutdown_while_leased,
+            PrivilegedResponse::Bool(false)
+        ));
         assert!(!state.should_exit_now());
 
         let released = dispatch(PrivilegedRequest::LeaseRelease { token }, &mut state);
@@ -935,9 +1057,94 @@ mod tests {
         assert!(!lease_token_is_live("invalid-token"));
     }
 
+    #[test]
+    fn managed_pid_registry_round_trip_and_stale_cleanup() {
+        with_managed_pid_registry_dir(|| {
+            let pid = std::process::id();
+            register_managed_pid(pid).expect("register managed pid");
+            assert!(managed_pid_is_current(pid).expect("check managed pid"));
+
+            let stale = managed_pid_entry_path(999_999);
+            std::fs::write(&stale, "1\n").expect("write stale entry");
+            cleanup_stale_managed_pid_registry_entries().expect("cleanup stale entries");
+            assert!(!stale.exists());
+        });
+    }
+
+    #[test]
+    fn managed_pid_cleanup_removes_invalid_entry_names() {
+        with_managed_pid_registry_dir(|| {
+            ensure_managed_pid_registry_dir().expect("ensure managed pid registry dir");
+            let invalid = managed_pid_registry_dir().join("bad-entry");
+            std::fs::write(&invalid, "junk").expect("write invalid entry");
+            cleanup_stale_managed_pid_registry_entries().expect("cleanup invalid entries");
+            assert!(!invalid.exists());
+        });
+    }
+
+    #[test]
+    fn kill_pid_rejects_stale_registry_entry_and_cleans_file() {
+        with_managed_pid_registry_dir(|| {
+            let pid = std::process::id();
+            let stale_path = managed_pid_entry_path(pid);
+            std::fs::write(&stale_path, "1\n").expect("write stale managed entry");
+
+            let mut state = ControlState::new(false);
+            let response = dispatch(
+                PrivilegedRequest::KillPid {
+                    pid,
+                    signal: KillSignal::Term,
+                },
+                &mut state,
+            );
+
+            match response {
+                PrivilegedResponse::Error { code, message } => {
+                    assert_eq!(code, "Authorization");
+                    assert!(message.contains("not managed by privileged service"));
+                }
+                other => panic!("expected authorization error, got {:?}", other),
+            }
+            assert!(!stale_path.exists());
+        });
+    }
+
     fn live_token() -> String {
         let pid = std::process::id();
         let start = process_start_ticks(pid).expect("must read current process start ticks");
         format!("{}:{}", pid, start)
+    }
+
+    fn with_managed_pid_registry_dir<F>(f: F)
+    where
+        F: FnOnce(),
+    {
+        static ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        let _guard = ENV_LOCK
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .expect("lock env mutex");
+
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("time")
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!(
+            "tunmux-managed-pids-test-{}-{}",
+            std::process::id(),
+            unique
+        ));
+        std::fs::create_dir_all(&dir).expect("create test registry dir");
+
+        let old = std::env::var_os("TUNMUX_MANAGED_PIDS_DIR");
+        std::env::set_var("TUNMUX_MANAGED_PIDS_DIR", &dir);
+        f();
+        if let Some(value) = old {
+            std::env::set_var("TUNMUX_MANAGED_PIDS_DIR", value);
+        } else {
+            std::env::remove_var("TUNMUX_MANAGED_PIDS_DIR");
+        }
+
+        let _ = std::fs::remove_dir_all(dir);
     }
 }
