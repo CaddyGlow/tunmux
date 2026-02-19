@@ -136,12 +136,12 @@ pub fn app_config_dir() -> PathBuf {
 
 #[must_use]
 pub fn privileged_socket_path() -> PathBuf {
-    PathBuf::from("/run/tunmux/ctl.sock")
+    privileged_socket_dir().join("ctl.sock")
 }
 
 #[must_use]
 pub fn privileged_socket_dir() -> PathBuf {
-    PathBuf::from("/run/tunmux")
+    PathBuf::from("/var/run/tunmux")
 }
 
 pub fn ensure_privileged_socket_dir() -> Result<()> {
@@ -155,7 +155,10 @@ pub fn ensure_privileged_socket_dir() -> Result<()> {
 
 #[must_use]
 pub fn privileged_runtime_dir() -> PathBuf {
-    PathBuf::from("/var/lib/tunmux")
+    #[cfg(target_os = "macos")]
+    return PathBuf::from("/var/db/tunmux");
+    #[cfg(not(target_os = "macos"))]
+    return PathBuf::from("/var/lib/tunmux");
 }
 
 pub fn ensure_privileged_runtime_dir() -> Result<()> {
