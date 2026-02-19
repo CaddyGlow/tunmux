@@ -291,6 +291,27 @@ pub enum MullvadCommand {
     Login {
         /// Mullvad account number
         account: String,
+
+        /// Overwrite existing saved account ID without confirmation
+        #[arg(long)]
+        force: bool,
+    },
+
+    /// Create a new Mullvad account and sign in
+    CreateAccount {
+        /// Output result as JSON
+        #[arg(long)]
+        json: bool,
+
+        /// Overwrite existing saved account ID without confirmation
+        #[arg(long)]
+        force: bool,
+    },
+
+    /// Payment-related commands
+    Payment {
+        #[command(subcommand)]
+        action: MullvadPaymentCommand,
     },
 
     /// Sign out and remove credentials
@@ -354,6 +375,27 @@ pub enum IvpnCommand {
     Login {
         /// IVPN account ID (for example: i-XXXX-XXXX-XXXX)
         account: String,
+
+        /// Overwrite existing saved account ID without confirmation
+        #[arg(long)]
+        force: bool,
+    },
+
+    /// Create a new IVPN account
+    CreateAccount {
+        /// Product: standard or pro
+        #[arg(long, default_value = "standard", value_parser = ["standard", "pro"])]
+        product: String,
+
+        /// Overwrite existing saved account ID without confirmation
+        #[arg(long)]
+        force: bool,
+    },
+
+    /// Payment-related commands
+    Payment {
+        #[command(subcommand)]
+        action: IvpnPaymentCommand,
     },
 
     /// Sign out and remove credentials
@@ -408,6 +450,33 @@ pub enum IvpnCommand {
         /// Disconnect all active connections for this provider
         #[arg(long)]
         all: bool,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum MullvadPaymentCommand {
+    /// Fetch Mullvad Monero payment details from the web account flow
+    Monero {
+        /// Mullvad account number (defaults to saved session account)
+        #[arg(long)]
+        account: Option<String>,
+
+        /// Output result as JSON
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum IvpnPaymentCommand {
+    /// Fetch Monero payment details for an IVPN account
+    Monero {
+        /// IVPN account ID (for example: i-XXXX-XXXX-XXXX). If omitted, uses saved account ID.
+        account: Option<String>,
+
+        /// Billing duration: 7d, 1m, 1y
+        #[arg(long, default_value = "1m", value_parser = ["7d", "1m", "1y"])]
+        duration: String,
     },
 }
 

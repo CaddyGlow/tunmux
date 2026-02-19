@@ -1,8 +1,10 @@
 use anyhow::Context;
-use reqwest::Client;
+use reqwest::{Client, StatusCode};
 use serde::de::DeserializeOwned;
+use std::net::{IpAddr, Ipv4Addr};
+use std::time::Duration;
 
-use crate::cli::IvpnCommand;
+use crate::cli::{IvpnCommand, IvpnPaymentCommand};
 use crate::config::{self, AppConfig, Provider};
 use crate::crypto;
 use crate::error;
@@ -13,9 +15,14 @@ use crate::wireguard;
 const PROVIDER: Provider = Provider::Ivpn;
 const INTERFACE_NAME: &str = "ivpn0";
 const MANIFEST_FILE: &str = "manifest.json";
+const ACCOUNT_FILE: &str = "account.json";
 const API_BASE: &str = "https://api.ivpn.net";
+const WEB_BASE: &str = "https://www.ivpn.net";
 const CODE_SUCCESS: i64 = 200;
 const CODE_2FA_REQUIRED: i64 = 70011;
+const CREATE_ACCOUNT_PRODUCT_STANDARD: &str = "IVPN Standard";
+const PAYMENT_METHOD_MONERO: &str = "Monero";
+const WEB_RATE_LIMIT_RETRIES: usize = 3;
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 struct IvpnSession {
@@ -29,6 +36,11 @@ struct IvpnSession {
     wg_local_ip: String,
     account_active: bool,
     account_active_until: Option<i64>,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct IvpnSavedAccount {
+    account_id: String,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -81,6 +93,67 @@ struct IvpnPortInfo {
 struct IvpnPortRange {
     min: u16,
     max: u16,
+}
+
+#[derive(Debug, serde::Serialize)]
+struct IvpnCreateAccountRequest<'a> {
+    product: &'a str,
+}
+
+#[derive(Debug, serde::Serialize)]
+struct IvpnWebLoginRequest<'a> {
+    account_id: &'a str,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct IvpnCreateAccountResponse {
+    account: IvpnCreatedAccount,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct IvpnCreatedAccount {
+    id: String,
+    #[serde(default)]
+    ref_id: String,
+    #[serde(default)]
+    is_active: bool,
+    #[serde(default)]
+    product: Option<IvpnCreatedAccountProduct>,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct IvpnCreatedAccountProduct {
+    #[serde(default)]
+    name: String,
+}
+
+#[derive(Debug, serde::Serialize)]
+struct IvpnMoneroPaymentDetailsRequest<'a> {
+    duration: &'a str,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct IvpnMoneroPaymentDetailsResponse {
+    #[serde(default)]
+    address: String,
+    #[serde(default)]
+    payment_uri: String,
+    #[serde(default)]
+    amount: u64,
+    #[serde(default)]
+    amount_rounded: String,
+}
+
+#[derive(Debug, serde::Serialize)]
+struct IvpnPaymentsRequest<'a> {
+    is_recent: bool,
+    payment_method: &'a str,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct IvpnPaymentsResponse {
+    #[serde(default)]
+    payments: Vec<serde_json::Value>,
 }
 
 #[derive(Debug, serde::Serialize)]
@@ -160,6 +233,12 @@ struct IvpnBasicResponse {
 pub async fn dispatch(command: IvpnCommand, config: &AppConfig) -> anyhow::Result<()> {
     match command {
         IvpnCommand::Login { account } => cmd_login(&account, config).await,
+        IvpnCommand::CreateAccount { product } => cmd_create_account(&product).await,
+        IvpnCommand::Payment { action } => match action {
+            IvpnPaymentCommand::Monero { account, duration } => {
+                cmd_monero_payment(account.as_deref(), &duration, config).await
+            }
+        },
         IvpnCommand::Logout => cmd_logout(config).await,
         IvpnCommand::Info => cmd_info(config).await,
         IvpnCommand::Servers { country } => cmd_servers(country).await,
@@ -186,6 +265,55 @@ pub async fn dispatch(command: IvpnCommand, config: &AppConfig) -> anyhow::Resul
         }
         IvpnCommand::Disconnect { instance, all } => cmd_disconnect(instance, all),
     }
+}
+
+async fn cmd_create_account(product: &str) -> anyhow::Result<()> {
+    let client = web_client()?;
+    let product = normalize_create_account_product(product)?;
+    let (account, _csrf_token) = create_account(&client, product).await?;
+    save_account_id(&account.id)?;
+    let plan = account
+        .product
+        .as_ref()
+        .map(|p| p.name.as_str())
+        .filter(|name| !name.is_empty())
+        .unwrap_or(CREATE_ACCOUNT_PRODUCT_STANDARD);
+
+    println!("Created IVPN account {}", account.id);
+    if !account.ref_id.is_empty() {
+        println!("Reference ID: {}", account.ref_id);
+    }
+    println!("Plan:         {}", plan);
+    if !account.is_active {
+        println!("Status:       inactive");
+    }
+    Ok(())
+}
+
+async fn cmd_monero_payment(
+    account_id: Option<&str>,
+    duration: &str,
+    config: &AppConfig,
+) -> anyhow::Result<()> {
+    let client = web_client()?;
+    let mut csrf_token = None;
+    let duration = normalize_payment_duration(duration)?;
+    let account_id = resolve_account_id(account_id, config)?;
+
+    web_login(&client, &mut csrf_token, &account_id).await?;
+    if csrf_token.is_none() {
+        let _ = web_get_account(&client, &mut csrf_token).await;
+    }
+
+    let details = monero_payment_details(&client, &mut csrf_token, duration).await?;
+    println!("Monero amount: {}", details.amount_rounded);
+    println!("Monero atomic amount: {}", details.amount);
+    println!("Monero address: {}", details.address);
+    println!("Monero payment URI: {}", details.payment_uri);
+
+    let items = payments(&client, &mut csrf_token, true, PAYMENT_METHOD_MONERO).await?;
+    println!("Recent {} payments: {}", PAYMENT_METHOD_MONERO, items.len());
+    Ok(())
 }
 
 async fn cmd_login(account_id: &str, config: &AppConfig) -> anyhow::Result<()> {
@@ -231,6 +359,7 @@ async fn cmd_login(account_id: &str, config: &AppConfig) -> anyhow::Result<()> {
         },
     };
     config::save_session(PROVIDER, &session, config)?;
+    save_account_id(account_id)?;
 
     if let Ok(manifest) = fetch_manifest(&client).await {
         let _ = save_manifest(&manifest);
@@ -836,7 +965,304 @@ fn ensure_api_success(code: i64, message: &str, action: &str) -> anyhow::Result<
 }
 
 fn api_client() -> anyhow::Result<Client> {
-    Ok(Client::builder().user_agent("tunmux").build()?)
+    Ok(Client::builder()
+        .user_agent("tunmux")
+        .cookie_store(true)
+        .build()?)
+}
+
+fn web_client() -> anyhow::Result<Client> {
+    // IVPN web account endpoints are currently rate-limited on IPv6 from some networks.
+    // Bind to an IPv4 local address so outbound connections use IPv4.
+    Ok(Client::builder()
+        .user_agent("tunmux")
+        .cookie_store(true)
+        .local_address(IpAddr::V4(Ipv4Addr::UNSPECIFIED))
+        .build()?)
+}
+
+async fn create_account(
+    client: &Client,
+    product: &str,
+) -> anyhow::Result<(IvpnCreatedAccount, Option<String>)> {
+    create_account_with_base(client, WEB_BASE, product).await
+}
+
+async fn create_account_with_base(
+    client: &Client,
+    web_base: &str,
+    product: &str,
+) -> anyhow::Result<(IvpnCreatedAccount, Option<String>)> {
+    let req = IvpnCreateAccountRequest { product };
+    let (parsed, csrf_token) = web_post_json_with_base::<IvpnCreateAccountResponse, _>(
+        client,
+        web_base,
+        "/web/accounts/create",
+        &req,
+        None,
+        "IVPN account creation",
+    )
+    .await?;
+    if parsed.account.id.is_empty() {
+        anyhow::bail!("IVPN account creation failed: missing account id");
+    }
+    Ok((parsed.account, csrf_token))
+}
+
+async fn web_login(
+    client: &Client,
+    csrf_token: &mut Option<String>,
+    account_id: &str,
+) -> anyhow::Result<()> {
+    web_login_with_base(client, WEB_BASE, csrf_token, account_id).await
+}
+
+async fn web_login_with_base(
+    client: &Client,
+    web_base: &str,
+    csrf_token: &mut Option<String>,
+    account_id: &str,
+) -> anyhow::Result<()> {
+    let req = IvpnWebLoginRequest { account_id };
+    let (_parsed, next_csrf): (serde_json::Value, Option<String>) = web_post_json_with_base(
+        client,
+        web_base,
+        "/web/accounts/login",
+        &req,
+        csrf_token.as_deref(),
+        "IVPN web login",
+    )
+    .await?;
+    if next_csrf.is_some() {
+        *csrf_token = next_csrf;
+    }
+    Ok(())
+}
+
+async fn web_get_account(client: &Client, csrf_token: &mut Option<String>) -> anyhow::Result<()> {
+    let (_parsed, next_csrf): (serde_json::Value, Option<String>) =
+        web_get_json_with_base(client, WEB_BASE, "/web/accounts/get", "IVPN account lookup")
+            .await?;
+    if next_csrf.is_some() {
+        *csrf_token = next_csrf;
+    }
+    Ok(())
+}
+
+async fn monero_payment_details(
+    client: &Client,
+    csrf_token: &mut Option<String>,
+    duration: &str,
+) -> anyhow::Result<IvpnMoneroPaymentDetailsResponse> {
+    monero_payment_details_with_base(client, WEB_BASE, csrf_token, duration).await
+}
+
+async fn monero_payment_details_with_base(
+    client: &Client,
+    web_base: &str,
+    csrf_token: &mut Option<String>,
+    duration: &str,
+) -> anyhow::Result<IvpnMoneroPaymentDetailsResponse> {
+    let req = IvpnMoneroPaymentDetailsRequest { duration };
+    let (parsed, next_csrf) = web_post_json_with_base(
+        client,
+        web_base,
+        "/web/accounts/monero-payment-details",
+        &req,
+        csrf_token.as_deref(),
+        "IVPN Monero payment details",
+    )
+    .await?;
+    if next_csrf.is_some() {
+        *csrf_token = next_csrf;
+    }
+    Ok(parsed)
+}
+
+async fn payments(
+    client: &Client,
+    csrf_token: &mut Option<String>,
+    is_recent: bool,
+    payment_method: &str,
+) -> anyhow::Result<Vec<serde_json::Value>> {
+    payments_with_base(client, WEB_BASE, csrf_token, is_recent, payment_method).await
+}
+
+async fn payments_with_base(
+    client: &Client,
+    web_base: &str,
+    csrf_token: &mut Option<String>,
+    is_recent: bool,
+    payment_method: &str,
+) -> anyhow::Result<Vec<serde_json::Value>> {
+    let req = IvpnPaymentsRequest {
+        is_recent,
+        payment_method,
+    };
+    let (parsed, next_csrf): (IvpnPaymentsResponse, Option<String>) = web_post_json_with_base(
+        client,
+        web_base,
+        "/web/accounts/payments",
+        &req,
+        csrf_token.as_deref(),
+        "IVPN payments lookup",
+    )
+    .await?;
+    if next_csrf.is_some() {
+        *csrf_token = next_csrf;
+    }
+    Ok(parsed.payments)
+}
+
+async fn web_post_json_with_base<T, B>(
+    client: &Client,
+    web_base: &str,
+    path: &str,
+    body: &B,
+    csrf_token: Option<&str>,
+    action: &str,
+) -> anyhow::Result<(T, Option<String>)>
+where
+    T: DeserializeOwned,
+    B: serde::Serialize + ?Sized,
+{
+    let url = format!("{}{}", web_base.trim_end_matches('/'), path);
+
+    for attempt in 0..=WEB_RATE_LIMIT_RETRIES {
+        let mut req = client.post(url.clone()).json(body);
+        if let Some(token) = csrf_token {
+            req = req.header("Csrf-Token", token);
+        }
+        let resp = req.send().await?;
+
+        if resp.status() != StatusCode::TOO_MANY_REQUESTS {
+            let next_csrf = response_csrf_token(&resp);
+            let parsed = parse_api_json(resp, action).await?;
+            return Ok((parsed, next_csrf));
+        }
+
+        let retry_after = retry_after_seconds(&resp).unwrap_or_else(|| 1u64 << attempt.min(6));
+        let body = resp.text().await.unwrap_or_default();
+
+        if attempt >= WEB_RATE_LIMIT_RETRIES {
+            anyhow::bail!(
+                "{action} failed after {} retries (429 Too Many Requests): {}. Try again in about {}s.",
+                WEB_RATE_LIMIT_RETRIES,
+                extract_api_error(&body),
+                retry_after
+            );
+        }
+
+        tokio::time::sleep(Duration::from_secs(retry_after.min(60))).await;
+    }
+
+    unreachable!()
+}
+
+async fn web_get_json_with_base<T>(
+    client: &Client,
+    web_base: &str,
+    path: &str,
+    action: &str,
+) -> anyhow::Result<(T, Option<String>)>
+where
+    T: DeserializeOwned,
+{
+    let url = format!("{}{}", web_base.trim_end_matches('/'), path);
+    let resp = client.get(url).send().await?;
+    let next_csrf = response_csrf_token(&resp);
+    let parsed = parse_api_json(resp, action).await?;
+    Ok((parsed, next_csrf))
+}
+
+fn response_csrf_token(resp: &reqwest::Response) -> Option<String> {
+    resp.headers()
+        .get("Csrf-Token")
+        .or_else(|| resp.headers().get("csrf-token"))
+        .and_then(|value| value.to_str().ok())
+        .map(|value| value.to_string())
+}
+
+fn retry_after_seconds(resp: &reqwest::Response) -> Option<u64> {
+    let header = resp.headers().get("Retry-After")?;
+    let raw = header.to_str().ok()?;
+    raw.trim().parse::<u64>().ok()
+}
+
+fn normalize_create_account_product(product: &str) -> anyhow::Result<&'static str> {
+    let normalized = product.trim().to_lowercase();
+    let canonical = match normalized.as_str() {
+        "standard" | "ivpn standard" => "IVPN Standard",
+        "pro" | "ivpn pro" => "IVPN Pro",
+        _ => anyhow::bail!(
+            "unsupported product {:?}. Use \"standard\" or \"pro\"",
+            product
+        ),
+    };
+    Ok(canonical)
+}
+
+fn save_account_id(account_id: &str) -> anyhow::Result<()> {
+    let saved = IvpnSavedAccount {
+        account_id: account_id.to_string(),
+    };
+    let json = serde_json::to_string_pretty(&saved)?;
+    config::save_provider_file(PROVIDER, ACCOUNT_FILE, json.as_bytes())?;
+    Ok(())
+}
+
+fn load_saved_account_id() -> anyhow::Result<Option<String>> {
+    let data = match config::load_provider_file(PROVIDER, ACCOUNT_FILE)? {
+        Some(data) => data,
+        None => return Ok(None),
+    };
+
+    let saved: IvpnSavedAccount =
+        serde_json::from_slice(&data).context("failed to parse saved IVPN account ID")?;
+    let id = saved.account_id.trim();
+    if id.is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(id.to_string()))
+}
+
+fn resolve_account_id(explicit: Option<&str>, config: &AppConfig) -> anyhow::Result<String> {
+    if let Some(id) = explicit.map(str::trim).filter(|id| !id.is_empty()) {
+        save_account_id(id)?;
+        return Ok(id.to_string());
+    }
+
+    if let Ok(session) = config::load_session::<IvpnSession>(PROVIDER, config) {
+        let id = session.account_id.trim().to_string();
+        if !id.is_empty() {
+            save_account_id(&id)?;
+            return Ok(id);
+        }
+    }
+
+    if let Some(saved) = load_saved_account_id()? {
+        return Ok(saved);
+    }
+
+    anyhow::bail!(
+        "no IVPN account ID available. Provide <account_id> or run `tunmux ivpn create-account` / `tunmux ivpn login <account_id>` first."
+    )
+}
+
+fn normalize_payment_duration(duration: &str) -> anyhow::Result<&'static str> {
+    let normalized = duration.trim().to_lowercase();
+    let canonical = match normalized.as_str() {
+        "7 days" | "7 day" | "7d" | "week" | "weekly" | "1 week" => "7 days",
+        "1 months" | "1 month" | "1m" | "month" | "monthly" => "1 months",
+        "1 years" | "1 year" | "1y" | "year" | "yearly" => "1 years",
+        _ => {
+            anyhow::bail!(
+                "unsupported duration {:?}. Use one of: \"7d\", \"1m\", \"1y\"",
+                duration
+            )
+        }
+    };
+    Ok(canonical)
 }
 
 async fn session_new(
@@ -1201,6 +1627,28 @@ mod tests {
         assert_eq!(err.to_string(), "IVPN login failed: API status 500");
     }
 
+    #[test]
+    fn test_normalize_payment_duration_aliases() {
+        assert_eq!(normalize_payment_duration("7 days").unwrap(), "7 days");
+        assert_eq!(normalize_payment_duration("week").unwrap(), "7 days");
+        assert_eq!(normalize_payment_duration("1 months").unwrap(), "1 months");
+        assert_eq!(normalize_payment_duration("monthly").unwrap(), "1 months");
+        assert_eq!(normalize_payment_duration("1 years").unwrap(), "1 years");
+        assert!(normalize_payment_duration("2y").is_err());
+        assert!(normalize_payment_duration("3y").is_err());
+        assert!(normalize_payment_duration("6 months").is_err());
+    }
+
+    #[test]
+    fn test_normalize_create_account_product() {
+        assert_eq!(
+            normalize_create_account_product("standard").unwrap(),
+            "IVPN Standard"
+        );
+        assert_eq!(normalize_create_account_product("pro").unwrap(), "IVPN Pro");
+        assert!(normalize_create_account_product("plus").is_err());
+    }
+
     #[tokio::test]
     async fn test_session_new_with_confirmation_and_manifest_fetch() {
         let manifest_json = r#"{
@@ -1266,6 +1714,89 @@ mod tests {
         let manifest = fetch_manifest_with_base(&client, &base).await.unwrap();
         assert_eq!(manifest.wireguard.len(), 1);
         assert_eq!(manifest.config.ports.wireguard.len(), 1);
+
+        handle.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_create_account_flow() {
+        let (base, handle) = spawn_mock_api_server(vec![ExpectedRequest {
+            method: "POST",
+            path: "/web/accounts/create",
+            must_contain: &[r#""product":"IVPN Standard""#],
+            status: 200,
+            body: r#"{
+                "account":{
+                    "id":"i-FVYZ-GMLZ-ZN7E",
+                    "ref_id":"FGUNDR3S",
+                    "is_active":false,
+                    "product":{"name":"IVPN Standard"}
+                }
+            }"#,
+        }]);
+
+        let client = api_client().unwrap();
+        let (account, _csrf_token) = create_account_with_base(&client, &base, "IVPN Standard")
+            .await
+            .unwrap();
+        assert_eq!(account.id, "i-FVYZ-GMLZ-ZN7E");
+        assert_eq!(account.ref_id, "FGUNDR3S");
+        assert!(!account.is_active);
+        assert_eq!(account.product.unwrap().name, "IVPN Standard");
+
+        handle.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_monero_payment_details_and_payments_flow() {
+        let (base, handle) = spawn_mock_api_server(vec![
+            ExpectedRequest {
+                method: "POST",
+                path: "/web/accounts/login",
+                must_contain: &[r#""account_id":"i-FVYZ-GMLZ-ZN7E""#],
+                status: 200,
+                body: r#"{"account":{"id":"i-FVYZ-GMLZ-ZN7E"}}"#,
+            },
+            ExpectedRequest {
+                method: "POST",
+                path: "/web/accounts/monero-payment-details",
+                must_contain: &[r#""duration":"1 years""#],
+                status: 200,
+                body: r#"{
+                    "address":"4L6yzckyiEZcGDjhnBTwdVRaRpeGdd1MMJ5r6c9T1QswM92LNkKHeFXSUuhfqcvfXgC2yfm5bCURBcdtKBmHAJ9SHSPPXJNtCYzARq3hn8",
+                    "payment_uri":"monero:4L6...3hn8?tx_amount=0.179072404942",
+                    "amount":179072404942,
+                    "amount_rounded":"0.1791"
+                }"#,
+            },
+            ExpectedRequest {
+                method: "POST",
+                path: "/web/accounts/payments",
+                must_contain: &[r#""is_recent":true"#, r#""payment_method":"Monero""#],
+                status: 200,
+                body: r#"{"payments":[]}"#,
+            },
+        ]);
+
+        let client = api_client().unwrap();
+        let mut csrf_token = None;
+
+        web_login_with_base(&client, &base, &mut csrf_token, "i-FVYZ-GMLZ-ZN7E")
+            .await
+            .unwrap();
+
+        let details = monero_payment_details_with_base(&client, &base, &mut csrf_token, "1 years")
+            .await
+            .unwrap();
+        assert_eq!(details.amount_rounded, "0.1791");
+        assert_eq!(details.amount, 179072404942);
+        assert!(!details.address.is_empty());
+        assert!(details.payment_uri.starts_with("monero:"));
+
+        let items = payments_with_base(&client, &base, &mut csrf_token, true, "Monero")
+            .await
+            .unwrap();
+        assert!(items.is_empty());
 
         handle.join().unwrap();
     }

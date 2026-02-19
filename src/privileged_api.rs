@@ -265,11 +265,11 @@ pub fn validate_namespace_name(name: &str) -> Result<(), String> {
 }
 
 fn validate_interface_name(interface: &str) -> Result<(), String> {
-    if interface == "proton0" || interface == "airvpn0" {
+    if matches!(interface, "proton0" | "airvpn0" | "mullvad0" | "ivpn0") {
         return Ok(());
     }
     if !interface.starts_with("wg-") {
-        return Err("interface must be proton0, airvpn0 or wg-*".into());
+        return Err("interface must be proton0, airvpn0, mullvad0, ivpn0 or wg-*".into());
     }
     let suffix = &interface["wg-".len()..];
     if suffix.is_empty() || suffix.len() > 12 {
@@ -285,10 +285,10 @@ fn validate_interface_name(interface: &str) -> Result<(), String> {
 }
 
 fn validate_provider(provider: &str) -> Result<(), String> {
-    if provider == "proton" || provider == "airvpn" {
+    if matches!(provider, "proton" | "airvpn" | "mullvad" | "ivpn") {
         Ok(())
     } else {
-        Err("provider must be proton or airvpn".into())
+        Err("provider must be proton, airvpn, mullvad or ivpn".into())
     }
 }
 
@@ -353,6 +353,32 @@ fn validate_netns_exec_args(args: &[String]) -> Result<(), String> {
         return Ok(());
     }
     Err("disallowed netns exec command".into())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{validate_interface_name, validate_provider};
+
+    #[test]
+    fn direct_provider_interfaces_are_allowed() {
+        for iface in ["proton0", "airvpn0", "mullvad0", "ivpn0"] {
+            assert!(validate_interface_name(iface).is_ok(), "iface {}", iface);
+        }
+    }
+
+    #[test]
+    fn wg_prefixed_interfaces_are_allowed() {
+        for iface in ["wg-a", "wg-us-sjc-507", "wg-51820"] {
+            assert!(validate_interface_name(iface).is_ok(), "iface {}", iface);
+        }
+    }
+
+    #[test]
+    fn known_providers_are_allowed() {
+        for provider in ["proton", "airvpn", "mullvad", "ivpn"] {
+            assert!(validate_provider(provider).is_ok(), "provider {}", provider);
+        }
+    }
 }
 
 fn validate_route_destination(destination: &str) -> Result<(), String> {

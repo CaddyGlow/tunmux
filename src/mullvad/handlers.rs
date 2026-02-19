@@ -1,10 +1,12 @@
 use std::collections::HashMap;
+use std::io::Write;
+use std::sync::Arc;
 
 use anyhow::Context;
 use reqwest::{Client, StatusCode};
 use serde::de::DeserializeOwned;
 
-use crate::cli::MullvadCommand;
+use crate::cli::{MullvadCommand, MullvadPaymentCommand};
 use crate::config::{self, AppConfig, Provider};
 use crate::crypto;
 use crate::error;
@@ -15,7 +17,9 @@ use crate::wireguard;
 const PROVIDER: Provider = Provider::Mullvad;
 const INTERFACE_NAME: &str = "mullvad0";
 const MANIFEST_FILE: &str = "manifest.json";
+const ACCOUNT_ID_FILE: &str = "account_id.json";
 const API_BASE: &str = "https://api.mullvad.net";
+const WEB_BASE: &str = "https://mullvad.net";
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 struct MullvadSession {
@@ -80,6 +84,11 @@ struct MullvadAccountResponse {
     expiry: String,
 }
 
+#[derive(Debug, serde::Deserialize)]
+struct MullvadCreateAccountResponse {
+    number: String,
+}
+
 #[derive(Debug, serde::Serialize)]
 struct MullvadCreateDeviceRequest<'a> {
     pubkey: &'a str,
@@ -95,9 +104,40 @@ struct MullvadDeviceResponse {
     ipv6_address: String,
 }
 
+#[derive(Debug, serde::Deserialize)]
+struct MullvadWebActionResponse {
+    #[serde(rename = "type")]
+    response_type: String,
+    status: u16,
+    #[serde(default)]
+    location: Option<String>,
+    #[serde(default)]
+    data: Option<String>,
+}
+
+#[derive(Debug, Clone, serde::Serialize, PartialEq)]
+struct MullvadMoneroPayment {
+    monthly_price: f64,
+    monthly_price_eur: f64,
+    address: String,
+}
+
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+struct SavedMullvadAccountId {
+    account_id: String,
+}
+
 pub async fn dispatch(command: MullvadCommand, config: &AppConfig) -> anyhow::Result<()> {
     match command {
-        MullvadCommand::Login { account } => cmd_login(&account, config).await,
+        MullvadCommand::Login { account, force } => cmd_login(&account, force, config).await,
+        MullvadCommand::CreateAccount { json, force } => {
+            cmd_create_account(json, force, config).await
+        }
+        MullvadCommand::Payment { action } => match action {
+            MullvadPaymentCommand::Monero { account, json } => {
+                cmd_monero_payment(account, json, config).await
+            }
+        },
         MullvadCommand::Logout => cmd_logout(config).await,
         MullvadCommand::Info => cmd_info(config).await,
         MullvadCommand::Servers { country } => cmd_servers(country).await,
@@ -126,8 +166,95 @@ pub async fn dispatch(command: MullvadCommand, config: &AppConfig) -> anyhow::Re
     }
 }
 
-async fn cmd_login(account_number: &str, config: &AppConfig) -> anyhow::Result<()> {
+async fn cmd_create_account(json: bool, force: bool, config: &AppConfig) -> anyhow::Result<()> {
+    confirm_create_account_allowed(force)?;
     let client = api_client()?;
+    let account_number = create_account(&client).await?;
+    save_account_id(&account_number)?;
+
+    let session = login_with_client(&client, &account_number, config)
+        .await
+        .with_context(|| {
+            format!(
+                "created Mullvad account {}, but failed to register device/login",
+                account_number
+            )
+        })?;
+
+    if json {
+        let output = serde_json::json!({
+            "account_number": session.account_number,
+            "account_id": session.account_id,
+            "account_expiry": session.account_expiry,
+            "device": {
+                "id": session.device_id,
+                "name": session.device_name,
+                "public_key": session.device_public_key,
+            },
+            "wireguard": {
+                "public_key": session.wg_public_key,
+                "ipv4_address": session.ipv4_address,
+                "ipv6_address": session.ipv6_address,
+            }
+        });
+        println!("{}", serde_json::to_string_pretty(&output)?);
+    } else {
+        println!("Created Mullvad account {}", account_number);
+        println!(
+            "Logged in to Mullvad account {} (device: {})",
+            account_number, session.device_name
+        );
+    }
+
+    Ok(())
+}
+
+async fn cmd_monero_payment(
+    account: Option<String>,
+    json: bool,
+    config: &AppConfig,
+) -> anyhow::Result<()> {
+    let account_number = resolve_account_id(account.as_deref(), config)?;
+
+    let client = mullvad_web_client()?;
+    mullvad_web_login(&client, &account_number).await?;
+    let payment = fetch_monero_payment(&client).await?;
+
+    if json {
+        let output = serde_json::json!({
+            "account_number": account_number,
+            "monthly_price": payment.monthly_price,
+            "monthly_price_eur": payment.monthly_price_eur,
+            "address": payment.address,
+        });
+        println!("{}", serde_json::to_string_pretty(&output)?);
+    } else {
+        println!("Account:           {}", account_number);
+        println!("Monero monthly:    {}", payment.monthly_price);
+        println!("Monthly EUR price: {}", payment.monthly_price_eur);
+        println!("Address:           {}", payment.address);
+    }
+
+    Ok(())
+}
+
+async fn cmd_login(account_number: &str, force: bool, config: &AppConfig) -> anyhow::Result<()> {
+    confirm_login_allowed(account_number, force)?;
+    let client = api_client()?;
+    let session = login_with_client(&client, account_number, config).await?;
+
+    println!(
+        "Logged in to Mullvad account {} (device: {})",
+        account_number, session.device_name
+    );
+    Ok(())
+}
+
+async fn login_with_client(
+    client: &Client,
+    account_number: &str,
+    config: &AppConfig,
+) -> anyhow::Result<MullvadSession> {
     let keys = crypto::keys::VpnKeys::generate()?;
     let wg_public_key = keys.wg_public_key();
     let wg_private_key = keys.wg_private_key();
@@ -153,16 +280,13 @@ async fn cmd_login(account_number: &str, config: &AppConfig) -> anyhow::Result<(
         },
     };
     config::save_session(PROVIDER, &session, config)?;
+    save_account_id(account_number)?;
 
     if let Ok(manifest) = fetch_manifest(&client).await {
         let _ = save_manifest(&manifest);
     }
 
-    println!(
-        "Logged in to Mullvad account {} (device: {})",
-        account_number, session.device_name
-    );
-    Ok(())
+    Ok(session)
 }
 
 async fn cmd_logout(config: &AppConfig) -> anyhow::Result<()> {
@@ -680,6 +804,28 @@ fn api_client() -> anyhow::Result<Client> {
     Ok(Client::builder().user_agent("tunmux").build()?)
 }
 
+fn mullvad_web_client() -> anyhow::Result<Client> {
+    let cookie_store = Arc::new(reqwest_cookie_store::CookieStoreMutex::new(
+        reqwest_cookie_store::CookieStore::default(),
+    ));
+    Ok(Client::builder()
+        .user_agent("tunmux")
+        .cookie_provider(cookie_store)
+        .build()?)
+}
+
+async fn create_account(client: &Client) -> anyhow::Result<String> {
+    create_account_with_base(client, API_BASE).await
+}
+
+async fn create_account_with_base(client: &Client, api_base: &str) -> anyhow::Result<String> {
+    let url = format!("{}/accounts/v1/accounts", api_base);
+    let resp = client.post(url).send().await?;
+    let account: MullvadCreateAccountResponse =
+        parse_api_json(resp, "Mullvad account creation").await?;
+    Ok(account.number)
+}
+
 async fn fetch_access_token(client: &Client, account_number: &str) -> anyhow::Result<String> {
     fetch_access_token_with_base(client, API_BASE, account_number).await
 }
@@ -774,6 +920,82 @@ async fn fetch_manifest(client: &Client) -> anyhow::Result<MullvadManifest> {
     fetch_manifest_with_base(client, API_BASE).await
 }
 
+async fn mullvad_web_login(client: &Client, account_number: &str) -> anyhow::Result<()> {
+    mullvad_web_login_with_base(client, WEB_BASE, account_number).await
+}
+
+async fn mullvad_web_login_with_base(
+    client: &Client,
+    web_base: &str,
+    account_number: &str,
+) -> anyhow::Result<()> {
+    let url = format!("{}/en/account/login", web_base);
+    let origin = web_base.trim_end_matches('/');
+    let referer = format!("{}/en/account/login", origin);
+    let resp = client
+        .post(url)
+        .header("x-sveltekit-action", "true")
+        .header("origin", origin)
+        .header("referer", referer)
+        .form(&[("account_number", account_number)])
+        .send()
+        .await?;
+
+    let action: MullvadWebActionResponse = parse_api_json(resp, "Mullvad web login").await?;
+    let is_successful_login = action.response_type == "redirect"
+        && action.status == 302
+        && action
+            .location
+            .as_deref()
+            .is_some_and(|location| location.starts_with("/en/account"));
+
+    if !is_successful_login {
+        anyhow::bail!(
+            "Mullvad web login failed: unexpected action response (type={}, status={})",
+            action.response_type,
+            action.status
+        );
+    }
+
+    Ok(())
+}
+
+async fn fetch_monero_payment(client: &Client) -> anyhow::Result<MullvadMoneroPayment> {
+    fetch_monero_payment_with_base(client, WEB_BASE).await
+}
+
+async fn fetch_monero_payment_with_base(
+    client: &Client,
+    web_base: &str,
+) -> anyhow::Result<MullvadMoneroPayment> {
+    let url = format!("{}/en/account/payment/monero", web_base);
+    let origin = web_base.trim_end_matches('/');
+    let referer = format!("{}/en/account/payment/monero", origin);
+    let resp = client
+        .post(url)
+        .header("x-sveltekit-action", "true")
+        .header("origin", origin)
+        .header("referer", referer)
+        .form(&[("understood", "on")])
+        .send()
+        .await?;
+
+    let action: MullvadWebActionResponse =
+        parse_api_json(resp, "Mullvad Monero payment request").await?;
+    if action.response_type != "success" || action.status != 200 {
+        anyhow::bail!(
+            "Mullvad Monero payment request failed: unexpected action response (type={}, status={})",
+            action.response_type,
+            action.status
+        );
+    }
+
+    let data = action
+        .data
+        .context("Mullvad Monero payment request returned no action data")?;
+    parse_monero_payment_data(&data)
+}
+
 async fn fetch_manifest_with_base(
     client: &Client,
     api_base: &str,
@@ -812,6 +1034,177 @@ fn extract_api_error(body: &str) -> String {
     }
 
     body.to_string()
+}
+
+fn parse_monero_payment_data(data: &str) -> anyhow::Result<MullvadMoneroPayment> {
+    let root: serde_json::Value = serde_json::from_str(data)
+        .with_context(|| "failed to parse SvelteKit action data as JSON array")?;
+    let values = root
+        .as_array()
+        .context("SvelteKit action data was not a JSON array")?;
+    let mapping = values
+        .first()
+        .and_then(serde_json::Value::as_object)
+        .context("SvelteKit action data did not include an index mapping object")?;
+
+    let monthly_price =
+        indexed_value_as_f64(values, mapping, "monthly_price").context("invalid monthly_price")?;
+    let monthly_price_eur = indexed_value_as_f64(values, mapping, "monthly_price_eur")
+        .context("invalid monthly_price_eur")?;
+    let address = indexed_value_as_string(values, mapping, "address").context("invalid address")?;
+
+    Ok(MullvadMoneroPayment {
+        monthly_price,
+        monthly_price_eur,
+        address,
+    })
+}
+
+fn indexed_value_as_f64(
+    values: &[serde_json::Value],
+    mapping: &serde_json::Map<String, serde_json::Value>,
+    key: &str,
+) -> anyhow::Result<f64> {
+    let value = indexed_value(values, mapping, key)?;
+    if let Some(v) = value.as_f64() {
+        return Ok(v);
+    }
+    if let Some(v) = value.as_i64() {
+        return Ok(v as f64);
+    }
+    if let Some(v) = value.as_u64() {
+        return Ok(v as f64);
+    }
+    if let Some(v) = value.as_str() {
+        return v
+            .parse::<f64>()
+            .with_context(|| format!("value for {key} was not a number"));
+    }
+    anyhow::bail!("value for {key} was not a number")
+}
+
+fn indexed_value_as_string(
+    values: &[serde_json::Value],
+    mapping: &serde_json::Map<String, serde_json::Value>,
+    key: &str,
+) -> anyhow::Result<String> {
+    let value = indexed_value(values, mapping, key)?;
+    value
+        .as_str()
+        .map(str::to_owned)
+        .with_context(|| format!("value for {key} was not a string"))
+}
+
+fn indexed_value<'a>(
+    values: &'a [serde_json::Value],
+    mapping: &serde_json::Map<String, serde_json::Value>,
+    key: &str,
+) -> anyhow::Result<&'a serde_json::Value> {
+    let index = mapping
+        .get(key)
+        .and_then(serde_json::Value::as_u64)
+        .with_context(|| format!("missing index mapping for {key}"))? as usize;
+    values
+        .get(index)
+        .with_context(|| format!("index mapping for {key} points out of bounds"))
+}
+
+fn save_account_id(account_id: &str) -> anyhow::Result<()> {
+    let saved = SavedMullvadAccountId {
+        account_id: account_id.to_string(),
+    };
+    let data = serde_json::to_vec_pretty(&saved)?;
+    config::save_provider_file(PROVIDER, ACCOUNT_ID_FILE, &data)?;
+    Ok(())
+}
+
+fn load_saved_account_id() -> anyhow::Result<Option<String>> {
+    let data = match config::load_provider_file(PROVIDER, ACCOUNT_ID_FILE)? {
+        Some(data) => data,
+        None => return Ok(None),
+    };
+
+    let saved: SavedMullvadAccountId = serde_json::from_slice(&data)?;
+    let id = saved.account_id.trim();
+    if id.is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(id.to_string()))
+}
+
+fn resolve_account_id(explicit: Option<&str>, config: &AppConfig) -> anyhow::Result<String> {
+    if let Some(id) = explicit.map(str::trim).filter(|id| !id.is_empty()) {
+        save_account_id(id)?;
+        return Ok(id.to_string());
+    }
+
+    if let Ok(session) = config::load_session::<MullvadSession>(PROVIDER, config) {
+        let id = session.account_number.trim().to_string();
+        if !id.is_empty() {
+            save_account_id(&id)?;
+            return Ok(id);
+        }
+    }
+
+    if let Some(saved) = load_saved_account_id()? {
+        return Ok(saved);
+    }
+
+    anyhow::bail!(
+        "no Mullvad account ID available. Provide --account or run `tunmux mullvad create-account` / `tunmux mullvad login <account_number>` first."
+    )
+}
+
+fn confirm_create_account_allowed(force: bool) -> anyhow::Result<()> {
+    let existing = load_saved_account_id()?;
+    confirm_account_overwrite(
+        force,
+        existing.as_deref(),
+        None,
+        "create a new Mullvad account",
+    )
+}
+
+fn confirm_login_allowed(account_number: &str, force: bool) -> anyhow::Result<()> {
+    let existing = load_saved_account_id()?;
+    confirm_account_overwrite(
+        force,
+        existing.as_deref(),
+        Some(account_number),
+        "log in to Mullvad",
+    )
+}
+
+fn confirm_account_overwrite(
+    force: bool,
+    existing_account_id: Option<&str>,
+    requested_account_id: Option<&str>,
+    action: &str,
+) -> anyhow::Result<()> {
+    if force {
+        return Ok(());
+    }
+
+    let Some(existing_account_id) = existing_account_id else {
+        return Ok(());
+    };
+
+    eprintln!("Warning: a saved Mullvad account ID already exists: {existing_account_id}");
+    if let Some(requested_account_id) = requested_account_id {
+        eprintln!("Requested account ID: {requested_account_id}");
+    }
+    eprintln!("You are about to {action}, which may replace the saved account ID.");
+    eprint!("Continue? [y/N]: ");
+    std::io::stdout().flush()?;
+
+    let mut input = String::new();
+    std::io::stdin().read_line(&mut input)?;
+    let answer = input.trim().to_ascii_lowercase();
+    if answer == "y" || answer == "yes" {
+        return Ok(());
+    }
+
+    anyhow::bail!("Aborted by user")
 }
 
 #[cfg(test)]
@@ -1054,6 +1447,18 @@ mod tests {
         );
     }
 
+    #[test]
+    fn test_parse_monero_payment_data_sveltekit_indexed() {
+        let encoded = r#"[{"monthly_price":1,"monthly_price_eur":2,"address":3},0.015705161763,4.5,"4FxacoBaGToSSWJAXmACVJjCtU27fzCrMAtTDs4jLNV8YUbN8NqYYv8btYJR97wMDNTAqP8fgYcvqG817jdDfd4UQT5Z6noxoH75NEVhff"]"#;
+        let parsed = parse_monero_payment_data(encoded).unwrap();
+        assert!((parsed.monthly_price - 0.015705161763).abs() < 1e-15);
+        assert!((parsed.monthly_price_eur - 4.5).abs() < f64::EPSILON);
+        assert_eq!(
+            parsed.address,
+            "4FxacoBaGToSSWJAXmACVJjCtU27fzCrMAtTDs4jLNV8YUbN8NqYYv8btYJR97wMDNTAqP8fgYcvqG817jdDfd4UQT5Z6noxoH75NEVhff"
+        );
+    }
+
     #[tokio::test]
     async fn test_mullvad_api_login_and_manifest_flow() {
         let manifest_json = r#"{
@@ -1139,6 +1544,98 @@ mod tests {
 
         let manifest = fetch_manifest_with_base(&client, &base).await.unwrap();
         assert_eq!(manifest.wireguard.relays.len(), 1);
+
+        handle.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_monero_payment_web_flow_uses_login_cookie() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let base = format!("http://{}", addr);
+
+        let (ready_tx, ready_rx) = mpsc::channel();
+        let handle = thread::spawn(move || {
+            ready_tx.send(()).ok();
+
+            let (mut login_stream, _) = listener.accept().unwrap();
+            let (request_line, headers, body) = read_http_request(&mut login_stream).unwrap();
+            let parts: Vec<&str> = request_line.split_whitespace().collect();
+            assert!(parts.len() >= 2, "invalid request line: {request_line}");
+            assert_eq!(parts[0], "POST");
+            assert_eq!(parts[1], "/en/account/login");
+            assert!(body.contains("account_number=1919656516838123"));
+            let login_headers_lower = headers.to_ascii_lowercase();
+            assert!(login_headers_lower.contains("x-sveltekit-action: true"));
+            assert!(login_headers_lower.contains("content-type: application/x-www-form-urlencoded"));
+
+            let login_body = r#"{"type":"redirect","status":302,"location":"/en/account"}"#;
+            let login_response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nSet-Cookie: accessToken=mva_test_cookie; Path=/; HttpOnly; SameSite=Lax\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                login_body.len(),
+                login_body
+            );
+            login_stream.write_all(login_response.as_bytes()).unwrap();
+            login_stream.flush().unwrap();
+
+            let (mut payment_stream, _) = listener.accept().unwrap();
+            let (request_line, headers, body) = read_http_request(&mut payment_stream).unwrap();
+            let parts: Vec<&str> = request_line.split_whitespace().collect();
+            assert!(parts.len() >= 2, "invalid request line: {request_line}");
+            assert_eq!(parts[0], "POST");
+            assert_eq!(parts[1], "/en/account/payment/monero");
+            assert!(body.contains("understood=on"));
+
+            let payment_headers_lower = headers.to_ascii_lowercase();
+            assert!(payment_headers_lower.contains("x-sveltekit-action: true"));
+            assert!(payment_headers_lower.contains("cookie: accesstoken=mva_test_cookie"));
+
+            let payment_body = r#"{"type":"success","status":200,"data":"[{\"monthly_price\":1,\"monthly_price_eur\":2,\"address\":3},0.015705161763,4.5,\"4FxacoBaGToSSWJAXmACVJjCtU27fzCrMAtTDs4jLNV8YUbN8NqYYv8btYJR97wMDNTAqP8fgYcvqG817jdDfd4UQT5Z6noxoH75NEVhff\"]"}"#;
+            let payment_response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                payment_body.len(),
+                payment_body
+            );
+            payment_stream
+                .write_all(payment_response.as_bytes())
+                .unwrap();
+            payment_stream.flush().unwrap();
+        });
+
+        ready_rx.recv().unwrap();
+
+        let client = mullvad_web_client().unwrap();
+        mullvad_web_login_with_base(&client, &base, "1919656516838123")
+            .await
+            .unwrap();
+        let payment = fetch_monero_payment_with_base(&client, &base)
+            .await
+            .unwrap();
+
+        assert!((payment.monthly_price - 0.015705161763).abs() < 1e-15);
+        assert!((payment.monthly_price_eur - 4.5).abs() < f64::EPSILON);
+        assert_eq!(
+            payment.address,
+            "4FxacoBaGToSSWJAXmACVJjCtU27fzCrMAtTDs4jLNV8YUbN8NqYYv8btYJR97wMDNTAqP8fgYcvqG817jdDfd4UQT5Z6noxoH75NEVhff"
+        );
+
+        handle.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_create_account_flow() {
+        let (base, handle) = spawn_mock_api_server(vec![ExpectedRequest {
+            method: "POST",
+            path: "/accounts/v1/accounts",
+            must_contain_body: &[],
+            must_contain_headers: &[],
+            status: 201,
+            body: r#"{"number":"1234123412341234"}"#,
+        }]);
+
+        let client = api_client().unwrap();
+        let account = create_account_with_base(&client, &base).await.unwrap();
+        assert_eq!(account, "1234123412341234");
 
         handle.join().unwrap();
     }
