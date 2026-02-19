@@ -8,7 +8,7 @@ use std::path::PathBuf;
 use std::thread;
 use std::time::Duration;
 
-use tracing::info;
+use slog_scope::{debug, info, warn};
 
 use crate::config;
 use crate::privileged_api::KillSignal;
@@ -68,7 +68,7 @@ pub fn spawn_daemon(
         &log_path.to_string_lossy(),
     )?;
 
-    info!("Spawned proxy daemon {} for namespace {}", pid, netns_name);
+    info!("spawned_proxy_daemon"; "pid" => pid, "namespace" => netns_name);
     Ok(pid)
 }
 
@@ -122,20 +122,36 @@ fn loopback_tcp_bind_available(port: u16) -> bool {
 pub fn stop_daemon(pid: u32) -> anyhow::Result<()> {
     let client = PrivilegedClient::new();
     if !pid_is_alive(pid) {
+        debug!("proxy_daemon_already_exited"; "pid" => pid);
         return Ok(());
     }
 
-    let _ = client.kill_pid(pid, KillSignal::Term);
+    debug!("proxy_daemon_signal_send"; "pid" => pid, "signal" => "SIGTERM");
+    if let Err(e) = client.kill_pid(pid, KillSignal::Term) {
+        warn!("proxy_daemon_signal_request_failed"; "pid" => pid, "signal" => "SIGTERM", "error" => e.to_string());
+    }
     for _ in 0..20 {
         thread::sleep(Duration::from_millis(100));
         if !pid_is_alive(pid) {
+            debug!("proxy_daemon_exited_after_signal"; "pid" => pid, "signal" => "SIGTERM");
             return Ok(());
         }
     }
 
-    let _ = client.kill_pid(pid, KillSignal::Kill);
-    thread::sleep(Duration::from_millis(100));
-    Ok(())
+    debug!("proxy_daemon_signal_send"; "pid" => pid, "signal" => "SIGKILL");
+    client
+        .kill_pid(pid, KillSignal::Kill)
+        .map_err(|e| anyhow::anyhow!("failed to SIGKILL proxy daemon {}: {}", pid, e))?;
+
+    for _ in 0..20 {
+        thread::sleep(Duration::from_millis(100));
+        if !pid_is_alive(pid) {
+            debug!("proxy_daemon_exited_after_signal"; "pid" => pid, "signal" => "SIGKILL");
+            return Ok(());
+        }
+    }
+
+    anyhow::bail!("proxy daemon {} is still alive after SIGKILL", pid)
 }
 fn pid_is_alive(pid: u32) -> bool {
     std::path::Path::new(&format!("/proc/{}", pid)).exists()

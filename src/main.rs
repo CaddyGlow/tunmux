@@ -4,6 +4,7 @@ mod cli;
 mod config;
 mod crypto;
 mod error;
+mod logging;
 mod models;
 #[cfg(target_os = "linux")]
 mod netns;
@@ -23,7 +24,7 @@ mod proxy;
 mod wireguard;
 
 use clap::Parser;
-use tracing::error;
+use slog_scope::error;
 
 use cli::{Cli, TopCommand};
 use wireguard::connection::ConnectionState;
@@ -35,6 +36,7 @@ fn main() {
         // Privileged control server.
         TopCommand::Privileged {
             serve,
+            stdio,
             authorized_group,
             idle_timeout_ms,
             autostarted,
@@ -43,13 +45,18 @@ fn main() {
                 eprintln!("privileged mode requires --serve");
                 std::process::exit(1);
             }
-            if let Err(e) = privileged::serve(authorized_group, idle_timeout_ms, autostarted) {
+            let run = if stdio {
+                privileged::serve_stdio(idle_timeout_ms, autostarted)
+            } else {
+                privileged::serve(authorized_group, idle_timeout_ms, autostarted)
+            };
+            if let Err(e) = run {
                 eprintln!("privileged service error: {}", e);
                 std::process::exit(1);
             }
         }
         // ProxyDaemon runs its own single-threaded runtime and daemonizes.
-        // Do not initialize tracing here -- the daemon sets up file logging itself.
+        // Do not initialize terminal logging here -- the daemon sets up file logging itself.
         TopCommand::ProxyDaemon {
             netns,
             socks_port,
@@ -66,16 +73,16 @@ fn main() {
 
         // Status is a quick sync command, no tokio needed.
         TopCommand::Status => {
-            init_tracing(cli.verbose);
+            init_logging(cli.verbose);
             if let Err(e) = cmd_status() {
-                error!("{}", e);
+                error!("command_failed"; "command" => "status", "error" => e.to_string());
                 std::process::exit(1);
             }
         }
 
         // All other commands use the multi-threaded tokio runtime.
         other => {
-            init_tracing(cli.verbose);
+            init_logging(cli.verbose);
             let config = config::load_config();
             let _command_scope = privileged_client::CommandScopeGuard::begin(
                 config.general.privileged_autostop_mode,
@@ -83,23 +90,15 @@ fn main() {
 
             let rt = tokio::runtime::Runtime::new().expect("failed to create tokio runtime");
             if let Err(e) = rt.block_on(run(other, config)) {
-                error!("{}", e);
+                error!("command_failed"; "error" => e.to_string());
                 std::process::exit(1);
             }
         }
     }
 }
 
-fn init_tracing(verbose: bool) {
-    let filter = if verbose { "debug" } else { "info" };
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(filter)),
-        )
-        .with_target(false)
-        .without_time()
-        .init();
+fn init_logging(verbose: bool) {
+    logging::init_terminal(verbose);
 }
 
 async fn run(command: TopCommand, config: config::AppConfig) -> anyhow::Result<()> {

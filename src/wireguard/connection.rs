@@ -2,7 +2,7 @@ use std::fs;
 use std::os::unix::fs::PermissionsExt;
 
 use serde::{Deserialize, Serialize};
-use tracing::info;
+use slog_scope::info;
 
 use crate::config;
 use crate::error::Result;
@@ -37,7 +37,7 @@ impl ConnectionState {
         let json = serde_json::to_string_pretty(self)?;
         fs::write(&path, &json)?;
         fs::set_permissions(&path, fs::Permissions::from_mode(0o600))?;
-        info!("Connection state saved to {}", path.display());
+        info!("connection_state_saved"; "path" => path.display().to_string());
         Ok(())
     }
 
@@ -67,7 +67,11 @@ impl ConnectionState {
                 match serde_json::from_str::<Self>(&json) {
                     Ok(state) => connections.push(state),
                     Err(e) => {
-                        tracing::warn!("skipping {}: {}", path.display(), e);
+                        slog_scope::warn!(
+                            "connection_state_entry_skipped";
+                            "path" => path.display().to_string(),
+                            "error" => e.to_string()
+                        );
                     }
                 }
             }
@@ -80,7 +84,7 @@ impl ConnectionState {
         let path = config::connections_dir().join(format!("{}.json", instance));
         if path.exists() {
             fs::remove_file(&path)?;
-            info!("Connection state removed for {}", instance);
+            info!("connection_state_removed"; "instance" => instance);
         }
         Ok(())
     }

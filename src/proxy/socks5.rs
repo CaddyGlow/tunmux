@@ -4,11 +4,11 @@ use std::collections::HashMap;
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::{Arc, Mutex};
 
+use slog_scope::{debug, warn};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpStream, UdpSocket};
 use tokio::sync::RwLock;
 use tokio::task::AbortHandle;
-use tracing::{debug, warn};
 
 // SOCKS5 constants
 const SOCKS_VERSION: u8 = 0x05;
@@ -150,18 +150,22 @@ async fn parse_address(client: &mut TcpStream, atyp: u8) -> anyhow::Result<(Stri
 async fn handle_connect(mut client: TcpStream, atyp: u8) -> anyhow::Result<()> {
     let (addr, port) = parse_address(&mut client, atyp).await?;
     let target = format!("{}:{}", addr, port);
-    debug!("SOCKS5 CONNECT to {}", target);
+    debug!("socks5_connect_start"; "target" => target.as_str());
 
     match TcpStream::connect(&target).await {
         Ok(mut remote) => {
             send_reply(&mut client, REP_SUCCESS, None).await?;
             let result = tokio::io::copy_bidirectional(&mut client, &mut remote).await;
             if let Err(e) = result {
-                debug!("SOCKS5 tunnel closed: {}", e);
+                debug!("socks5_tunnel_closed"; "error" => e.to_string());
             }
         }
         Err(e) => {
-            warn!("SOCKS5 connect to {} failed: {}", target, e);
+            warn!(
+                "socks5_connect_failed";
+                "target" => target.as_str(),
+                "error" => e.to_string()
+            );
             send_reply(&mut client, REP_GENERAL_FAILURE, None).await?;
         }
     }
@@ -195,7 +199,7 @@ async fn handle_udp_associate(
         declared
     };
 
-    debug!("SOCKS5 UDP ASSOCIATE (key={})", assoc_key);
+    debug!("socks5_udp_associate_start"; "key" => assoc_key.to_string());
 
     // Create outbound socket in VPN namespace (current namespace after setns)
     let outbound = Arc::new(UdpSocket::bind("0.0.0.0:0").await?);
@@ -233,7 +237,7 @@ async fn handle_udp_associate(
 
     // Cleanup: read the (possibly upgraded) key and remove the association
     let key = *client_addr.lock().unwrap();
-    debug!("SOCKS5 UDP ASSOCIATE closed (key={})", key);
+    debug!("socks5_udp_associate_closed"; "key" => key.to_string());
     associations.remove(&key).await;
 
     Ok(())
@@ -274,24 +278,31 @@ pub async fn run_udp_relay(relay_socket: Arc<UdpSocket>, associations: Arc<UdpAs
         let (n, client_src) = match relay_socket.recv_from(&mut buf).await {
             Ok(r) => r,
             Err(e) => {
-                warn!("UDP relay recv_from error: {}", e);
+                warn!("udp_relay_recv_from_error"; "error" => e.to_string());
                 continue;
             }
         };
 
         let data = &buf[..n];
         let Some((dst_addr, payload)) = parse_udp_header(data) else {
-            debug!("UDP relay: malformed SOCKS5 UDP header from {}", client_src);
+            debug!(
+                "udp_relay_malformed_header";
+                "client_src" => client_src.to_string()
+            );
             continue;
         };
 
         let Some(outbound) = associations.lookup(&client_src).await else {
-            debug!("UDP relay: no association for {}", client_src);
+            debug!("udp_relay_association_missing"; "client_src" => client_src.to_string());
             continue;
         };
 
         if let Err(e) = outbound.send_to(payload, dst_addr).await {
-            debug!("UDP relay forward to {} failed: {}", dst_addr, e);
+            debug!(
+                "udp_relay_forward_failed";
+                "dst_addr" => dst_addr.to_string(),
+                "error" => e.to_string()
+            );
         }
     }
 }
@@ -321,7 +332,11 @@ async fn relay_vpn_to_client(
         packet.extend_from_slice(&buf[..n]);
 
         if let Err(e) = relay_socket.send_to(&packet, addr).await {
-            debug!("UDP relay send_to client {} failed: {}", addr, e);
+            debug!(
+                "udp_relay_send_to_client_failed";
+                "client_addr" => addr.to_string(),
+                "error" => e.to_string()
+            );
             break;
         }
     }

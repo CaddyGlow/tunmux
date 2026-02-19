@@ -4,23 +4,24 @@ use std::os::fd::AsRawFd;
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
-use std::process::{Command, Stdio};
+use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 use std::{fs, thread};
 
 use nix::libc;
 use nix::unistd::Uid;
-use tracing::debug;
+use slog_scope::debug;
 
 use crate::config;
-use crate::config::PrivilegedAutostopMode;
+use crate::config::{PrivilegedAutostopMode, PrivilegedTransport};
 use crate::error::{AppError, Result};
 
 use crate::privileged_api::{KillSignal, PrivilegedRequest, PrivilegedResponse, WgQuickAction};
 
 pub struct PrivilegedClient {
     socket_path: PathBuf,
+    transport: PrivilegedTransport,
     autostart_enabled: bool,
     autostart_timeout: Duration,
     authorized_group: String,
@@ -32,6 +33,69 @@ pub struct PrivilegedClient {
 struct CommandSessionState {
     enabled_count: usize,
     lease_token: Option<String>,
+    transport: Option<CommandSessionTransport>,
+}
+
+enum CommandSessionTransport {
+    Socket(UnixStream),
+    Stdio(StdioSession),
+}
+
+struct StdioSession {
+    child: Child,
+    stdin: ChildStdin,
+    stdout: BufReader<ChildStdout>,
+}
+
+impl StdioSession {
+    fn pid(&self) -> u32 {
+        self.child.id()
+    }
+
+    fn shutdown(mut self) {
+        let pid = self.child.id();
+        debug!("privileged_stdio_helper_closing"; "pid" => pid);
+        let _ = self.stdin.flush();
+        drop(self.stdin);
+        for _ in 0..10 {
+            match self.child.try_wait() {
+                Ok(Some(status)) => {
+                    debug!(
+                        "privileged_stdio_helper_exited";
+                        "pid" => pid,
+                        "status" => status.to_string()
+                    );
+                    return;
+                }
+                Ok(None) => thread::sleep(Duration::from_millis(20)),
+                Err(e) => {
+                    debug!(
+                        "privileged_stdio_helper_wait_failed";
+                        "pid" => pid,
+                        "error" => e.to_string()
+                    );
+                    return;
+                }
+            }
+        }
+        debug!(
+            "privileged_stdio_helper_still_running_after_grace";
+            "pid" => pid
+        );
+        let _ = self.child.kill();
+        match self.child.wait() {
+            Ok(status) => debug!(
+                "privileged_stdio_helper_exited_after_kill";
+                "pid" => pid,
+                "status" => status.to_string()
+            ),
+            Err(e) => debug!(
+                "privileged_stdio_helper_wait_after_kill_failed";
+                "pid" => pid,
+                "error" => e.to_string()
+            ),
+        }
+    }
 }
 
 fn command_session_state() -> &'static Mutex<CommandSessionState> {
@@ -44,10 +108,7 @@ pub struct CommandScopeGuard {
 }
 
 impl CommandScopeGuard {
-    pub fn begin(mode: PrivilegedAutostopMode) -> Self {
-        if !matches!(mode, PrivilegedAutostopMode::Command) {
-            return Self { enabled: false };
-        }
+    pub fn begin(_mode: PrivilegedAutostopMode) -> Self {
         if let Ok(mut state) = command_session_state().lock() {
             state.enabled_count = state.enabled_count.saturating_add(1);
         }
@@ -62,22 +123,57 @@ impl Drop for CommandScopeGuard {
         }
 
         let mut token_to_release = None;
+        let mut session_transport = None;
         if let Ok(mut state) = command_session_state().lock() {
             if state.enabled_count > 0 {
                 state.enabled_count -= 1;
             }
             if state.enabled_count == 0 {
                 token_to_release = state.lease_token.take();
+                session_transport = state.transport.take();
             }
         }
 
+        let client = PrivilegedClient::new();
+        if let Some(mut transport) = session_transport.take() {
+            debug!("privileged_command_scoped_transport_closing");
+            if let Some(token) = token_to_release {
+                debug!("privileged_daemon_release_command_lease_on_scoped_transport");
+                let token_for_fallback = token.clone();
+                if client
+                    .send_on_transport(&mut transport, &PrivilegedRequest::LeaseRelease { token })
+                    .is_err()
+                    && matches!(client.transport, PrivilegedTransport::Socket)
+                {
+                    let _ = client.send_control_request_if_connected(
+                        &PrivilegedRequest::LeaseRelease {
+                            token: token_for_fallback,
+                        },
+                    );
+                }
+                debug!("privileged_daemon_request_shutdown_if_idle");
+                if client
+                    .send_on_transport(&mut transport, &PrivilegedRequest::ShutdownIfIdle)
+                    .is_err()
+                    && matches!(client.transport, PrivilegedTransport::Socket)
+                {
+                    let _ = client
+                        .send_control_request_if_connected(&PrivilegedRequest::ShutdownIfIdle);
+                }
+            }
+            client.close_transport(transport);
+            return;
+        }
+
         if let Some(token) = token_to_release {
-            let client = PrivilegedClient::new();
-            debug!("privileged daemon stop: releasing command lease");
-            let _ = client
-                .send_control_request_if_connected(&PrivilegedRequest::LeaseRelease { token });
-            debug!("privileged daemon stop: requesting shutdown-if-idle");
-            let _ = client.send_control_request_if_connected(&PrivilegedRequest::ShutdownIfIdle);
+            if matches!(client.transport, PrivilegedTransport::Socket) {
+                debug!("privileged_daemon_release_command_lease");
+                let _ = client
+                    .send_control_request_if_connected(&PrivilegedRequest::LeaseRelease { token });
+                debug!("privileged_daemon_request_shutdown_if_idle");
+                let _ =
+                    client.send_control_request_if_connected(&PrivilegedRequest::ShutdownIfIdle);
+            }
         }
     }
 }
@@ -94,6 +190,7 @@ impl PrivilegedClient {
         };
         Self {
             socket_path: config::privileged_socket_path(),
+            transport: cfg.general.privileged_transport,
             autostart_enabled: cfg.general.privileged_autostart,
             autostart_timeout: Duration::from_millis(timeout_ms),
             authorized_group: cfg.general.privileged_authorized_group,
@@ -268,14 +365,121 @@ impl PrivilegedClient {
 
     fn send(&self, request: PrivilegedRequest) -> Result<PrivilegedResponse> {
         request.validate().map_err(AppError::Other)?;
-        debug!(
-            "privileged ctl request={} socket={}",
-            request_kind(&request),
-            self.socket_path.display()
-        );
-        self.ensure_command_lease_if_enabled()?;
-        let mut stream = self.connect_or_autostart()?;
-        self.send_on_stream(&mut stream, &request)
+        slog_scope::trace!("privileged_ctl_request"; "request" => request_kind(&request));
+        if self.command_session_enabled()? {
+            return self.send_with_command_session(&request);
+        }
+
+        match self.transport {
+            PrivilegedTransport::Socket => {
+                self.ensure_command_lease_if_enabled()?;
+                let mut stream = self.connect_or_autostart()?;
+                self.send_on_stream(&mut stream, &request)
+            }
+            PrivilegedTransport::Stdio => {
+                let mut session = self.spawn_privileged_stdio_session()?;
+                let response = self.send_on_stdio_session(&mut session, &request);
+                session.shutdown();
+                response
+            }
+        }
+    }
+
+    fn command_session_enabled(&self) -> Result<bool> {
+        let state = command_session_state()
+            .lock()
+            .map_err(|_| AppError::Other("command lease state lock poisoned".to_string()))?;
+        Ok(state.enabled_count > 0)
+    }
+
+    fn send_with_command_session(&self, request: &PrivilegedRequest) -> Result<PrivilegedResponse> {
+        let mut state = command_session_state()
+            .lock()
+            .map_err(|_| AppError::Other("command lease state lock poisoned".to_string()))?;
+        self.ensure_command_lease_in_session(&mut state)?;
+        let response = self.send_on_session_transport(&mut state, request);
+        if let Err(err) = &response {
+            if is_transport_error(err) {
+                if let Some(transport) = state.transport.take() {
+                    self.close_transport(transport);
+                }
+            }
+        }
+        response
+    }
+
+    fn ensure_command_lease_in_session(&self, state: &mut CommandSessionState) -> Result<()> {
+        if !matches!(self.autostop_mode, PrivilegedAutostopMode::Command)
+            || state.lease_token.is_some()
+        {
+            return Ok(());
+        }
+        let token = build_lease_token();
+        self.send_on_session_transport(
+            state,
+            &PrivilegedRequest::LeaseAcquire {
+                token: token.clone(),
+            },
+        )?;
+        state.lease_token = Some(token);
+        Ok(())
+    }
+
+    fn send_on_session_transport(
+        &self,
+        state: &mut CommandSessionState,
+        request: &PrivilegedRequest,
+    ) -> Result<PrivilegedResponse> {
+        if state.transport.is_none() {
+            state.transport = Some(self.open_transport()?);
+        }
+        let transport = state
+            .transport
+            .as_mut()
+            .ok_or_else(|| AppError::Other("command-scoped transport unavailable".to_string()))?;
+        self.send_on_transport(transport, request)
+    }
+
+    fn open_transport(&self) -> Result<CommandSessionTransport> {
+        match self.transport {
+            PrivilegedTransport::Socket => {
+                debug!("privileged_command_transport_open"; "mode" => "socket");
+                self.connect_or_autostart()
+                    .map(CommandSessionTransport::Socket)
+            }
+            PrivilegedTransport::Stdio => {
+                debug!("privileged_command_transport_open"; "mode" => "stdio");
+                self.spawn_privileged_stdio_session()
+                    .map(CommandSessionTransport::Stdio)
+            }
+        }
+    }
+
+    fn close_transport(&self, transport: CommandSessionTransport) {
+        match transport {
+            CommandSessionTransport::Socket(_) => {
+                debug!("privileged_command_transport_closed"; "mode" => "socket");
+            }
+            CommandSessionTransport::Stdio(session) => {
+                debug!(
+                    "privileged_command_transport_closed";
+                    "mode" => "stdio",
+                    "pid" => session.pid()
+                );
+                session.shutdown();
+            }
+        }
+    }
+
+    fn send_on_transport(
+        &self,
+        transport: &mut CommandSessionTransport,
+        request: &PrivilegedRequest,
+    ) -> Result<PrivilegedResponse> {
+        match transport {
+            CommandSessionTransport::Socket(stream) => self.send_on_stream(stream, request),
+            CommandSessionTransport::Stdio(session) => self.send_on_stdio_session(session, request),
+        }
     }
 
     fn send_on_stream(
@@ -283,7 +487,7 @@ impl PrivilegedClient {
         stream: &mut UnixStream,
         request: &PrivilegedRequest,
     ) -> Result<PrivilegedResponse> {
-        debug!("privileged ctl write request={}", request_kind(request));
+        slog_scope::trace!("privileged_ctl_write"; "request" => request_kind(request));
         let request_bytes = serde_json::to_vec(request)
             .map_err(|e| AppError::Other(format!("serialize request: {}", e)))?;
         stream
@@ -308,8 +512,51 @@ impl PrivilegedClient {
         }
         let response: PrivilegedResponse = serde_json::from_str(&response_line)
             .map_err(|e| AppError::Other(format!("decode response: {}", e)))?;
-        debug!("privileged ctl response request={}", request_kind(request));
+        slog_scope::trace!("privileged_ctl_response"; "request" => request_kind(request));
 
+        map_privileged_error(response)
+    }
+
+    fn send_on_stdio_session(
+        &self,
+        session: &mut StdioSession,
+        request: &PrivilegedRequest,
+    ) -> Result<PrivilegedResponse> {
+        slog_scope::trace!(
+            "privileged_ctl_stdio_write";
+            "request" => request_kind(request)
+        );
+        let request_bytes = serde_json::to_vec(request)
+            .map_err(|e| AppError::Other(format!("serialize request: {}", e)))?;
+        session
+            .stdin
+            .write_all(&request_bytes)
+            .map_err(|e| AppError::Other(format!("write request stdin: {}", e)))?;
+        session
+            .stdin
+            .write_all(b"\n")
+            .map_err(|e| AppError::Other(format!("write request delimiter stdin: {}", e)))?;
+        session
+            .stdin
+            .flush()
+            .map_err(|e| AppError::Other(format!("flush request stdin: {}", e)))?;
+
+        let mut response_line = String::new();
+        session
+            .stdout
+            .read_line(&mut response_line)
+            .map_err(|e| AppError::Other(format!("read response stdout: {}", e)))?;
+        if response_line.trim().is_empty() {
+            return Err(AppError::Other(
+                "empty response from privileged server".into(),
+            ));
+        }
+        let response: PrivilegedResponse = serde_json::from_str(&response_line)
+            .map_err(|e| AppError::Other(format!("decode response: {}", e)))?;
+        slog_scope::trace!(
+            "privileged_ctl_stdio_response";
+            "request" => request_kind(request)
+        );
         map_privileged_error(response)
     }
 
@@ -415,9 +662,9 @@ impl PrivilegedClient {
     }
 
     fn autostart_daemon(&self) -> Result<()> {
-        debug!("privileged ctl autostart begin");
+        slog_scope::trace!("privileged_ctl_autostart_begin");
         let _lock = self.acquire_startup_lock()?;
-        debug!("privileged ctl autostart lock acquired");
+        slog_scope::trace!("privileged_ctl_autostart_lock_acquired");
 
         if self.try_connect_socket().is_ok() {
             return Ok(());
@@ -425,7 +672,7 @@ impl PrivilegedClient {
 
         self.spawn_privileged_daemon()?;
         self.wait_until_ready()?;
-        debug!("privileged ctl autostart ready");
+        slog_scope::trace!("privileged_ctl_autostart_ready");
         Ok(())
     }
 
@@ -480,9 +727,9 @@ impl PrivilegedClient {
 
     fn spawn_privileged_daemon(&self) -> Result<()> {
         const SUDO_PROMPT_TIMEOUT: Duration = Duration::from_secs(90);
-        debug!("privileged daemon start: trying non-interactive sudo launch");
+        debug!("privileged_daemon_start_non_interactive_launch_attempt");
         if self.run_sudo_non_interactive_launch()? {
-            debug!("privileged daemon start: non-interactive launch ok");
+            debug!("privileged_daemon_start_non_interactive_launch_ok");
             return Ok(());
         }
 
@@ -501,7 +748,7 @@ impl PrivilegedClient {
         }
 
         if !std::io::stdin().is_terminal() {
-            debug!("privileged daemon start: password required but no TTY");
+            debug!("privileged_daemon_start_password_required_no_tty");
             return Err(AppError::Other(format!(
                 "sudo password required but no TTY available; run: {}",
                 self.manual_start_command()
@@ -516,16 +763,16 @@ impl PrivilegedClient {
         let validate = run_sudo_validate_with_timeout(SUDO_PROMPT_TIMEOUT)
             .map_err(|e| map_sudo_spawn_error(e, self.manual_start_command()))?;
         if !validate {
-            debug!("privileged daemon start: sudo -v returned non-success");
+            debug!("privileged_daemon_start_sudo_validate_failed");
             return Err(AppError::Other(format!(
                 "sudo authentication failed; run: {}",
                 self.manual_start_command()
             )));
         }
 
-        debug!("privileged daemon start: retrying non-interactive launch after sudo -v");
+        debug!("privileged_daemon_start_retry_non_interactive_after_validate");
         if self.run_sudo_non_interactive_launch()? {
-            debug!("privileged daemon start: retry launch ok");
+            debug!("privileged_daemon_start_retry_launch_ok");
             return Ok(());
         }
         let retry_probe = self.run_sudo_non_interactive_probe()?;
@@ -600,6 +847,108 @@ impl PrivilegedClient {
             .map_err(|e| map_sudo_spawn_error(e, self.manual_start_command()))
     }
 
+    fn spawn_privileged_stdio_session(&self) -> Result<StdioSession> {
+        const SUDO_PROMPT_TIMEOUT: Duration = Duration::from_secs(90);
+
+        let probe = self.run_sudo_non_interactive_probe()?;
+        if !probe.status.success() {
+            let stderr = String::from_utf8_lossy(&probe.stderr);
+            if !stderr_requires_password(&stderr) {
+                return Err(AppError::Other(format!(
+                    "failed to start privileged stdio helper via sudo: {}; run: {}",
+                    stderr.trim(),
+                    self.manual_start_command()
+                )));
+            }
+            if !std::io::stdin().is_terminal() {
+                return Err(AppError::Other(format!(
+                    "sudo password required but no TTY available; run: {}",
+                    self.manual_start_command()
+                )));
+            }
+
+            eprintln!("sudo authentication required for tunmux privileged stdio mode.");
+            let validate = run_sudo_validate_with_timeout(SUDO_PROMPT_TIMEOUT)
+                .map_err(|e| map_sudo_spawn_error(e, self.manual_start_command()))?;
+            if !validate {
+                return Err(AppError::Other(format!(
+                    "sudo authentication failed; run: {}",
+                    self.manual_start_command()
+                )));
+            }
+        }
+
+        self.spawn_privileged_stdio_session_non_interactive()
+    }
+
+    fn spawn_privileged_stdio_session_non_interactive(&self) -> Result<StdioSession> {
+        let exe = std::env::current_exe()
+            .map_err(|e| AppError::Other(format!("cannot resolve current executable: {}", e)))?;
+
+        debug!("privileged_stdio_helper_spawn_begin");
+        let mut command = Command::new("sudo");
+        command
+            .arg("-n")
+            .arg(exe)
+            .arg("privileged")
+            .arg("--serve")
+            .arg("--stdio")
+            .arg("--autostarted")
+            .arg("--authorized-group")
+            .arg(self.authorized_group.as_str())
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped());
+
+        if let Some(idle_timeout_ms) = self.daemon_idle_timeout_ms {
+            command
+                .arg("--idle-timeout-ms")
+                .arg(idle_timeout_ms.to_string());
+        }
+
+        if let Some(log_path) = configured_privileged_stdio_log_path() {
+            if let Some(parent) = log_path.parent() {
+                let _ = fs::create_dir_all(parent);
+            }
+            let log_file = fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&log_path)
+                .map_err(|e| {
+                    AppError::Other(format!(
+                        "failed to open privileged stdio log {}: {}",
+                        log_path.display(),
+                        e
+                    ))
+                })?;
+            command.stderr(Stdio::from(log_file));
+            debug!(
+                "privileged stdio helper: capturing stderr to {}",
+                log_path.display()
+            );
+        } else {
+            command.stderr(Stdio::inherit());
+        }
+
+        let mut child = command
+            .spawn()
+            .map_err(|e| map_sudo_spawn_error(e, self.manual_start_command()))?;
+        debug!("privileged_stdio_helper_spawned"; "pid" => child.id());
+        let stdin = child
+            .stdin
+            .take()
+            .ok_or_else(|| AppError::Other("failed to capture privileged stdin".to_string()))?;
+        let stdout = child
+            .stdout
+            .take()
+            .ok_or_else(|| AppError::Other("failed to capture privileged stdout".to_string()))?;
+
+        Ok(StdioSession {
+            child,
+            stdin,
+            stdout: BufReader::new(stdout),
+        })
+    }
+
     fn wait_until_ready(&self) -> Result<()> {
         debug!(
             "privileged ctl readiness wait timeout_ms={}",
@@ -662,9 +1011,15 @@ impl PrivilegedClient {
 
     fn manual_start_command(&self) -> String {
         let exe = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("tunmux"));
+        let stdio = if matches!(self.transport, PrivilegedTransport::Stdio) {
+            " --stdio"
+        } else {
+            ""
+        };
         format!(
-            "sudo {} privileged --serve --authorized-group {}{}",
+            "sudo {} privileged --serve{} --authorized-group {}{}",
             shell_quote(&exe.to_string_lossy()),
+            stdio,
             shell_quote(&self.authorized_group),
             self.daemon_idle_timeout_ms
                 .map(|ms| format!(" --idle-timeout-ms {}", ms))
@@ -691,6 +1046,23 @@ fn is_autostart_connect_error(err: &std::io::Error) -> bool {
     err.kind() == std::io::ErrorKind::NotFound
         || err.kind() == std::io::ErrorKind::ConnectionRefused
         || err.kind() == std::io::ErrorKind::PermissionDenied
+}
+
+fn is_transport_error(err: &AppError) -> bool {
+    match err {
+        AppError::Other(message) => {
+            message.starts_with("write request:")
+                || message.starts_with("write request delimiter:")
+                || message.starts_with("flush request:")
+                || message.starts_with("read response:")
+                || message.starts_with("write request stdin:")
+                || message.starts_with("write request delimiter stdin:")
+                || message.starts_with("flush request stdin:")
+                || message.starts_with("read response stdout:")
+                || message == "empty response from privileged server"
+        }
+        _ => false,
+    }
 }
 
 fn stderr_requires_password(stderr: &str) -> bool {

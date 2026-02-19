@@ -6,7 +6,7 @@ use reqwest::redirect;
 use reqwest_cookie_store::{CookieStore, CookieStoreMutex};
 use scraper::{Html, Selector};
 use serde::{Deserialize, Serialize};
-use tracing::debug;
+use slog_scope::debug;
 
 use crate::config::{self, AppConfig, Provider};
 
@@ -244,8 +244,8 @@ impl AirVpnWeb {
         let client = Self::build_client(cookie_store.clone()).ok()?;
 
         debug!(
-            "restored saved web session ({} ecsrf tokens cached)",
-            saved.ecsrf.len()
+            "web_session_restored";
+            "ecsrf_cached_count" => saved.ecsrf.len()
         );
 
         Some(Self {
@@ -275,12 +275,12 @@ impl AirVpnWeb {
             };
             let json = serde_json::to_string(&saved)?;
             config::save_provider_file(Provider::AirVpn, WEB_SESSION_FILE, json.as_bytes())?;
-            debug!("saved web session to disk");
+            debug!("web_session_saved");
             Ok(())
         })();
 
         if let Err(e) = result {
-            debug!("failed to save web session: {}", e);
+            debug!("web_session_save_failed"; "error" => e.to_string());
         }
     }
 
@@ -308,7 +308,7 @@ impl AirVpnWeb {
 
         let csrf_key =
             extract_input_value(&doc, "csrfKey").context("could not find csrfKey in login form")?;
-        debug!("extracted csrfKey from login form");
+        debug!("login_csrf_key_extracted");
 
         let ref_value = extract_input_value(&doc, "ref").unwrap_or_default();
 
@@ -331,7 +331,7 @@ impl AirVpnWeb {
             .context("login POST failed")?;
 
         let status = resp.status();
-        debug!("login response status: {}", status);
+        debug!("login_response_status"; "status" => status.as_u16());
 
         if !status.is_redirection() {
             bail!(
@@ -351,7 +351,7 @@ impl AirVpnWeb {
             let _ = follow_redirects(&client, &cookie_store, &url).await;
         }
 
-        debug!("login succeeded");
+        debug!("login_succeeded");
 
         Ok(Self {
             client,
@@ -738,7 +738,7 @@ impl AirVpnWeb {
 
         let token = extract_ecsrf(&body)
             .with_context(|| format!("could not find ecsrf token on {}", path))?;
-        debug!("extracted ecsrf for {} ", path);
+        debug!("ajax_ecsrf_extracted"; "path" => path);
 
         self.ecsrf_cache
             .borrow_mut()
@@ -756,7 +756,7 @@ impl AirVpnWeb {
         match self.ajax_post_inner(path, params).await {
             Ok(val) => Ok(val),
             Err(e) if e.to_string().contains("Invalid CSRF Token") => {
-                debug!("CSRF token expired for {}, re-fetching", path);
+                debug!("ajax_csrf_token_expired"; "path" => path);
                 self.ecsrf_cache.borrow_mut().remove(path);
                 self.ajax_post_inner(path, params).await
             }
@@ -777,9 +777,9 @@ impl AirVpnWeb {
         form_params.push(("ecsrf", &ecsrf));
 
         debug!(
-            "AJAX POST {} action={}",
-            path,
-            params.first().map(|p| p.1).unwrap_or("?")
+            "ajax_post_request";
+            "path" => path,
+            "action" => params.first().map(|p| p.1).unwrap_or("?")
         );
 
         let resp = self.client.post(&url).form(&form_params).send().await?;
@@ -792,10 +792,10 @@ impl AirVpnWeb {
         }
 
         debug!(
-            "AJAX response ({} {}B): {}",
-            status,
-            body.len(),
-            &body[..body.len().min(500)]
+            "ajax_post_response";
+            "status" => status.as_u16(),
+            "bytes" => body.len(),
+            "body_preview" => &body[..body.len().min(500)]
         );
 
         // Detect server-side error responses (e.g. expired CSRF token).
@@ -898,7 +898,7 @@ async fn follow_redirects(
                             if let Ok(mut store) = cookie_store.lock() {
                                 let _ = store.insert_raw(&raw, &cookie_url);
                             }
-                            debug!("solved entry gate inline (af3={})", af3);
+                            debug!("entry_gate_solved"; "af3" => af3);
 
                             // Redirect to aek_url (the original destination)
                             if let Some(aek_url) = parsed
@@ -918,7 +918,7 @@ async fn follow_redirects(
                 }
 
                 current_url = redirect_url;
-                debug!("following redirect to {}", current_url);
+                debug!("redirect_follow"; "url" => current_url.as_str());
                 continue;
             }
         }
@@ -955,10 +955,10 @@ impl AirVpnWebApi {
         let keys = web.list_api_keys().await?;
 
         let secret = if let Some(k) = keys.first() {
-            debug!("using existing API key {:?}", k.name);
+            debug!("api_key_selected_existing"; "name" => k.name.as_str());
             k.secret.clone()
         } else {
-            debug!("no API keys found, creating one");
+            debug!("api_key_create_required");
             let id = web.add_api_key().await?;
             web.rename_api_key(&id, API_KEY_NAME).await?;
             let keys = web.list_api_keys().await?;
@@ -981,7 +981,7 @@ impl AirVpnWebApi {
         // Try stored key first.
         if let Some(ref key) = session.api_key {
             if !key.is_empty() {
-                debug!("using stored API key");
+                debug!("api_key_selected_stored");
                 return Self::with_key(key);
             }
         }
@@ -1006,7 +1006,7 @@ impl AirVpnWebApi {
         query: &[(&str, &str)],
     ) -> anyhow::Result<T> {
         let url = format!("{}/{}/", API_BASE_URL, path.trim_matches('/'));
-        debug!("API GET {}", url);
+        debug!("api_get_request"; "url" => url.as_str());
 
         let resp = self
             .client
@@ -1029,7 +1029,7 @@ impl AirVpnWebApi {
         form: &[(&str, &str)],
     ) -> anyhow::Result<T> {
         let url = format!("{}/{}/", API_BASE_URL, path.trim_matches('/'));
-        debug!("API POST {}", url);
+        debug!("api_post_request"; "url" => url.as_str());
 
         let resp = self
             .client
@@ -1047,7 +1047,7 @@ impl AirVpnWebApi {
     /// POST form data to an API endpoint, returning the raw text body.
     pub async fn post_text(&self, path: &str, form: &[(&str, &str)]) -> anyhow::Result<String> {
         let url = format!("{}/{}/", API_BASE_URL, path.trim_matches('/'));
-        debug!("API POST {}", url);
+        debug!("api_post_request"; "url" => url.as_str());
 
         let resp = self
             .client
@@ -1071,7 +1071,11 @@ impl AirVpnWebApi {
             );
         }
 
-        debug!("API response ({} {}B)", status, body.len());
+        debug!(
+            "api_response_received";
+            "status" => status.as_u16(),
+            "bytes" => body.len()
+        );
 
         // Check for JSON error responses.
         if body.starts_with('{') {
@@ -1097,7 +1101,7 @@ impl AirVpnWebApi {
         form: &[(&str, &str)],
     ) -> anyhow::Result<(Vec<u8>, String)> {
         let url = format!("{}/{}/", API_BASE_URL, path.trim_matches('/'));
-        debug!("API POST {} (bytes)", url);
+        debug!("api_post_bytes_request"; "url" => url.as_str());
 
         let resp = self
             .client
@@ -1129,10 +1133,10 @@ impl AirVpnWebApi {
 
         let data = resp.bytes().await?.to_vec();
         debug!(
-            "API response ({} {}B, {})",
-            status,
-            data.len(),
-            content_type
+            "api_response_bytes_received";
+            "status" => status.as_u16(),
+            "bytes" => data.len(),
+            "content_type" => content_type.as_str()
         );
 
         // If the server returned JSON, check for errors.
@@ -1171,7 +1175,11 @@ impl AirVpnWebApi {
             );
         }
 
-        debug!("API response ({} {}B)", status, body.len());
+        debug!(
+            "api_response_received";
+            "status" => status.as_u16(),
+            "bytes" => body.len()
+        );
 
         serde_json::from_str(&body).with_context(|| {
             format!(

@@ -27,6 +27,7 @@ pub struct GeneralConfig {
     pub proxy: bool,
     pub socks_port: Option<u16>,
     pub http_port: Option<u16>,
+    pub privileged_transport: PrivilegedTransport,
     pub privileged_autostart: bool,
     pub privileged_autostart_timeout_ms: u64,
     pub privileged_authorized_group: String,
@@ -42,6 +43,7 @@ impl Default for GeneralConfig {
             proxy: false,
             socks_port: None,
             http_port: None,
+            privileged_transport: PrivilegedTransport::Socket,
             privileged_autostart: true,
             privileged_autostart_timeout_ms: 5000,
             privileged_authorized_group: "tunmux".to_string(),
@@ -65,6 +67,19 @@ impl Default for PrivilegedAutostopMode {
     }
 }
 
+#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum PrivilegedTransport {
+    Socket,
+    Stdio,
+}
+
+impl Default for PrivilegedTransport {
+    fn default() -> Self {
+        Self::Socket
+    }
+}
+
 #[derive(Debug, Default, Deserialize)]
 #[serde(default)]
 pub struct ProtonConfig {
@@ -82,7 +97,11 @@ pub fn load_config() -> AppConfig {
     let path = app_config_dir().join("config.toml");
     match fs::read_to_string(&path) {
         Ok(text) => toml::from_str(&text).unwrap_or_else(|e| {
-            tracing::warn!("failed to parse {}: {}", path.display(), e);
+            slog_scope::warn!(
+                "config_parse_failed";
+                "path" => path.display().to_string(),
+                "error" => e.to_string()
+            );
             AppConfig::default()
         }),
         Err(_) => AppConfig::default(),
@@ -255,7 +274,7 @@ fn save_session_file(provider: Provider, json: &str) -> Result<()> {
     let path = session_path(provider);
     fs::write(&path, json)?;
     fs::set_permissions(&path, fs::Permissions::from_mode(0o600))?;
-    tracing::info!("Session saved to {}", path.display());
+    slog_scope::info!("session_saved"; "path" => path.display().to_string());
     Ok(())
 }
 
@@ -273,7 +292,7 @@ fn delete_session_file(provider: Provider) -> Result<()> {
     let path = session_path(provider);
     if path.exists() {
         fs::remove_file(&path)?;
-        tracing::info!("Session deleted");
+        slog_scope::info!("session_deleted"; "path" => path.display().to_string());
     }
     Ok(())
 }
@@ -287,7 +306,7 @@ fn save_session_keyring(provider: Provider, json: &str) -> Result<()> {
     entry
         .set_password(json)
         .map_err(|e| AppError::Other(format!("keyring set error: {}", e)))?;
-    tracing::info!("Session saved to keyring ({})", provider.dir_name());
+    slog_scope::info!("session_saved_keyring"; "provider" => provider.dir_name());
     Ok(())
 }
 
@@ -305,7 +324,7 @@ fn delete_session_keyring(provider: Provider) -> Result<()> {
     let entry = keyring::Entry::new("tunmux", provider.dir_name())
         .map_err(|e| AppError::Other(format!("keyring error: {}", e)))?;
     let _ = entry.delete_credential();
-    tracing::info!("Session deleted from keyring");
+    slog_scope::info!("session_deleted_keyring"; "provider" => provider.dir_name());
     Ok(())
 }
 

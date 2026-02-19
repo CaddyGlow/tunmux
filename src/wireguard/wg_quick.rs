@@ -2,7 +2,7 @@ use crate::config;
 use crate::error::Result;
 use crate::privileged_api::WgQuickAction;
 use crate::privileged_client::PrivilegedClient;
-use tracing::info;
+use slog_scope::info;
 
 /// Write the WireGuard config and bring up the interface.
 pub fn up(config_content: &str, interface_name: &str, provider: config::Provider) -> Result<()> {

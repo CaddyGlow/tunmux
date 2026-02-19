@@ -49,6 +49,10 @@ pub enum TopCommand {
         #[arg(long)]
         serve: bool,
 
+        /// Use stdin/stdout request transport instead of Unix socket.
+        #[arg(long, hide = true)]
+        stdio: bool,
+
         /// Optional group name for privileged socket authorization.
         #[arg(long)]
         authorized_group: Option<String>,

@@ -1,5 +1,5 @@
 use serde_json::json;
-use tracing::info;
+use slog_scope::info;
 
 use crate::api::http::{check_api_response, ProtonClient};
 use crate::error::Result;
@@ -14,7 +14,7 @@ pub async fn fetch_certificate(
     client: &ProtonClient,
     ed25519_pubkey_pem: &str,
 ) -> Result<CertificateResponse> {
-    info!("Fetching VPN certificate");
+    info!("fetching_vpn_certificate");
     let body = json!({
         "ClientPublicKey": ed25519_pubkey_pem,
         "Duration": format!("{} min", CERT_DURATION_MIN),
@@ -29,6 +29,6 @@ pub async fn fetch_certificate(
     check_api_response(&json)?;
 
     let cert: CertificateResponse = serde_json::from_value(json)?;
-    info!(serial = %cert.serial_number, "Certificate fetched");
+    info!("certificate_fetched"; "serial" => cert.serial_number.as_str());
     Ok(cert)
 }

@@ -1,5 +1,5 @@
 use serde_json::json;
-use tracing::{debug, info};
+use slog_scope::{debug, info};
 
 use crate::api::http::{check_api_response, ProtonClient};
 use crate::api::srp;
@@ -15,7 +15,7 @@ pub async fn login(
     password: &str,
 ) -> Result<AuthResponse> {
     // Step 1: Get auth info (salt, server ephemeral, modulus)
-    info!("Fetching auth info for {}", username);
+    info!("fetching_auth_info"; "username" => username);
     let info_body = json!({ "Username": username });
 
     let info_resp = client.post("/auth/v4/info").json(&info_body).send().await?;
@@ -23,7 +23,7 @@ pub async fn login(
     check_api_response(&info_json)?;
 
     let auth_info: AuthInfoResponse = serde_json::from_value(info_json)?;
-    debug!(version = auth_info.version, "SRP version");
+    debug!("srp_version"; "version" => auth_info.version);
 
     // Step 2: Decode modulus, hash password, compute SRP proof
     let (modulus, modulus_le) = srp::decode_modulus(&auth_info.modulus)?;
@@ -32,7 +32,7 @@ pub async fn login(
         srp::compute_srp_proof(&hashed, &auth_info.server_ephemeral, &modulus)?;
 
     // Step 3: Submit auth request
-    info!("Submitting SRP authentication");
+    info!("submitting_srp_auth");
     let auth_body = json!({
         "Username": username,
         "ClientEphemeral": client_ephemeral,
@@ -48,7 +48,7 @@ pub async fn login(
 
     // Step 4: Verify server proof
     srp::verify_server_proof(&expected_server_proof, &auth.server_proof)?;
-    info!("Server proof verified");
+    info!("server_proof_verified");
 
     // Set auth credentials on the client
     client.set_auth(&auth.uid, &auth.access_token);
@@ -58,7 +58,7 @@ pub async fn login(
 
 /// Submit TOTP 2FA code.
 pub async fn submit_2fa(client: &ProtonClient, code: &str) -> Result<TwoFactorResponse> {
-    info!("Submitting 2FA code");
+    info!("submitting_2fa_code");
     let body = json!({ "TwoFactorCode": code });
 
     let resp = client.post("/auth/v4/2fa").json(&body).send().await?;
@@ -66,6 +66,6 @@ pub async fn submit_2fa(client: &ProtonClient, code: &str) -> Result<TwoFactorRe
     check_api_response(&json)?;
 
     let result: TwoFactorResponse = serde_json::from_value(json)?;
-    info!("2FA accepted");
+    info!("two_fa_accepted");
     Ok(result)
 }

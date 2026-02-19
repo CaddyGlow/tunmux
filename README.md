@@ -199,6 +199,7 @@ are optional; a missing file means all defaults apply.
     [general]
     backend = "auto"              # default WireGuard backend: auto, wg-quick, kernel
     credential_store = "keyring"  # "keyring" or "file" (requires --features keyring)
+    privileged_transport = "socket"  # socket (default) or stdio
     privileged_autostart = true
     privileged_autostart_timeout_ms = 5000
     privileged_authorized_group = "tunmux"
@@ -248,6 +249,18 @@ Typical failures:
 - `sudo password required but no TTY available`
 - `startup timeout waiting for privileged daemon readiness`
 - `authorization denied by privileged daemon`
+
+### Privileged stdio mode
+
+Set `general.privileged_transport = "stdio"` to run privileged requests over a
+single sudo-launched helper process using stdin/stdout for one command
+lifetime, instead of `/run/tunmux/ctl.sock`.
+
+Example sudoers entry for stdio mode:
+
+```bash
+<user-or-group> ALL=(root) NOPASSWD: /usr/bin/tunmux privileged --serve --stdio --autostarted --authorized-group tunmux
+```
 
 ### Keyring support
 

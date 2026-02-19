@@ -3,6 +3,7 @@ use std::io::{BufRead, BufReader, Write};
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::io::FromRawFd;
 use std::os::unix::net::UnixStream;
+use std::os::unix::process::CommandExt;
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
@@ -10,7 +11,7 @@ use nix::sys::signal::{kill, Signal};
 #[cfg(target_os = "linux")]
 use nix::sys::socket::{getsockopt, sockopt::PeerCredentials};
 use nix::unistd::{chown, Gid, Pid};
-use tracing::{debug, info, warn};
+use slog_scope::{debug, info, warn};
 
 use crate::config;
 use crate::error::{AppError, Result};
@@ -53,9 +54,9 @@ pub fn serve(
     let authorized_group = resolve_authorized_group(cli_authorized_group);
     let idle_timeout = cli_idle_timeout_ms.map(|ms| Duration::from_millis(ms.max(100)));
     debug!(
-        "privileged service start autostarted={} idle_timeout_ms={}",
-        cli_autostarted,
-        idle_timeout.map(|d| d.as_millis()).unwrap_or(0)
+        "privileged_service_start";
+        "autostarted" => cli_autostarted,
+        "idle_timeout_ms" => idle_timeout.map(|d| d.as_millis()).unwrap_or(0) as u64
     );
     config::ensure_privileged_socket_dir()?;
     config::ensure_privileged_runtime_dir()?;
@@ -72,12 +73,16 @@ pub fn serve(
     if let Some(gid) = group_gid {
         let socket_dir = config::privileged_socket_dir();
         chown(&socket_dir, None, Some(Gid::from_raw(gid)))?;
-        info!("socket dir {} chowned to gid {}", socket_dir.display(), gid);
+        info!(
+            "socket_dir_chowned";
+            "path" => socket_dir.display().to_string(),
+            "gid" => gid
+        );
     }
 
     let listener = match systemd_activated_listener()? {
         Some(listener) => {
-            info!("privileged service using systemd socket activation");
+            info!("privileged_service_systemd_socket_activation");
             listener
         }
         None => {
@@ -93,10 +98,17 @@ pub fn serve(
             // Chown socket file so group members can connect (mode 0660).
             if let Some(gid) = group_gid {
                 chown(&socket_path, None, Some(Gid::from_raw(gid)))?;
-                info!("socket {} chowned to gid {}", socket_path.display(), gid);
+                info!(
+                    "socket_file_chowned";
+                    "path" => socket_path.display().to_string(),
+                    "gid" => gid
+                );
             }
 
-            info!("privileged service listening on {}", socket_path.display());
+            info!(
+                "privileged_service_listening";
+                "socket" => socket_path.display().to_string()
+            );
             listener
         }
     };
@@ -104,8 +116,8 @@ pub fn serve(
     if idle_timeout.is_some() {
         listener.set_nonblocking(true)?;
         info!(
-            "privileged service idle timeout enabled: {} ms",
-            idle_timeout.map(|d| d.as_millis()).unwrap_or_default()
+            "privileged_service_idle_timeout_enabled";
+            "idle_timeout_ms" => idle_timeout.map(|d| d.as_millis()).unwrap_or_default() as u64
         );
     }
 
@@ -115,29 +127,39 @@ pub fn serve(
         match listener.accept() {
             Ok((stream, _)) => {
                 let mut stream = stream;
-                let response =
-                    handle_client(&mut stream, &mut control_state, authorized_group.as_deref());
-                let mut buffer = serde_json::to_vec(&response)?;
-                buffer.push(b'\n');
-                if let Err(e) = stream.write_all(&buffer) {
-                    warn!("failed to write privileged response: {}", e);
-                }
-                last_activity = Instant::now();
-                if control_state.should_exit_now() {
-                    debug!(
-                        "privileged service stop condition met: explicit shutdown and no leases"
-                    );
-                    info!("privileged service exiting after explicit shutdown request");
-                    return Ok(());
+                loop {
+                    match handle_client(
+                        &mut stream,
+                        &mut control_state,
+                        authorized_group.as_deref(),
+                    ) {
+                        ClientReadResult::ConnectionClosed => break,
+                        ClientReadResult::Response(response) => {
+                            let mut buffer = serde_json::to_vec(&response)?;
+                            buffer.push(b'\n');
+                            if let Err(e) = stream.write_all(&buffer) {
+                                warn!("privileged_response_write_failed"; "error" => e.to_string());
+                                break;
+                            }
+                            last_activity = Instant::now();
+                            if control_state.should_exit_now() {
+                                debug!(
+                                    "privileged_service_stop_condition_explicit_shutdown_no_leases"
+                                );
+                                info!("privileged_service_exiting_explicit_shutdown");
+                                return Ok(());
+                            }
+                        }
+                    }
                 }
             }
             Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                 if let Some(timeout) = idle_timeout {
                     if last_activity.elapsed() >= timeout {
-                        debug!("privileged service stop condition met: idle timeout elapsed");
+                        debug!("privileged_service_stop_condition_idle_timeout_elapsed");
                         info!(
-                            "privileged service exiting after {} ms idle timeout",
-                            timeout.as_millis()
+                            "privileged_service_exiting_idle_timeout";
+                            "idle_timeout_ms" => timeout.as_millis() as u64
                         );
                         return Ok(());
                     }
@@ -147,6 +169,44 @@ pub fn serve(
                 return Err(e.into());
             }
             Err(e) => return Err(e.into()),
+        }
+    }
+}
+
+pub fn serve_stdio(cli_idle_timeout_ms: Option<u64>, cli_autostarted: bool) -> anyhow::Result<()> {
+    debug!(
+        "privileged_stdio_service_start";
+        "autostarted" => cli_autostarted,
+        "idle_timeout_ms" => cli_idle_timeout_ms.unwrap_or(0)
+    );
+    config::ensure_privileged_runtime_dir()?;
+    ensure_managed_pid_registry_dir()?;
+    cleanup_stale_managed_pid_registry_entries()?;
+
+    let stdin = std::io::stdin();
+    let stdout = std::io::stdout();
+    let mut reader = BufReader::new(stdin.lock());
+    let mut writer = stdout.lock();
+    let mut control_state = ControlState::new(cli_autostarted);
+
+    loop {
+        let mut payload = String::new();
+        let bytes = reader.read_line(&mut payload)?;
+        if bytes == 0 {
+            debug!("privileged_stdio_service_exiting_stdin_eof");
+            return Ok(());
+        }
+
+        let response = process_request_payload(&payload, &mut control_state, None);
+        let mut buffer = serde_json::to_vec(&response)?;
+        buffer.push(b'\n');
+        writer.write_all(&buffer)?;
+        writer.flush()?;
+
+        if control_state.should_exit_now() {
+            debug!("privileged_stdio_service_stop_condition_explicit_shutdown_no_leases");
+            info!("privileged_stdio_service_exiting_explicit_shutdown");
+            return Ok(());
         }
     }
 }
@@ -182,18 +242,27 @@ fn systemd_activated_listener() -> anyhow::Result<Option<std::os::unix::net::Uni
     Ok(Some(listener))
 }
 
+enum ClientReadResult {
+    ConnectionClosed,
+    Response(PrivilegedResponse),
+}
+
 fn handle_client(
     stream: &mut UnixStream,
     control_state: &mut ControlState,
     authorized_group: Option<&str>,
-) -> PrivilegedResponse {
+) -> ClientReadResult {
     let mut reader = BufReader::new(&mut *stream);
     let mut payload = String::new();
-    if let Err(e) = reader.read_line(&mut payload) {
-        return PrivilegedResponse::Error {
-            code: "Protocol".into(),
-            message: format!("failed to read request: {}", e),
-        };
+    match reader.read_line(&mut payload) {
+        Ok(0) => return ClientReadResult::ConnectionClosed,
+        Ok(_) => {}
+        Err(e) => {
+            return ClientReadResult::Response(PrivilegedResponse::Error {
+                code: "Protocol".into(),
+                message: format!("failed to read request: {}", e),
+            });
+        }
     }
 
     let peer = {
@@ -206,19 +275,23 @@ fn handle_client(
                     if !is_authorized(peer_uid, peer_gid, authorized_group) {
                         let message =
                             format!("peer uid={} gid={} not authorized", peer_uid, peer_gid);
-                        warn!("{}", message);
-                        return PrivilegedResponse::Error {
+                        warn!(
+                            "peer_not_authorized";
+                            "uid" => peer_uid,
+                            "gid" => peer_gid
+                        );
+                        return ClientReadResult::Response(PrivilegedResponse::Error {
                             code: "Auth".into(),
                             message,
-                        };
+                        });
                     }
                     (peer_uid, peer_gid)
                 }
                 Err(e) => {
-                    return PrivilegedResponse::Error {
+                    return ClientReadResult::Response(PrivilegedResponse::Error {
                         code: "Auth".into(),
                         message: format!("SO_PEERCRED failed: {}", e),
-                    };
+                    });
                 }
             }
         }
@@ -229,6 +302,18 @@ fn handle_client(
         }
     };
 
+    ClientReadResult::Response(process_request_payload(
+        &payload,
+        control_state,
+        Some((peer.0, peer.1)),
+    ))
+}
+
+fn process_request_payload(
+    payload: &str,
+    control_state: &mut ControlState,
+    peer: Option<(u32, u32)>,
+) -> PrivilegedResponse {
     if payload.trim().is_empty() {
         return PrivilegedResponse::Error {
             code: "Protocol".into(),
@@ -236,7 +321,7 @@ fn handle_client(
         };
     }
 
-    let request: PrivilegedRequest = match serde_json::from_str::<PrivilegedRequest>(&payload) {
+    let request: PrivilegedRequest = match serde_json::from_str::<PrivilegedRequest>(payload) {
         Ok(req) => req,
         Err(e) => {
             return PrivilegedResponse::Error {
@@ -246,10 +331,21 @@ fn handle_client(
         }
     };
     let request_kind = describe_request(&request);
-    info!(
-        "privileged request from uid={} gid={} => {}",
-        peer.0, peer.1, request_kind
-    );
+    if let Some((uid, gid)) = peer {
+        info!(
+            "privileged_request_received";
+            "transport" => "socket",
+            "uid" => uid,
+            "gid" => gid,
+            "request" => request_kind
+        );
+    } else {
+        info!(
+            "privileged_request_received";
+            "transport" => "stdio",
+            "request" => request_kind
+        );
+    }
 
     if let Err(e) = request.validate() {
         return PrivilegedResponse::Error {
@@ -513,7 +609,9 @@ fn dispatch(request: PrivilegedRequest, control_state: &mut ControlState) -> Pri
                 };
             }
             if let Ok(exe) = std::fs::read_link(format!("/proc/{}/exe", pid)) {
-                if !exe.to_string_lossy().ends_with("/tunmux") {
+                let exe_str = exe.to_string_lossy();
+                let exe_name = exe_str.strip_suffix(" (deleted)").unwrap_or(&exe_str);
+                if !exe_name.ends_with("/tunmux") {
                     return PrivilegedResponse::Error {
                         code: "Authorization".into(),
                         message: "target pid not tunmux".into(),
@@ -532,16 +630,10 @@ fn dispatch(request: PrivilegedRequest, control_state: &mut ControlState) -> Pri
             };
             let target = Pid::from_raw(pid as i32);
             match kill(target, signal) {
-                Ok(()) => {
-                    let _ = unregister_managed_pid(pid);
-                    PrivilegedResponse::Unit
-                }
+                Ok(()) => PrivilegedResponse::Unit,
                 Err(nix::errno::Errno::ESRCH) => {
                     let _ = unregister_managed_pid(pid);
-                    PrivilegedResponse::Error {
-                        code: "Kernel".into(),
-                        message: format!("kill {} failed: process no longer exists", pid),
-                    }
+                    PrivilegedResponse::Unit
                 }
                 Err(e) => PrivilegedResponse::Error {
                     code: "Kernel".into(),
@@ -583,8 +675,8 @@ fn dispatch(request: PrivilegedRequest, control_state: &mut ControlState) -> Pri
             control_state.prune_stale_leases();
             control_state.leases.insert(token);
             debug!(
-                "privileged service lease acquired count={}",
-                control_state.leases.len()
+                "privileged_lease_acquired";
+                "lease_count" => control_state.leases.len()
             );
             PrivilegedResponse::Unit
         }
@@ -593,8 +685,8 @@ fn dispatch(request: PrivilegedRequest, control_state: &mut ControlState) -> Pri
             control_state.leases.remove(token.as_str());
             control_state.prune_stale_leases();
             debug!(
-                "privileged service lease released count={}",
-                control_state.leases.len()
+                "privileged_lease_released";
+                "lease_count" => control_state.leases.len()
             );
             PrivilegedResponse::Unit
         }
@@ -609,8 +701,8 @@ fn dispatch(request: PrivilegedRequest, control_state: &mut ControlState) -> Pri
             control_state.shutdown_requested = true;
             control_state.prune_stale_leases();
             debug!(
-                "privileged service shutdown-if-idle requested remaining_leases={}",
-                control_state.leases.len()
+                "privileged_shutdown_if_idle_requested";
+                "remaining_leases" => control_state.leases.len()
             );
             PrivilegedResponse::Bool(control_state.leases.is_empty())
         }
@@ -778,7 +870,9 @@ fn spawn_proxy_daemon(
     let socks = socks_port.to_string();
     let http = http_port.to_string();
 
-    let mut child = Command::new(exe)
+    let mut command = Command::new(exe);
+    command.arg0("tunmux");
+    let mut child = command
         .args([
             "proxy-daemon",
             "--netns",
@@ -823,11 +917,24 @@ fn spawn_proxy_daemon(
 }
 
 fn self_executable_for_spawn() -> Result<std::path::PathBuf> {
-    let proc_self_exe = std::path::PathBuf::from("/proc/self/exe");
-    if proc_self_exe.exists() {
-        return Ok(proc_self_exe);
+    if let Ok(current) = std::env::current_exe() {
+        if current.exists() {
+            return Ok(current);
+        }
     }
-    std::env::current_exe().map_err(AppError::from)
+
+    if let Ok(cmdline) = std::fs::read("/proc/self/cmdline") {
+        if let Some(raw) = cmdline.split(|b| *b == 0).next() {
+            if !raw.is_empty() {
+                let candidate = std::path::PathBuf::from(String::from_utf8_lossy(raw).to_string());
+                if candidate.is_absolute() && candidate.exists() {
+                    return Ok(candidate);
+                }
+            }
+        }
+    }
+
+    Ok(std::path::PathBuf::from("/proc/self/exe"))
 }
 
 fn wait_for_pid_file(pid_file: &str, timeout: Duration) -> Result<u32> {
