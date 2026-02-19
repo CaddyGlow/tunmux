@@ -90,20 +90,32 @@ pub fn next_available_ports() -> anyhow::Result<ProxyConfig> {
         }
     }
 
-    let mut socks_port = 1080u16;
-    while used_socks.contains(&socks_port) {
-        socks_port = socks_port.checked_add(1).unwrap_or(1080);
-    }
+    let socks_port = next_available_port(1080, &used_socks)?;
 
-    let mut http_port = 8118u16;
-    while used_http.contains(&http_port) {
-        http_port = http_port.checked_add(1).unwrap_or(8118);
-    }
+    let http_port = next_available_port(8118, &used_http)?;
 
     Ok(ProxyConfig {
         socks_port,
         http_port,
     })
+}
+
+fn next_available_port(start: u16, used: &[u16]) -> anyhow::Result<u16> {
+    let mut port = start;
+    loop {
+        if !used.contains(&port) && loopback_tcp_bind_available(port) {
+            return Ok(port);
+        }
+        port = port.checked_add(1).unwrap_or(1024);
+        if port == start {
+            anyhow::bail!("no available proxy port found from {}", start);
+        }
+    }
+}
+
+fn loopback_tcp_bind_available(port: u16) -> bool {
+    std::net::TcpListener::bind(("127.0.0.1", port)).is_ok()
+        || std::net::TcpListener::bind(("::1", port)).is_ok()
 }
 
 /// Stop a proxy daemon via the privileged API.
@@ -154,5 +166,10 @@ mod tests {
     #[test]
     fn test_instance_name_special_chars() {
         assert_eq!(instance_name("US@#1!"), "us-1");
+    }
+
+    #[test]
+    fn test_loopback_tcp_bind_available_ephemeral() {
+        assert!(loopback_tcp_bind_available(0));
     }
 }

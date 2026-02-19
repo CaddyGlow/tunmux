@@ -10,7 +10,7 @@ use nix::sys::signal::{kill, Signal};
 #[cfg(target_os = "linux")]
 use nix::sys::socket::{getsockopt, sockopt::PeerCredentials};
 use nix::unistd::{chown, Gid, Pid};
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 use crate::config;
 use crate::error::{AppError, Result};
@@ -52,6 +52,11 @@ pub fn serve(
 ) -> anyhow::Result<()> {
     let authorized_group = resolve_authorized_group(cli_authorized_group);
     let idle_timeout = cli_idle_timeout_ms.map(|ms| Duration::from_millis(ms.max(100)));
+    debug!(
+        "privileged service start autostarted={} idle_timeout_ms={}",
+        cli_autostarted,
+        idle_timeout.map(|d| d.as_millis()).unwrap_or(0)
+    );
     config::ensure_privileged_socket_dir()?;
     config::ensure_privileged_runtime_dir()?;
     ensure_managed_pid_registry_dir()?;
@@ -119,6 +124,9 @@ pub fn serve(
                 }
                 last_activity = Instant::now();
                 if control_state.should_exit_now() {
+                    debug!(
+                        "privileged service stop condition met: explicit shutdown and no leases"
+                    );
                     info!("privileged service exiting after explicit shutdown request");
                     return Ok(());
                 }
@@ -126,6 +134,7 @@ pub fn serve(
             Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                 if let Some(timeout) = idle_timeout {
                     if last_activity.elapsed() >= timeout {
+                        debug!("privileged service stop condition met: idle timeout elapsed");
                         info!(
                             "privileged service exiting after {} ms idle timeout",
                             timeout.as_millis()
@@ -573,12 +582,20 @@ fn dispatch(request: PrivilegedRequest, control_state: &mut ControlState) -> Pri
         PrivilegedRequest::LeaseAcquire { token } => {
             control_state.prune_stale_leases();
             control_state.leases.insert(token);
+            debug!(
+                "privileged service lease acquired count={}",
+                control_state.leases.len()
+            );
             PrivilegedResponse::Unit
         }
 
         PrivilegedRequest::LeaseRelease { token } => {
             control_state.leases.remove(token.as_str());
             control_state.prune_stale_leases();
+            debug!(
+                "privileged service lease released count={}",
+                control_state.leases.len()
+            );
             PrivilegedResponse::Unit
         }
 
@@ -591,6 +608,10 @@ fn dispatch(request: PrivilegedRequest, control_state: &mut ControlState) -> Pri
             }
             control_state.shutdown_requested = true;
             control_state.prune_stale_leases();
+            debug!(
+                "privileged service shutdown-if-idle requested remaining_leases={}",
+                control_state.leases.len()
+            );
             PrivilegedResponse::Bool(control_state.leases.is_empty())
         }
     }
@@ -739,8 +760,12 @@ fn spawn_proxy_daemon(
     pid_file: &str,
     log_file: &str,
 ) -> Result<u32> {
-    let exe = std::env::current_exe()?;
-    let exe = exe.to_string_lossy();
+    let exe = self_executable_for_spawn()?;
+    info!(
+        "spawning proxy-daemon via {} for netns {}",
+        exe.display(),
+        netns
+    );
 
     // Ensure the proxy directory exists (e.g. /var/lib/tunmux/proxy/).
     if let Some(parent) = std::path::Path::new(pid_file).parent() {
@@ -753,7 +778,7 @@ fn spawn_proxy_daemon(
     let socks = socks_port.to_string();
     let http = http_port.to_string();
 
-    let mut child = Command::new(exe.as_ref())
+    let mut child = Command::new(exe)
         .args([
             "proxy-daemon",
             "--netns",
@@ -795,6 +820,14 @@ fn spawn_proxy_daemon(
 
     let pid = wait_for_pid_file(pid_file, Duration::from_secs(5))?;
     Ok(pid)
+}
+
+fn self_executable_for_spawn() -> Result<std::path::PathBuf> {
+    let proc_self_exe = std::path::PathBuf::from("/proc/self/exe");
+    if proc_self_exe.exists() {
+        return Ok(proc_self_exe);
+    }
+    std::env::current_exe().map_err(AppError::from)
 }
 
 fn wait_for_pid_file(pid_file: &str, timeout: Duration) -> Result<u32> {

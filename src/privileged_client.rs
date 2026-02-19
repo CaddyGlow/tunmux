@@ -4,13 +4,14 @@ use std::os::fd::AsRawFd;
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
-use std::process::Command;
+use std::process::{Command, Stdio};
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 use std::{fs, thread};
 
 use nix::libc;
 use nix::unistd::Uid;
+use tracing::debug;
 
 use crate::config;
 use crate::config::PrivilegedAutostopMode;
@@ -72,8 +73,10 @@ impl Drop for CommandScopeGuard {
 
         if let Some(token) = token_to_release {
             let client = PrivilegedClient::new();
+            debug!("privileged daemon stop: releasing command lease");
             let _ = client
                 .send_control_request_if_connected(&PrivilegedRequest::LeaseRelease { token });
+            debug!("privileged daemon stop: requesting shutdown-if-idle");
             let _ = client.send_control_request_if_connected(&PrivilegedRequest::ShutdownIfIdle);
         }
     }
@@ -265,6 +268,11 @@ impl PrivilegedClient {
 
     fn send(&self, request: PrivilegedRequest) -> Result<PrivilegedResponse> {
         request.validate().map_err(AppError::Other)?;
+        debug!(
+            "privileged ctl request={} socket={}",
+            request_kind(&request),
+            self.socket_path.display()
+        );
         self.ensure_command_lease_if_enabled()?;
         let mut stream = self.connect_or_autostart()?;
         self.send_on_stream(&mut stream, &request)
@@ -275,6 +283,7 @@ impl PrivilegedClient {
         stream: &mut UnixStream,
         request: &PrivilegedRequest,
     ) -> Result<PrivilegedResponse> {
+        debug!("privileged ctl write request={}", request_kind(request));
         let request_bytes = serde_json::to_vec(request)
             .map_err(|e| AppError::Other(format!("serialize request: {}", e)))?;
         stream
@@ -299,6 +308,7 @@ impl PrivilegedClient {
         }
         let response: PrivilegedResponse = serde_json::from_str(&response_line)
             .map_err(|e| AppError::Other(format!("decode response: {}", e)))?;
+        debug!("privileged ctl response request={}", request_kind(request));
 
         map_privileged_error(response)
     }
@@ -355,15 +365,36 @@ impl PrivilegedClient {
     }
 
     fn connect_or_autostart(&self) -> Result<UnixStream> {
+        debug!(
+            "privileged ctl connect attempt socket={}",
+            self.socket_path.display()
+        );
         match self.try_connect_socket() {
-            Ok(stream) => return Ok(stream),
+            Ok(stream) => {
+                debug!(
+                    "privileged ctl connect ok socket={}",
+                    self.socket_path.display()
+                );
+                return Ok(stream);
+            }
             Err(e) if !is_autostart_connect_error(&e) => {
+                debug!(
+                    "privileged ctl connect failed socket={} err={}",
+                    self.socket_path.display(),
+                    e
+                );
                 return Err(AppError::Other(format!(
                     "failed to connect to privileged socket: {}",
                     e
                 )));
             }
-            Err(_) => {}
+            Err(e) => {
+                debug!(
+                    "privileged ctl connect recoverable socket={} err={}",
+                    self.socket_path.display(),
+                    e
+                );
+            }
         }
 
         if !self.autostart_enabled {
@@ -384,14 +415,18 @@ impl PrivilegedClient {
     }
 
     fn autostart_daemon(&self) -> Result<()> {
+        debug!("privileged ctl autostart begin");
         let _lock = self.acquire_startup_lock()?;
+        debug!("privileged ctl autostart lock acquired");
 
         if self.try_connect_socket().is_ok() {
             return Ok(());
         }
 
         self.spawn_privileged_daemon()?;
-        self.wait_until_ready()
+        self.wait_until_ready()?;
+        debug!("privileged ctl autostart ready");
+        Ok(())
     }
 
     fn acquire_startup_lock(&self) -> Result<std::fs::File> {
@@ -444,13 +479,20 @@ impl PrivilegedClient {
     }
 
     fn spawn_privileged_daemon(&self) -> Result<()> {
-        let non_interactive = self.run_sudo_non_interactive()?;
-        if non_interactive.status.success() {
+        const SUDO_PROMPT_TIMEOUT: Duration = Duration::from_secs(90);
+        debug!("privileged daemon start: trying non-interactive sudo launch");
+        if self.run_sudo_non_interactive_launch()? {
+            debug!("privileged daemon start: non-interactive launch ok");
             return Ok(());
         }
 
-        let stderr = String::from_utf8_lossy(&non_interactive.stderr);
+        let probe = self.run_sudo_non_interactive_probe()?;
+        let stderr = String::from_utf8_lossy(&probe.stderr);
         if !stderr_requires_password(&stderr) {
+            debug!(
+                "privileged daemon start: non-interactive launch failed without password-prompt hint stderr={}",
+                stderr.trim()
+            );
             return Err(AppError::Other(format!(
                 "failed to start privileged daemon via sudo: {}; run: {}",
                 stderr.trim(),
@@ -459,28 +501,41 @@ impl PrivilegedClient {
         }
 
         if !std::io::stdin().is_terminal() {
+            debug!("privileged daemon start: password required but no TTY");
             return Err(AppError::Other(format!(
                 "sudo password required but no TTY available; run: {}",
                 self.manual_start_command()
             )));
         }
 
-        let validate = Command::new("sudo")
-            .arg("-v")
-            .status()
+        eprintln!("sudo authentication required for tunmux privileged autostart.");
+        debug!(
+            "privileged daemon start: running sudo -v with timeout={}s",
+            SUDO_PROMPT_TIMEOUT.as_secs()
+        );
+        let validate = run_sudo_validate_with_timeout(SUDO_PROMPT_TIMEOUT)
             .map_err(|e| map_sudo_spawn_error(e, self.manual_start_command()))?;
-        if !validate.success() {
+        if !validate {
+            debug!("privileged daemon start: sudo -v returned non-success");
             return Err(AppError::Other(format!(
                 "sudo authentication failed; run: {}",
                 self.manual_start_command()
             )));
         }
 
-        let retry = self.run_sudo_non_interactive()?;
-        if retry.status.success() {
+        debug!("privileged daemon start: retrying non-interactive launch after sudo -v");
+        if self.run_sudo_non_interactive_launch()? {
+            debug!("privileged daemon start: retry launch ok");
             return Ok(());
         }
-        let retry_stderr = String::from_utf8_lossy(&retry.stderr).trim().to_string();
+        let retry_probe = self.run_sudo_non_interactive_probe()?;
+        let retry_stderr = String::from_utf8_lossy(&retry_probe.stderr)
+            .trim()
+            .to_string();
+        debug!(
+            "privileged daemon start: retry launch failed stderr={}",
+            retry_stderr
+        );
         Err(AppError::Other(format!(
             "failed to start privileged daemon after sudo auth: {}; run: {}",
             retry_stderr,
@@ -488,7 +543,7 @@ impl PrivilegedClient {
         )))
     }
 
-    fn run_sudo_non_interactive(&self) -> Result<std::process::Output> {
+    fn run_sudo_non_interactive_launch(&self) -> Result<bool> {
         let exe = std::env::current_exe()
             .map_err(|e| AppError::Other(format!("cannot resolve current executable: {}", e)))?;
         let mut command = Command::new("sudo");
@@ -506,12 +561,50 @@ impl PrivilegedClient {
                 .arg("--idle-timeout-ms")
                 .arg(idle_timeout_ms.to_string());
         }
-        command
+        if let Some(log_path) = configured_privileged_stdio_log_path() {
+            if let Some(parent) = log_path.parent() {
+                let _ = fs::create_dir_all(parent);
+            }
+            let log_file = fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&log_path)
+                .map_err(|e| {
+                    AppError::Other(format!(
+                        "failed to open privileged stdio log {}: {}",
+                        log_path.display(),
+                        e
+                    ))
+                })?;
+            let log_file_err = log_file
+                .try_clone()
+                .map_err(|e| AppError::Other(format!("failed to clone log fd: {}", e)))?;
+            command.stdout(Stdio::from(log_file));
+            command.stderr(Stdio::from(log_file_err));
+            debug!(
+                "privileged daemon start: capturing sudo/daemon stdio to {}",
+                log_path.display()
+            );
+        }
+        let status = command
+            .status()
+            .map_err(|e| map_sudo_spawn_error(e, self.manual_start_command()))?;
+        Ok(status.success())
+    }
+
+    fn run_sudo_non_interactive_probe(&self) -> Result<std::process::Output> {
+        Command::new("sudo")
+            .arg("-n")
+            .arg("-v")
             .output()
             .map_err(|e| map_sudo_spawn_error(e, self.manual_start_command()))
     }
 
     fn wait_until_ready(&self) -> Result<()> {
+        debug!(
+            "privileged ctl readiness wait timeout_ms={}",
+            self.autostart_timeout.as_millis()
+        );
         let deadline = Instant::now() + self.autostart_timeout;
         loop {
             match self.readiness_probe_once() {
@@ -597,6 +690,7 @@ fn map_privileged_error(response: PrivilegedResponse) -> Result<PrivilegedRespon
 fn is_autostart_connect_error(err: &std::io::Error) -> bool {
     err.kind() == std::io::ErrorKind::NotFound
         || err.kind() == std::io::ErrorKind::ConnectionRefused
+        || err.kind() == std::io::ErrorKind::PermissionDenied
 }
 
 fn stderr_requires_password(stderr: &str) -> bool {
@@ -619,6 +713,15 @@ fn build_lease_token() -> String {
     let pid = std::process::id();
     let start_ticks = process_start_ticks(pid).unwrap_or(0);
     format!("{}:{}", pid, start_ticks)
+}
+
+fn configured_privileged_stdio_log_path() -> Option<PathBuf> {
+    let value = std::env::var_os("TUNMUX_PRIVILEGED_STDIO_LOG")?;
+    let path = PathBuf::from(value);
+    if path.as_os_str().is_empty() {
+        return None;
+    }
+    Some(path)
 }
 
 fn process_start_ticks(pid: u32) -> Option<u64> {
@@ -644,4 +747,53 @@ fn shell_quote(value: &str) -> String {
     }
     let escaped = value.replace('\'', "'\"'\"'");
     format!("'{}'", escaped)
+}
+
+fn request_kind(request: &PrivilegedRequest) -> &'static str {
+    match request {
+        PrivilegedRequest::NamespaceCreate { .. } => "NamespaceCreate",
+        PrivilegedRequest::NamespaceDelete { .. } => "NamespaceDelete",
+        PrivilegedRequest::NamespaceExists { .. } => "NamespaceExists",
+        PrivilegedRequest::InterfaceCreateWireguard { .. } => "InterfaceCreateWireguard",
+        PrivilegedRequest::InterfaceDelete { .. } => "InterfaceDelete",
+        PrivilegedRequest::InterfaceMoveToNetns { .. } => "InterfaceMoveToNetns",
+        PrivilegedRequest::NetnsExec { .. } => "NetnsExec",
+        PrivilegedRequest::HostIpAddrAdd { .. } => "HostIpAddrAdd",
+        PrivilegedRequest::HostIpLinkSetUp { .. } => "HostIpLinkSetUp",
+        PrivilegedRequest::HostIpRouteAdd { .. } => "HostIpRouteAdd",
+        PrivilegedRequest::HostIpRouteDel { .. } => "HostIpRouteDel",
+        PrivilegedRequest::WireguardSet { .. } => "WireguardSet",
+        PrivilegedRequest::WireguardSetPsk { .. } => "WireguardSetPsk",
+        PrivilegedRequest::WgQuickRun { .. } => "WgQuickRun",
+        PrivilegedRequest::EnsureDir { .. } => "EnsureDir",
+        PrivilegedRequest::WriteFile { .. } => "WriteFile",
+        PrivilegedRequest::RemoveDirAll { .. } => "RemoveDirAll",
+        PrivilegedRequest::KillPid { .. } => "KillPid",
+        PrivilegedRequest::SpawnProxyDaemon { .. } => "SpawnProxyDaemon",
+        PrivilegedRequest::LeaseAcquire { .. } => "LeaseAcquire",
+        PrivilegedRequest::LeaseRelease { .. } => "LeaseRelease",
+        PrivilegedRequest::ShutdownIfIdle => "ShutdownIfIdle",
+    }
+}
+
+fn run_sudo_validate_with_timeout(timeout: Duration) -> std::io::Result<bool> {
+    let mut child = Command::new("sudo").arg("-v").spawn()?;
+    let deadline = Instant::now() + timeout;
+    loop {
+        if let Some(status) = child.try_wait()? {
+            return Ok(status.success());
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                format!(
+                    "sudo authentication prompt timed out after {}s",
+                    timeout.as_secs()
+                ),
+            ));
+        }
+        thread::sleep(Duration::from_millis(100));
+    }
 }

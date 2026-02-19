@@ -232,10 +232,13 @@ Autostart behavior:
 - Optional autostop modes for autostarted daemons:
   - `privileged_autostop_mode = "command"`: uses command-scope lease refcount and explicit `shutdown-if-idle` when the command exits.
   - `privileged_autostop_mode = "timeout"`: exits after `privileged_autostop_timeout_ms` of idle time.
+- `KillPid` authorization is file-backed with stale cleanup via `/run/tunmux/managed-pids/*.start`.
 
 Recommended sudoers entry (example):
 
 ```bash
+<user-or-group> ALL=(root) NOPASSWD: /usr/bin/tunmux privileged --serve --autostarted --authorized-group tunmux
+<user-or-group> ALL=(root) NOPASSWD: /usr/bin/tunmux privileged --serve --autostarted --authorized-group tunmux --idle-timeout-ms *
 <user-or-group> ALL=(root) NOPASSWD: /usr/bin/tunmux privileged --serve --authorized-group tunmux
 ```
 
@@ -256,14 +259,12 @@ files. No automatic migration -- after enabling keyring, run
 
 ### Data directory
 
-Session and connection state stored in `~/.config/tunmux/`:
+User config/session/connection state stored in `~/.config/tunmux/`:
 
     ~/.config/tunmux/
       config.toml              # user preferences (optional)
       connections/             # multi-instance connection state
         us-1.json              # proxy instance state
-        us-1.pid               # proxy daemon PID
-        us-1.log               # proxy daemon log
         _direct.json           # direct (non-proxy) connection state
       proton/
         session.json           # Proton VPN credentials and keys
@@ -271,6 +272,20 @@ Session and connection state stored in `~/.config/tunmux/`:
         session.json           # AirVPN credentials and WG keys
         manifest.json          # cached server list
         web_session.json       # web session cookies and CSRF tokens
+
+Privileged runtime state:
+
+    /run/tunmux/
+      ctl.sock                 # privileged control socket
+      managed-pids/
+        <pid>.start            # file-backed managed PID authorization entries
+
+    /var/lib/tunmux/
+      proxy/
+        <instance>.pid         # proxy daemon PID file
+        <instance>.log         # proxy daemon log file
+      wg/
+        <provider>/<iface>.conf  # transient wg-quick config files
 
 ## Verbose logging
 
