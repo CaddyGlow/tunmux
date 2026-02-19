@@ -8,7 +8,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpStream, UdpSocket};
 use tokio::sync::RwLock;
 use tokio::task::AbortHandle;
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
 
 // SOCKS5 constants
 const SOCKS_VERSION: u8 = 0x05;
@@ -84,6 +84,7 @@ pub async fn handle_socks5(
     mut client: TcpStream,
     associations: Arc<UdpAssociations>,
     udp_relay: Option<(Arc<UdpSocket>, SocketAddr)>,
+    access_log: bool,
 ) -> anyhow::Result<()> {
     // 1. Greeting: client sends version + method list
     let ver = client.read_u8().await?;
@@ -110,8 +111,10 @@ pub async fn handle_socks5(
     let atyp = client.read_u8().await?;
 
     match cmd {
-        CMD_CONNECT => handle_connect(client, atyp).await,
-        CMD_UDP_ASSOCIATE => handle_udp_associate(client, atyp, associations, udp_relay).await,
+        CMD_CONNECT => handle_connect(client, atyp, access_log).await,
+        CMD_UDP_ASSOCIATE => {
+            handle_udp_associate(client, atyp, associations, udp_relay, access_log).await
+        }
         _ => {
             send_reply(&mut client, REP_CMD_NOT_SUPPORTED, None).await?;
             anyhow::bail!("unsupported SOCKS command: {}", cmd);
@@ -147,10 +150,16 @@ async fn parse_address(client: &mut TcpStream, atyp: u8) -> anyhow::Result<(Stri
     Ok((addr, port))
 }
 
-async fn handle_connect(mut client: TcpStream, atyp: u8) -> anyhow::Result<()> {
+async fn handle_connect(mut client: TcpStream, atyp: u8, access_log: bool) -> anyhow::Result<()> {
     let (addr, port) = parse_address(&mut client, atyp).await?;
     let target = format!("{}:{}", addr, port);
+    let peer_addr = client.peer_addr().ok().map(|addr| addr.to_string());
     debug!( target = ?target.as_str(), "socks5_connect_start");
+    if access_log {
+        info!(
+            peer_addr = ?peer_addr,
+            target = ?target.as_str(), "proxy_socks5_access_connect");
+    }
 
     match TcpStream::connect(&target).await {
         Ok(mut remote) => {
@@ -176,6 +185,7 @@ async fn handle_udp_associate(
     atyp: u8,
     associations: Arc<UdpAssociations>,
     udp_relay: Option<(Arc<UdpSocket>, SocketAddr)>,
+    access_log: bool,
 ) -> anyhow::Result<()> {
     let (addr_str, port) = parse_address(&mut client, atyp).await?;
 
@@ -198,6 +208,11 @@ async fn handle_udp_associate(
     };
 
     debug!( key = ?assoc_key.to_string(), "socks5_udp_associate_start");
+    if access_log {
+        info!(
+            peer_addr = ?peer_addr.to_string(),
+            key = ?assoc_key.to_string(), "proxy_socks5_access_udp_associate");
+    }
 
     // Create outbound socket in VPN namespace (current namespace after setns)
     let outbound = Arc::new(UdpSocket::bind("0.0.0.0:0").await?);
@@ -503,7 +518,13 @@ mod tests {
     ) {
         tokio::spawn(async move {
             let (stream, _) = proxy_listener.accept().await.unwrap();
-            let _ = handle_socks5(stream, associations, Some((relay_socket, relay_addr))).await;
+            let _ = handle_socks5(
+                stream,
+                associations,
+                Some((relay_socket, relay_addr)),
+                false,
+            )
+            .await;
         });
     }
 

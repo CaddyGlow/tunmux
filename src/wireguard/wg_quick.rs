@@ -2,7 +2,7 @@ use crate::config;
 use crate::error::Result;
 use crate::privileged_api::WgQuickAction;
 use crate::privileged_client::PrivilegedClient;
-use tracing::info;
+use tracing::{debug, info};
 
 /// Write the WireGuard config and bring up the interface.
 pub fn up(
@@ -47,6 +47,7 @@ pub fn down(interface_name: &str, provider: config::Provider) -> Result<()> {
 /// Check if a WireGuard interface is currently active.
 #[must_use]
 pub fn is_interface_active(interface_name: &str) -> bool {
+    debug!(cmd = format!("ip link show {}", interface_name), "exec");
     std::process::Command::new("ip")
         .args(["link", "show", interface_name])
         .output()

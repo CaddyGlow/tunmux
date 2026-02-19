@@ -23,6 +23,7 @@ pub fn run(
     netns_name: &str,
     socks_port: u16,
     http_port: u16,
+    proxy_access_log: bool,
     pid_file: &str,
     log_file: &str,
 ) -> anyhow::Result<()> {
@@ -96,7 +97,8 @@ pub fn run(
     info!(
         pid = ?pid,
         listeners = ?bound.join(", "),
-        netns = ?netns_name, "proxy_daemon_started");
+        netns = ?netns_name,
+        access_log = ?proxy_access_log, "proxy_daemon_started");
 
     // 5. Enter VPN namespace -- all subsequent socket connections go through the VPN.
     //    setns(CLONE_NEWNET) only switches the network namespace; it does NOT
@@ -279,21 +281,25 @@ pub fn run(
                     let assoc = associations.clone();
                     let relay = udp_relay4.clone();
                     handle_accept(result, "SOCKS5", move |stream| {
-                        socks5::handle_socks5(stream, assoc, relay)
+                        socks5::handle_socks5(stream, assoc, relay, proxy_access_log)
                     });
                 }
                 result = accept_opt(&socks6) => {
                     let assoc = associations.clone();
                     let relay = udp_relay6.clone();
                     handle_accept(result, "SOCKS5", move |stream| {
-                        socks5::handle_socks5(stream, assoc, relay)
+                        socks5::handle_socks5(stream, assoc, relay, proxy_access_log)
                     });
                 }
                 result = accept_opt(&http4) => {
-                    handle_accept(result, "HTTP", http::handle_http);
+                    handle_accept(result, "HTTP", move |stream| {
+                        http::handle_http(stream, proxy_access_log)
+                    });
                 }
                 result = accept_opt(&http6) => {
-                    handle_accept(result, "HTTP", http::handle_http);
+                    handle_accept(result, "HTTP", move |stream| {
+                        http::handle_http(stream, proxy_access_log)
+                    });
                 }
             }
         }

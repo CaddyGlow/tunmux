@@ -7,6 +7,7 @@ pub mod daemon {
         _netns_name: &str,
         _socks_port: u16,
         _http_port: u16,
+        _proxy_access_log: bool,
         _pid_file: &str,
         _log_file: &str,
     ) -> anyhow::Result<()> {
@@ -21,6 +22,7 @@ pub mod socks5 {}
 pub struct ProxyConfig {
     pub socks_port: u16,
     pub http_port: u16,
+    pub access_log: bool,
 }
 
 /// Sanitize a server name into a valid instance name.
@@ -65,6 +67,7 @@ pub fn next_available_ports() -> anyhow::Result<ProxyConfig> {
     Ok(ProxyConfig {
         socks_port: 1080,
         http_port: 8118,
+        access_log: false,
     })
 }
 

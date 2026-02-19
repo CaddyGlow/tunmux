@@ -630,12 +630,14 @@ fn dispatch(request: PrivilegedRequest, control_state: &mut ControlState) -> Pri
             netns,
             socks_port,
             http_port,
+            proxy_access_log,
             pid_file,
             log_file,
         } => match spawn_proxy_daemon(
             netns.as_str(),
             socks_port,
             http_port,
+            proxy_access_log,
             pid_file.as_str(),
             log_file.as_str(),
         ) {
@@ -769,7 +771,13 @@ fn wg_set(
     endpoint: &str,
     allowed_ips: &str,
 ) -> Result<()> {
-    debug!(cmd = format!("wg set {} peer {} allowed-ips {} endpoint {}", interface, peer_public_key, allowed_ips, endpoint), "exec");
+    debug!(
+        cmd = format!(
+            "wg set {} peer {} allowed-ips {} endpoint {}",
+            interface, peer_public_key, allowed_ips, endpoint
+        ),
+        "exec"
+    );
     let mut child = Command::new("wg")
         .args([
             "set",
@@ -806,7 +814,13 @@ fn wg_set(
 }
 
 fn set_preshared_key(interface: &str, peer_public_key: &str, psk: &str) -> Result<()> {
-    debug!(cmd = format!("wg set {} peer {} preshared-key", interface, peer_public_key), "exec");
+    debug!(
+        cmd = format!(
+            "wg set {} peer {} preshared-key",
+            interface, peer_public_key
+        ),
+        "exec"
+    );
     let mut child = Command::new("wg")
         .args([
             "set",
@@ -841,6 +855,7 @@ fn spawn_proxy_daemon(
     netns: &str,
     socks_port: u16,
     http_port: u16,
+    proxy_access_log: bool,
     pid_file: &str,
     log_file: &str,
 ) -> Result<u32> {
@@ -862,20 +877,23 @@ fn spawn_proxy_daemon(
 
     let mut command = Command::new(exe);
     command.arg0("tunmux");
+    command.args([
+        "proxy-daemon",
+        "--netns",
+        netns,
+        "--socks-port",
+        socks.as_str(),
+        "--http-port",
+        http.as_str(),
+        "--pid-file",
+        pid_file,
+        "--log-file",
+        log_file,
+    ]);
+    if proxy_access_log {
+        command.arg("--proxy-access-log");
+    }
     let mut child = command
-        .args([
-            "proxy-daemon",
-            "--netns",
-            netns,
-            "--socks-port",
-            socks.as_str(),
-            "--http-port",
-            http.as_str(),
-            "--pid-file",
-            pid_file,
-            "--log-file",
-            log_file,
-        ])
         .stderr(Stdio::piped())
         .stdout(Stdio::null())
         .spawn()

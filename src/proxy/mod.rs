@@ -17,6 +17,7 @@ use crate::privileged_client::PrivilegedClient;
 pub struct ProxyConfig {
     pub socks_port: u16,
     pub http_port: u16,
+    pub access_log: bool,
 }
 
 /// Sanitize a server name into a valid instance name.
@@ -64,6 +65,7 @@ pub fn spawn_daemon(
         netns_name,
         proxy_config.socks_port,
         proxy_config.http_port,
+        proxy_config.access_log,
         &pid_path.to_string_lossy(),
         &log_path.to_string_lossy(),
     )?;
@@ -97,6 +99,7 @@ pub fn next_available_ports() -> anyhow::Result<ProxyConfig> {
     Ok(ProxyConfig {
         socks_port,
         http_port,
+        access_log: false,
     })
 }
 

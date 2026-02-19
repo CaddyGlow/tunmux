@@ -62,11 +62,18 @@ fn main() {
             netns,
             socks_port,
             http_port,
+            proxy_access_log,
             pid_file,
             log_file,
         } => {
-            if let Err(e) = proxy::daemon::run(&netns, socks_port, http_port, &pid_file, &log_file)
-            {
+            if let Err(e) = proxy::daemon::run(
+                &netns,
+                socks_port,
+                http_port,
+                proxy_access_log,
+                &pid_file,
+                &log_file,
+            ) {
                 eprintln!("proxy-daemon error: {}", e);
                 std::process::exit(1);
             }

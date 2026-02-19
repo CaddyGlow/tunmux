@@ -31,9 +31,18 @@ pub async fn dispatch(command: ProtonCommand, config: &AppConfig) -> anyhow::Res
             proxy,
             socks_port,
             http_port,
+            proxy_access_log,
         } => {
             cmd_connect(
-                server, country, p2p, backend, proxy, socks_port, http_port, config,
+                server,
+                country,
+                p2p,
+                backend,
+                proxy,
+                socks_port,
+                http_port,
+                proxy_access_log,
+                config,
             )
             .await
         }
@@ -179,6 +188,7 @@ async fn cmd_connect(
     use_proxy: bool,
     socks_port_arg: Option<u16>,
     http_port_arg: Option<u16>,
+    proxy_access_log_arg: bool,
     config: &AppConfig,
 ) -> anyhow::Result<()> {
     let backend_str = backend_arg.as_deref().unwrap_or(&config.general.backend);
@@ -206,6 +216,7 @@ async fn cmd_connect(
 
     // Apply config defaults -- CLI flags override config
     let effective_country = country.or_else(|| config.proton.default_country.clone());
+    let proxy_access_log = proxy_access_log_arg || config.general.proxy_access_log;
 
     let session: models::session::Session = config::load_session(PROVIDER, config)?;
     let mut servers = load_servers_cached_or_fetch(&session).await?;
@@ -265,7 +276,13 @@ async fn cmd_connect(
     };
 
     if use_proxy {
-        connect_proxy(server, &params, socks_port_arg, http_port_arg)?;
+        connect_proxy(
+            server,
+            &params,
+            socks_port_arg,
+            http_port_arg,
+            proxy_access_log,
+        )?;
     } else {
         connect_direct(server, &params, backend, config)?;
     }
@@ -278,6 +295,7 @@ fn connect_proxy(
     params: &wireguard::config::WgConfigParams<'_>,
     socks_port_arg: Option<u16>,
     http_port_arg: Option<u16>,
+    proxy_access_log: bool,
 ) -> anyhow::Result<()> {
     let instance = proxy::instance_name(&server.name);
 
@@ -298,6 +316,7 @@ fn connect_proxy(
         proxy::ProxyConfig {
             socks_port: sp,
             http_port: hp,
+            access_log: proxy_access_log,
         }
     } else {
         let mut auto = proxy::next_available_ports()?;
@@ -307,6 +326,7 @@ fn connect_proxy(
         if let Some(hp) = http_port_arg {
             auto.http_port = hp;
         }
+        auto.access_log = proxy_access_log;
         auto
     };
 

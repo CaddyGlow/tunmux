@@ -1,6 +1,7 @@
 use std::process::Command;
 
 use crate::error::{AppError, Result};
+use tracing::debug;
 use crate::netns;
 use crate::privileged_client::PrivilegedClient;
 
@@ -225,6 +226,7 @@ fn is_systemd_resolved_managed_resolv_conf(path: &str) -> bool {
 
 /// Parse the default gateway IP and interface from `ip route show default`.
 fn get_default_gateway() -> Result<(String, String)> {
+    debug!(cmd = "ip route show default", "exec");
     let output = Command::new("ip")
         .args(["route", "show", "default"])
         .output()

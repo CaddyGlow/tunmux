@@ -2,9 +2,10 @@
 
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpStream;
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
 
-pub async fn handle_http(client: TcpStream) -> anyhow::Result<()> {
+pub async fn handle_http(client: TcpStream, access_log: bool) -> anyhow::Result<()> {
+    let peer_addr = client.peer_addr().ok().map(|addr| addr.to_string());
     let mut buf_client = BufReader::new(client);
 
     // Read the request line
@@ -23,6 +24,13 @@ pub async fn handle_http(client: TcpStream) -> anyhow::Result<()> {
     let method = parts[0];
     let target = parts[1];
     let version = parts[2];
+
+    if access_log {
+        info!(
+            peer_addr = ?peer_addr,
+            method = ?method,
+            target = ?target, "proxy_http_access");
+    }
 
     if method.eq_ignore_ascii_case("CONNECT") {
         handle_connect(buf_client, target).await
@@ -296,7 +304,7 @@ mod tests {
 
         tokio::spawn(async move {
             let (stream, _) = proxy_listener.accept().await.unwrap();
-            let _ = handle_http(stream).await;
+            let _ = handle_http(stream, false).await;
         });
 
         let mut client = TcpStream::connect(proxy_addr).await.unwrap();
@@ -332,7 +340,7 @@ mod tests {
 
         tokio::spawn(async move {
             let (stream, _) = proxy_listener.accept().await.unwrap();
-            let _ = handle_http(stream).await;
+            let _ = handle_http(stream, false).await;
         });
 
         let mut client = TcpStream::connect(proxy_addr).await.unwrap();
@@ -359,7 +367,7 @@ mod tests {
 
         tokio::spawn(async move {
             let (stream, _) = proxy_listener.accept().await.unwrap();
-            let _ = handle_http(stream).await;
+            let _ = handle_http(stream, false).await;
         });
 
         let mut client = TcpStream::connect(proxy_addr).await.unwrap();

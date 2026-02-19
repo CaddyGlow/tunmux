@@ -334,6 +334,7 @@ impl PrivilegedClient {
         netns: &str,
         socks_port: u16,
         http_port: u16,
+        proxy_access_log: bool,
         pid_file: &str,
         log_file: &str,
     ) -> Result<u32> {
@@ -341,6 +342,7 @@ impl PrivilegedClient {
             netns: netns.to_string(),
             socks_port,
             http_port,
+            proxy_access_log,
             pid_file: pid_file.to_string(),
             log_file: log_file.to_string(),
         })? {
@@ -819,6 +821,7 @@ impl PrivilegedClient {
                 log_path.display()
             );
         }
+        debug!(cmd = "sudo -n -b tunmux privileged --serve", "exec");
         let status = command
             .status()
             .map_err(|e| map_sudo_spawn_error(e, self.manual_start_command()))?;
@@ -826,6 +829,7 @@ impl PrivilegedClient {
     }
 
     fn run_sudo_non_interactive_probe(&self) -> Result<std::process::Output> {
+        debug!(cmd = "sudo -n -v", "exec");
         Command::new("sudo")
             .arg("-n")
             .arg("-v")
@@ -1135,6 +1139,7 @@ fn request_kind(request: &PrivilegedRequest) -> &'static str {
 }
 
 fn run_sudo_validate_with_timeout(timeout: Duration) -> std::io::Result<bool> {
+    debug!(cmd = "sudo -v", "exec");
     let mut child = Command::new("sudo").arg("-v").spawn()?;
     let deadline = Instant::now() + timeout;
     loop {

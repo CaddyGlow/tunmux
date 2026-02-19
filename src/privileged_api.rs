@@ -105,6 +105,7 @@ pub enum PrivilegedRequest {
         netns: String,
         socks_port: u16,
         http_port: u16,
+        proxy_access_log: bool,
         pid_file: String,
         log_file: String,
     },
@@ -223,6 +224,7 @@ impl PrivilegedRequest {
                 netns,
                 socks_port,
                 http_port,
+                proxy_access_log: _,
                 pid_file,
                 log_file,
             } => {

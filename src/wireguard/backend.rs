@@ -2,6 +2,7 @@ use std::fmt;
 use std::process::Command;
 
 use serde::{Deserialize, Serialize};
+use tracing::debug;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
@@ -53,6 +54,7 @@ impl fmt::Display for WgBackend {
 }
 
 fn wg_quick_on_path() -> bool {
+    debug!(cmd = "which wg-quick", "exec");
     Command::new("which")
         .arg("wg-quick")
         .output()

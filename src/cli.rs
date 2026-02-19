@@ -38,6 +38,8 @@ pub enum TopCommand {
         #[arg(long)]
         http_port: u16,
         #[arg(long)]
+        proxy_access_log: bool,
+        #[arg(long)]
         pid_file: String,
         #[arg(long)]
         log_file: String,
@@ -120,6 +122,10 @@ pub enum ProtonCommand {
         /// HTTP proxy port (default: auto-assign from 8118)
         #[arg(long)]
         http_port: Option<u16>,
+
+        /// Enable proxy access logging to the instance log file
+        #[arg(long)]
+        proxy_access_log: bool,
     },
 
     /// Disconnect from VPN
@@ -183,6 +189,10 @@ pub enum AirVpnCommand {
         /// HTTP proxy port (default: auto-assign from 8118)
         #[arg(long)]
         http_port: Option<u16>,
+
+        /// Enable proxy access logging to the instance log file
+        #[arg(long)]
+        proxy_access_log: bool,
     },
 
     /// Disconnect from VPN

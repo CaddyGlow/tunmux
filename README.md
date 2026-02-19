@@ -87,6 +87,9 @@ and proxy ports.
     # Explicit ports
     tunmux proton connect --proxy --country JP --socks-port 9050 --http-port 3128
 
+    # Enable access logs for this proxy instance
+    tunmux proton connect --proxy --proxy-access-log --country US
+
     # Use the proxy
     curl --socks5 127.0.0.1:1080 https://api.ipify.org    # US exit
     curl --socks5 127.0.0.1:1081 https://api.ipify.org    # CH exit
@@ -128,6 +131,7 @@ and proxy ports.
 
     tunmux airvpn connect --proxy --country IT
     tunmux airvpn connect --proxy Castor --socks-port 9060 --http-port 3129
+    tunmux airvpn connect --proxy --proxy-access-log --country NL
     tunmux airvpn disconnect castor
     tunmux airvpn disconnect --all
 
@@ -200,6 +204,7 @@ are optional; a missing file means all defaults apply.
     [general]
     backend = "auto"              # default WireGuard backend: auto, wg-quick, userspace, kernel
     credential_store = "keyring"  # "keyring" or "file" (requires --features keyring)
+    proxy_access_log = false      # default for --proxy-access-log
     privileged_transport = "socket"  # socket (default) or stdio
     privileged_autostart = true
     privileged_autostart_timeout_ms = 5000
