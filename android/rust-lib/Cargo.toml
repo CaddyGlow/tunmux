@@ -1,0 +1,17 @@
+[package]
+name = "tunmux-android"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+crate-type = ["cdylib"]
+name = "tunmux_android"
+
+[dependencies]
+tunmux = { path = "../..", default-features = false }
+jni = "0.21"
+tokio = { version = "1", features = ["rt-multi-thread", "sync", "macros"] }
+serde_json = "1"
+log = "0.4"
+android_logger = "0.14"
+libc = "0.2"

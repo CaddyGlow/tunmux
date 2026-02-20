@@ -810,20 +810,22 @@ fn run_wg_quick_down(path: &std::path::Path) -> Result<()> {
 }
 
 fn run_wg_show(interface: &str) -> Result<String> {
-    use std::io::BufRead;
-
     let socket_path = std::path::PathBuf::from("/var/run/wireguard")
         .join(format!("{interface}.sock"));
 
-    if !socket_path.exists() {
-        return Err(AppError::WireGuard(format!(
-            "no UAPI socket at {} — is the interface active and using the userspace backend?",
-            socket_path.display()
-        )));
+    if socket_path.exists() {
+        run_wg_show_uapi(interface, &socket_path)
+    } else {
+        // Kernel backend: no UAPI socket; wg is already a dependency of WireguardSet.
+        run_wg_show_kernel(interface)
     }
+}
+
+fn run_wg_show_uapi(interface: &str, socket_path: &std::path::Path) -> Result<String> {
+    use std::io::BufRead;
 
     debug!(socket = ?socket_path.display().to_string(), "uapi_get");
-    let mut stream = UnixStream::connect(&socket_path)
+    let mut stream = UnixStream::connect(socket_path)
         .map_err(|e| AppError::WireGuard(format!("UAPI connect: {e}")))?;
     std::io::Write::write_all(&mut stream, b"get=1\n\n")
         .map_err(|e| AppError::WireGuard(format!("UAPI write: {e}")))?;
@@ -849,6 +851,11 @@ fn run_wg_show(interface: &str) -> Result<String> {
     }
 
     format_wg_show(&raw, interface)
+}
+
+fn run_wg_show_kernel(interface: &str) -> Result<String> {
+    let uapi_text = crate::wireguard::netlink::wg_get_uapi(interface)?;
+    format_wg_show(&uapi_text, interface)
 }
 
 fn format_wg_show(raw: &str, interface: &str) -> Result<String> {
@@ -1061,84 +1068,17 @@ fn wg_set(
     endpoint: &str,
     allowed_ips: &str,
 ) -> Result<()> {
-    debug!(
-        cmd = format!(
-            "wg set {} peer {} allowed-ips {} endpoint {}",
-            interface, peer_public_key, allowed_ips, endpoint
-        ),
-        "exec"
-    );
-    let mut child = Command::new("wg")
-        .args([
-            "set",
-            interface,
-            "private-key",
-            "/dev/stdin",
-            "peer",
-            peer_public_key,
-            "allowed-ips",
-            allowed_ips,
-            "endpoint",
-            endpoint,
-        ])
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()?;
-    {
-        let stdin = child
-            .stdin
-            .as_mut()
-            .ok_or_else(|| AppError::WireGuard("failed to open stdin for wg set".into()))?;
-        stdin.write_all(private_key.as_bytes())?;
-    }
-
-    let output = child.wait_with_output()?;
-    if !output.status.success() {
-        return Err(AppError::WireGuard(format!(
-            "wg set failed: {}",
-            String::from_utf8_lossy(&output.stderr).trim()
-        )));
-    }
-    Ok(())
+    crate::wireguard::netlink::wg_set_device(
+        interface,
+        private_key,
+        peer_public_key,
+        endpoint,
+        allowed_ips,
+    )
 }
 
 fn set_preshared_key(interface: &str, peer_public_key: &str, psk: &str) -> Result<()> {
-    debug!(
-        cmd = format!(
-            "wg set {} peer {} preshared-key",
-            interface, peer_public_key
-        ),
-        "exec"
-    );
-    let mut child = Command::new("wg")
-        .args([
-            "set",
-            interface,
-            "peer",
-            peer_public_key,
-            "preshared-key",
-            "/dev/stdin",
-        ])
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()?;
-    {
-        let stdin = child.stdin.as_mut().ok_or_else(|| {
-            AppError::WireGuard("failed to open stdin for wg set preshared-key".into())
-        })?;
-        stdin.write_all(psk.as_bytes())?;
-    }
-
-    let output = child.wait_with_output()?;
-    if !output.status.success() {
-        return Err(AppError::WireGuard(format!(
-            "wg set preshared-key failed: {}",
-            String::from_utf8_lossy(&output.stderr).trim()
-        )));
-    }
-    Ok(())
+    crate::wireguard::netlink::wg_set_psk(interface, peer_public_key, psk)
 }
 
 fn spawn_proxy_daemon(

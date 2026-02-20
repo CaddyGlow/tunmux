@@ -40,6 +40,7 @@ pub struct UdpAssociations {
 }
 
 impl UdpAssociations {
+    #[allow(clippy::new_without_default)]
     pub fn new() -> Self {
         Self {
             inner: RwLock::new(HashMap::new()),

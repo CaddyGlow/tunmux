@@ -175,6 +175,7 @@ impl Drop for CommandScopeGuard {
 }
 
 impl PrivilegedClient {
+    #[allow(clippy::new_without_default)]
     pub fn new() -> Self {
         let cfg = config::load_config();
         let autostop_mode = cfg.general.privileged_autostop_mode;
