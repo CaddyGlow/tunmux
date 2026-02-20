@@ -63,6 +63,7 @@ pub async fn dispatch(command: AirVpnCommand, config: &AppConfig) -> anyhow::Res
             )
             .await
         }
+        AirVpnCommand::WgShow => cmd_wg_show(),
     }
 }
 
@@ -341,6 +342,7 @@ async fn cmd_connect(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn connect_proxy(
     server_name: &str,
     country_code: &str,
@@ -447,12 +449,13 @@ fn connect_direct(
     match backend {
         wireguard::backend::WgBackend::WgQuick => {
             let wg_config = wireguard::config::generate_config(params);
-            wireguard::wg_quick::up(&wg_config, INTERFACE_NAME, PROVIDER, false)?;
+            let effective_iface =
+                wireguard::wg_quick::up(&wg_config, INTERFACE_NAME, PROVIDER, false)?;
 
             let state = wireguard::connection::ConnectionState {
                 instance_name: DIRECT_INSTANCE.to_string(),
                 provider: PROVIDER.dir_name().to_string(),
-                interface_name: INTERFACE_NAME.to_string(),
+                interface_name: effective_iface,
                 backend,
                 server_endpoint: format!("{}:{}", server_ip, server_port),
                 server_display_name: server_name.to_string(),
@@ -619,6 +622,16 @@ fn disconnect_instance_direct() -> anyhow::Result<()> {
     if let Some(state) = wireguard::connection::ConnectionState::load(DIRECT_INSTANCE)? {
         disconnect_one(&state)?;
     }
+    Ok(())
+}
+
+fn cmd_wg_show() -> anyhow::Result<()> {
+    use wireguard::connection::DIRECT_INSTANCE;
+    let state = wireguard::connection::ConnectionState::load(DIRECT_INSTANCE)?
+        .ok_or_else(|| anyhow::anyhow!("not connected (no active direct connection)"))?;
+    let client = crate::privileged_client::PrivilegedClient::new();
+    let output = client.wg_show(&state.interface_name)?;
+    print!("{}", output);
     Ok(())
 }
 

@@ -150,6 +150,9 @@ pub enum ProtonCommand {
         #[arg(long)]
         all: bool,
     },
+
+    /// Show WireGuard tunnel state for the active connection (all backends)
+    WgShow,
 }
 
 #[derive(Subcommand)]
@@ -283,6 +286,9 @@ pub enum AirVpnCommand {
         #[command(subcommand)]
         action: ApiKeyAction,
     },
+
+    /// Show WireGuard tunnel state for the active connection (all backends)
+    WgShow,
 }
 
 #[derive(Subcommand)]
@@ -367,6 +373,9 @@ pub enum MullvadCommand {
         #[arg(long)]
         all: bool,
     },
+
+    /// Show WireGuard tunnel state for the active connection (all backends)
+    WgShow,
 }
 
 #[derive(Subcommand)]
@@ -451,6 +460,9 @@ pub enum IvpnCommand {
         #[arg(long)]
         all: bool,
     },
+
+    /// Show WireGuard tunnel state for the active connection (all backends)
+    WgShow,
 }
 
 #[derive(Subcommand)]

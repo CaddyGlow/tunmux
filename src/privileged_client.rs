@@ -323,6 +323,20 @@ impl PrivilegedClient {
         })
     }
 
+    /// Run `wg show <interface>` as root and return the output.
+    /// Works for kernel, wg-quick, and userspace (gotatun) backends.
+    #[allow(dead_code)]
+    pub fn wg_show(&self, interface: &str) -> Result<String> {
+        match self.send(PrivilegedRequest::WgShow {
+            interface: interface.to_string(),
+        })? {
+            PrivilegedResponse::Text(output) => Ok(output),
+            _ => Err(AppError::Other(
+                "invalid privileged response for WgShow".into(),
+            )),
+        }
+    }
+
     pub fn ensure_dir(&self, path: &str, mode: u32) -> Result<()> {
         self.send_unit(PrivilegedRequest::EnsureDir {
             path: path.to_string(),
@@ -697,6 +711,7 @@ impl PrivilegedClient {
         let lock_path = lock_dir.join("privileged-start.lock");
         let lock_file = fs::OpenOptions::new()
             .create(true)
+            .truncate(false)
             .read(true)
             .write(true)
             .open(&lock_path)
@@ -1178,6 +1193,7 @@ fn request_kind(request: &PrivilegedRequest) -> &'static str {
         PrivilegedRequest::LeaseAcquire { .. } => "LeaseAcquire",
         PrivilegedRequest::LeaseRelease { .. } => "LeaseRelease",
         PrivilegedRequest::ShutdownIfIdle => "ShutdownIfIdle",
+        PrivilegedRequest::WgShow { .. } => "WgShow",
     }
 }
 

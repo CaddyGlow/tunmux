@@ -370,6 +370,7 @@ fn describe_request(request: &PrivilegedRequest) -> &'static str {
         PrivilegedRequest::LeaseAcquire { .. } => "LeaseAcquire",
         PrivilegedRequest::LeaseRelease { .. } => "LeaseRelease",
         PrivilegedRequest::ShutdownIfIdle => "ShutdownIfIdle",
+        PrivilegedRequest::WgShow { .. } => "WgShow",
     }
 }
 
@@ -712,6 +713,14 @@ fn dispatch(request: PrivilegedRequest, control_state: &mut ControlState) -> Pri
                 remaining_leases = ?control_state.leases.len(), "privileged_shutdown_if_idle_requested");
             PrivilegedResponse::Bool(control_state.leases.is_empty())
         }
+
+        PrivilegedRequest::WgShow { interface } => match run_wg_show(interface.as_str()) {
+            Ok(output) => PrivilegedResponse::Text(output),
+            Err(e) => PrivilegedResponse::Error {
+                code: categorize_error(&e),
+                message: format!("{}", e),
+            },
+        },
     }
 }
 
@@ -795,6 +804,22 @@ fn run_wg_quick_down(path: &std::path::Path) -> Result<()> {
         )));
     }
     Ok(())
+}
+
+fn run_wg_show(interface: &str) -> Result<String> {
+    debug!(cmd = format!("wg show {}", interface), "exec");
+    let output = Command::new("wg")
+        .args(["show", interface])
+        .output()
+        .map_err(|e| AppError::WireGuard(format!("wg show failed to run: {}", e)))?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        return Err(AppError::WireGuard(format!(
+            "wg show exited {}: {}",
+            output.status, stderr
+        )));
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).into_owned())
 }
 
 fn run_gotatun_up(interface: &str, config_content: &str) -> Result<()> {

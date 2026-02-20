@@ -127,6 +127,13 @@ pub enum PrivilegedRequest {
         token: String,
     },
     ShutdownIfIdle,
+
+    /// Run `wg show <interface>` and return the output (works for kernel, wg-quick, and
+    /// userspace backends since the `wg` tool reads the UAPI socket at
+    /// `/var/run/wireguard/<interface>.sock` for userspace interfaces).
+    WgShow {
+        interface: String,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -135,6 +142,7 @@ pub enum PrivilegedResponse {
     Unit,
     Bool(bool),
     Pid(u32),
+    Text(String),
     Error { code: String, message: String },
 }
 
@@ -262,6 +270,7 @@ impl PrivilegedRequest {
                 validate_lease_token(token)
             }
             Self::ShutdownIfIdle => Ok(()),
+            Self::WgShow { interface } => validate_interface_name(interface),
         }
     }
 }
@@ -290,8 +299,20 @@ fn validate_interface_name(interface: &str) -> Result<(), String> {
     if matches!(interface, "proton0" | "airvpn0" | "mullvad0" | "ivpn0") {
         return Ok(());
     }
+    // On macOS, WireGuard TUN interfaces are named utunN (kernel-assigned).
+    // "utun" (no number) is also accepted as the name passed to wg-quick on macOS.
+    if interface == "utun" {
+        return Ok(());
+    }
+    if let Some(suffix) = interface.strip_prefix("utun") {
+        if !suffix.is_empty() && suffix.chars().all(|c| c.is_ascii_digit()) && suffix.len() <= 3 {
+            return Ok(());
+        }
+    }
     if !interface.starts_with("wg-") {
-        return Err("interface must be proton0, airvpn0, mullvad0, ivpn0 or wg-*".into());
+        return Err(
+            "interface must be proton0, airvpn0, mullvad0, ivpn0, utun, utunN, or wg-*".into(),
+        );
     }
     let suffix = &interface["wg-".len()..];
     if suffix.is_empty() || suffix.len() > 12 {
@@ -391,6 +412,13 @@ mod tests {
     #[test]
     fn wg_prefixed_interfaces_are_allowed() {
         for iface in ["wg-a", "wg-us-sjc-507", "wg-51820"] {
+            assert!(validate_interface_name(iface).is_ok(), "iface {}", iface);
+        }
+    }
+
+    #[test]
+    fn utun_interfaces_are_allowed() {
+        for iface in ["utun", "utun0", "utun5", "utun99"] {
             assert!(validate_interface_name(iface).is_ok(), "iface {}", iface);
         }
     }

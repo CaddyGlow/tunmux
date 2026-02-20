@@ -1,5 +1,3 @@
-#![cfg(target_os = "linux")]
-
 use crate::error::{AppError, Result};
 use std::path::Path;
 

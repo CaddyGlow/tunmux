@@ -463,7 +463,7 @@ fn configure_network(
     #[cfg(target_os = "linux")]
     {
         let cleanup = configure_network_linux(interface, config)?;
-        return Ok(CleanupState::Linux(cleanup));
+        Ok(CleanupState::Linux(cleanup))
     }
 
     #[cfg(target_os = "macos")]

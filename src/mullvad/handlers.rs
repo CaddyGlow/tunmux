@@ -163,6 +163,7 @@ pub async fn dispatch(command: MullvadCommand, config: &AppConfig) -> anyhow::Re
             .await
         }
         MullvadCommand::Disconnect { instance, all } => cmd_disconnect(instance, all),
+        MullvadCommand::WgShow => cmd_wg_show(),
     }
 }
 
@@ -259,9 +260,9 @@ async fn login_with_client(
     let wg_public_key = keys.wg_public_key();
     let wg_private_key = keys.wg_private_key();
 
-    let access_token = fetch_access_token(&client, account_number).await?;
-    let account = fetch_account(&client, &access_token).await?;
-    let device = create_device(&client, &access_token, &wg_public_key).await?;
+    let access_token = fetch_access_token(client, account_number).await?;
+    let account = fetch_account(client, &access_token).await?;
+    let device = create_device(client, &access_token, &wg_public_key).await?;
 
     let session = MullvadSession {
         account_number: account_number.to_string(),
@@ -282,7 +283,7 @@ async fn login_with_client(
     config::save_session(PROVIDER, &session, config)?;
     save_account_id(account_number)?;
 
-    if let Ok(manifest) = fetch_manifest(&client).await {
+    if let Ok(manifest) = fetch_manifest(client).await {
         let _ = save_manifest(&manifest);
     }
 
@@ -562,12 +563,13 @@ fn connect_direct(
     match backend {
         wireguard::backend::WgBackend::WgQuick => {
             let wg_config = wireguard::config::generate_config(params);
-            wireguard::wg_quick::up(&wg_config, INTERFACE_NAME, PROVIDER, false)?;
+            let effective_iface =
+                wireguard::wg_quick::up(&wg_config, INTERFACE_NAME, PROVIDER, false)?;
 
             let state = wireguard::connection::ConnectionState {
                 instance_name: DIRECT_INSTANCE.to_string(),
                 provider: PROVIDER.dir_name().to_string(),
-                interface_name: INTERFACE_NAME.to_string(),
+                interface_name: effective_iface,
                 backend,
                 server_endpoint: format!("{}:{}", params.server_ip, params.server_port),
                 server_display_name: relay.hostname.clone(),
@@ -678,6 +680,16 @@ fn cmd_disconnect(instance: Option<String>, all: bool) -> anyhow::Result<()> {
         }
     }
 
+    Ok(())
+}
+
+fn cmd_wg_show() -> anyhow::Result<()> {
+    use wireguard::connection::DIRECT_INSTANCE;
+    let state = wireguard::connection::ConnectionState::load(DIRECT_INSTANCE)?
+        .ok_or_else(|| anyhow::anyhow!("not connected (no active direct connection)"))?;
+    let client = crate::privileged_client::PrivilegedClient::new();
+    let output = client.wg_show(&state.interface_name)?;
+    print!("{}", output);
     Ok(())
 }
 

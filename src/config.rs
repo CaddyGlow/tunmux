@@ -64,35 +64,25 @@ fn default_backend() -> &'static str {
     }
     #[cfg(not(target_os = "macos"))]
     {
-        return "wg-quick";
+        "wg-quick"
     }
 }
 
-#[derive(Debug, Clone, Copy, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PrivilegedAutostopMode {
+    #[default]
     Never,
     Command,
     Timeout,
 }
 
-impl Default for PrivilegedAutostopMode {
-    fn default() -> Self {
-        Self::Never
-    }
-}
-
-#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum PrivilegedTransport {
+    #[default]
     Socket,
     Stdio,
-}
-
-impl Default for PrivilegedTransport {
-    fn default() -> Self {
-        Self::Socket
-    }
 }
 
 #[derive(Debug, Default, Deserialize)]
