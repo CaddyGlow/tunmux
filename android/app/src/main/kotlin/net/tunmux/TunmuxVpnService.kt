@@ -15,6 +15,9 @@ class TunmuxVpnService : VpnService() {
         const val ACTION_DISCONNECT = "net.tunmux.action.DISCONNECT"
         const val EXTRA_PROVIDER = "net.tunmux.extra.PROVIDER"
         const val EXTRA_SERVER_JSON = "net.tunmux.extra.SERVER_JSON"
+        const val EXTRA_APP_MODE = "net.tunmux.extra.APP_MODE"
+        const val EXTRA_SPLIT_TUNNEL_APPS = "net.tunmux.extra.SPLIT_TUNNEL_APPS"
+        const val EXTRA_SPLIT_TUNNEL_ONLY_ALLOW_SELECTED = "net.tunmux.extra.SPLIT_TUNNEL_ONLY_ALLOW_SELECTED"
         private const val NOTIF_CHANNEL_ID = "tunmux_vpn"
         private const val NOTIF_ID = 1
         private const val TAG = "tunmux"
@@ -25,6 +28,9 @@ class TunmuxVpnService : VpnService() {
     }
 
     private var activeTunPfd: ParcelFileDescriptor? = null
+    private var appMode: String = "vpn"
+    private var splitTunnelApps: Set<String> = emptySet()
+    private var splitTunnelOnlyAllowSelected: Boolean = false
 
     // Called from Rust via JNI
     fun openTun(addresses: List<String>, routes: List<String>, dnsServers: List<String>, mtu: Int): Int {
@@ -49,6 +55,7 @@ class TunmuxVpnService : VpnService() {
             for (dns in dnsServers) {
                 builder.addDnsServer(dns)
             }
+            applyAppMode(builder)
             val pfd = builder.establish()
             if (pfd == null) {
                 Log.e(TAG, "openTun establish returned null")
@@ -60,6 +67,30 @@ class TunmuxVpnService : VpnService() {
         } catch (e: Exception) {
             Log.e(TAG, "openTun failed", e)
             -1
+        }
+    }
+
+    private fun applyAppMode(builder: Builder) {
+        if (!appMode.equals("split", ignoreCase = true)) return
+        if (splitTunnelApps.isEmpty()) return
+        var applied = 0
+        for (packageName in splitTunnelApps) {
+            try {
+                if (splitTunnelOnlyAllowSelected) {
+                    builder.addAllowedApplication(packageName)
+                } else {
+                    builder.addDisallowedApplication(packageName)
+                }
+                applied += 1
+            } catch (_: Exception) {
+                // Ignore stale/uninstalled app entries.
+            }
+        }
+        if (applied > 0) {
+            Log.i(
+                TAG,
+                "split-tunnel enabled mode=${if (splitTunnelOnlyAllowSelected) "allow-selected" else "exclude-selected"} apps=$applied",
+            )
         }
     }
 
@@ -91,6 +122,13 @@ class TunmuxVpnService : VpnService() {
             ACTION_CONNECT -> {
                 val provider = intent.getStringExtra(EXTRA_PROVIDER) ?: return START_STICKY
                 val serverJson = intent.getStringExtra(EXTRA_SERVER_JSON) ?: "{}"
+                appMode = intent.getStringExtra(EXTRA_APP_MODE) ?: "vpn"
+                splitTunnelApps = intent.getStringArrayListExtra(EXTRA_SPLIT_TUNNEL_APPS)?.toSet()
+                    ?: emptySet()
+                splitTunnelOnlyAllowSelected = intent.getBooleanExtra(
+                    EXTRA_SPLIT_TUNNEL_ONLY_ALLOW_SELECTED,
+                    false,
+                )
                 nativeConnect(provider, serverJson)
             }
             ACTION_DISCONNECT -> {

@@ -3,6 +3,11 @@ package net.tunmux.model
 import android.app.Application
 import android.content.Context
 import android.content.Intent
+import android.content.pm.PackageManager
+import android.net.ConnectivityManager
+import android.net.Network
+import android.net.NetworkCapabilities
+import android.os.Build
 import android.util.Log
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
@@ -37,13 +42,12 @@ data class AirvpnDevice(
     val publicKey: String,
 )
 
-data class AutoTunnelConfig(
-    val enabled: Boolean = false,
-    val onWifi: Boolean = true,
-    val onMobile: Boolean = true,
-    val stopOnNoInternet: Boolean = true,
-    val startOnBoot: Boolean = false,
+data class SplitTunnelApp(
+    val packageName: String,
+    val label: String,
 )
+
+private enum class NetworkProfile { None, Wifi, Mobile, Ethernet, Other }
 
 data class UiState(
     val screen: Screen = Screen.ProviderSelect,
@@ -60,6 +64,7 @@ data class UiState(
     val airvpnDevices: List<AirvpnDevice> = emptyList(),
     val settingsMessage: String = "",
     val autoConfig: AutoTunnelConfig = AutoTunnelConfig(),
+    val splitTunnelApps: List<SplitTunnelApp> = emptyList(),
 )
 
 class VpnViewModel(app: Application) : AndroidViewModel(app) {
@@ -73,17 +78,41 @@ class VpnViewModel(app: Application) : AndroidViewModel(app) {
     val state: StateFlow<UiState> = _state
 
     private var statusJob: Job? = null
+    private var autoConnectCooldownJob: Job? = null
+    private var networkProfile: NetworkProfile = NetworkProfile.None
+    private val connectivityManager: ConnectivityManager? by lazy {
+        ctx.getSystemService(ConnectivityManager::class.java)
+    }
+    private val networkCallback = object : ConnectivityManager.NetworkCallback() {
+        override fun onAvailable(network: Network) {
+            onNetworkStateChanged()
+        }
+
+        override fun onLost(network: Network) {
+            onNetworkStateChanged()
+        }
+
+        override fun onCapabilitiesChanged(network: Network, networkCapabilities: NetworkCapabilities) {
+            onNetworkStateChanged()
+        }
+    }
 
     init {
         val config = AppConfigStore.load(ctx)
-        _state.value = _state.value.copy(config = config)
+        _state.value = _state.value.copy(
+            config = config,
+            autoConfig = config.auto,
+        )
         ensureStatusPolling()
+        startNetworkMonitoring()
+        loadInstalledApps()
 
         // Attempt silent re-login with credentials stored in Keystore.
         val saved = KeystoreCredentials.load(ctx)
         if (saved != null) {
             val (provider, savedCredential) = saved
             _state.value = _state.value.copy(selectedProvider = provider)
+            AutoRuntimeStore.saveProvider(ctx, provider)
             viewModelScope.launch(Dispatchers.IO) {
                 try {
                     val loginCredential = applyConfigToCredential(provider, savedCredential, config)
@@ -100,6 +129,7 @@ class VpnViewModel(app: Application) : AndroidViewModel(app) {
                         if (provider == "airvpn") {
                             refreshAirvpnSettingsDataInternal()
                         }
+                        evaluateAutoTunnel("auto-login")
                     }
                 } catch (e: Exception) {
                     Log.e(TAG, "auto-login failed provider=$provider", e)
@@ -109,11 +139,14 @@ class VpnViewModel(app: Application) : AndroidViewModel(app) {
     }
 
     override fun onCleared() {
+        runCatching { connectivityManager?.unregisterNetworkCallback(networkCallback) }
         statusJob?.cancel()
+        autoConnectCooldownJob?.cancel()
         super.onCleared()
     }
 
     fun selectProvider(provider: String) {
+        AutoRuntimeStore.saveProvider(ctx, provider)
         _state.value = _state.value.copy(
             selectedProvider = provider,
             screen = Screen.Login,
@@ -126,6 +159,9 @@ class VpnViewModel(app: Application) : AndroidViewModel(app) {
         _state.value = _state.value.copy(activeTab = tab, errorMessage = "")
         if (tab == DashboardTab.Config && _state.value.selectedProvider == "airvpn") {
             refreshAirvpnSettingsData()
+        }
+        if (tab == DashboardTab.Settings) {
+            loadInstalledApps()
         }
     }
 
@@ -161,6 +197,7 @@ class VpnViewModel(app: Application) : AndroidViewModel(app) {
                 val json = JSONObject(result)
                 val status = json.optString("status", "error")
                 if (status == "ok") {
+                    AutoRuntimeStore.saveProvider(ctx, provider)
                     KeystoreCredentials.save(ctx, provider, credentialToStore)
                     val servers = fetchServersNow(provider) ?: return@launch
                     _state.value = _state.value.copy(
@@ -172,6 +209,7 @@ class VpnViewModel(app: Application) : AndroidViewModel(app) {
                     if (provider == "airvpn") {
                         refreshAirvpnSettingsDataInternal()
                     }
+                    evaluateAutoTunnel("manual-login")
                 } else {
                     val error = json.optString("error", "login failed")
                     _state.value = _state.value.copy(errorMessage = error)
@@ -189,10 +227,14 @@ class VpnViewModel(app: Application) : AndroidViewModel(app) {
             runCatching { RustBridge.logout(provider) }
         }
         KeystoreCredentials.clear(ctx)
+        AutoRuntimeStore.clear(ctx)
+        val config = _state.value.config
+        val splitApps = _state.value.splitTunnelApps
         _state.value = UiState(
             screen = Screen.ProviderSelect,
-            config = _state.value.config,
-            autoConfig = _state.value.autoConfig,
+            config = config,
+            autoConfig = config.auto,
+            splitTunnelApps = splitApps,
         )
     }
 
@@ -251,6 +293,8 @@ class VpnViewModel(app: Application) : AndroidViewModel(app) {
 
     fun connect(context: Context, serverJson: String) {
         val provider = _state.value.selectedProvider
+        val config = _state.value.config
+        AutoRuntimeStore.save(ctx, provider, serverJson)
         _state.value = _state.value.copy(
             connectionState = ConnectionState.Connecting,
             activeServer = serverJson,
@@ -260,6 +304,15 @@ class VpnViewModel(app: Application) : AndroidViewModel(app) {
             action = TunmuxVpnService.ACTION_CONNECT
             putExtra(TunmuxVpnService.EXTRA_PROVIDER, provider)
             putExtra(TunmuxVpnService.EXTRA_SERVER_JSON, serverJson)
+            putExtra(TunmuxVpnService.EXTRA_APP_MODE, config.general.appMode)
+            putStringArrayListExtra(
+                TunmuxVpnService.EXTRA_SPLIT_TUNNEL_APPS,
+                ArrayList(config.general.splitTunnelApps),
+            )
+            putExtra(
+                TunmuxVpnService.EXTRA_SPLIT_TUNNEL_ONLY_ALLOW_SELECTED,
+                config.general.splitTunnelOnlyAllowSelected,
+            )
         }
         context.startService(intent)
     }
@@ -311,9 +364,10 @@ class VpnViewModel(app: Application) : AndroidViewModel(app) {
                     }
                 }
             }
-        } catch (_: Exception) {
+        } catch (_: Throwable) {
             // Keep existing UI state if status polling fails momentarily.
         }
+        evaluateAutoTunnel("status-poll")
     }
 
     private fun buildWgLikeStatus(status: JSONObject): String {
@@ -330,6 +384,10 @@ class VpnViewModel(app: Application) : AndroidViewModel(app) {
         val addresses = readStringArray(status.optJSONArray("addresses"))
         val allowedIps = readStringArray(status.optJSONArray("allowed_ips"))
         val dns = readStringArray(status.optJSONArray("dns"))
+
+        val latestHandshakeAgeSecs = status.optNullableLong("latest_handshake_age_secs")
+        val rxBytes = status.optNullableLong("rx_bytes")
+        val txBytes = status.optNullableLong("tx_bytes")
 
         val connectedSince = status.optLong("connected_since_epoch_secs", 0L)
         val now = System.currentTimeMillis() / 1000L
@@ -348,8 +406,17 @@ class VpnViewModel(app: Application) : AndroidViewModel(app) {
             if (selectedKey.isNotBlank()) appendLine("  selected key: $selectedKey")
             if (endpoint.isNotBlank()) appendLine("  endpoint: $endpoint")
             if (allowedIps.isNotEmpty()) appendLine("  allowed ips: ${allowedIps.joinToString(", ")}")
-            appendLine("  latest handshake: ${formatElapsed(elapsed)} ago")
-            appendLine("  transfer: n/a")
+            if (latestHandshakeAgeSecs != null) {
+                appendLine("  latest handshake: ${formatElapsed(latestHandshakeAgeSecs)} ago")
+            } else {
+                appendLine("  latest handshake: ${formatElapsed(elapsed)} ago")
+            }
+            val transfer = if (rxBytes != null && txBytes != null) {
+                "${formatBytes(rxBytes)} received, ${formatBytes(txBytes)} sent"
+            } else {
+                "n/a"
+            }
+            appendLine("  transfer: $transfer")
             if (keepalive > 0) appendLine("  persistent keepalive: $keepalive sec")
         }.trim()
     }
@@ -372,11 +439,25 @@ class VpnViewModel(app: Application) : AndroidViewModel(app) {
         return "${hours}h ${minutes % 60}m"
     }
 
+    private fun formatBytes(bytes: Long): String {
+        val kib = 1024.0
+        val mib = kib * 1024.0
+        val gib = mib * 1024.0
+        val v = bytes.toDouble()
+        return when {
+            v >= gib -> String.format("%.2f GiB", v / gib)
+            v >= mib -> String.format("%.2f MiB", v / mib)
+            v >= kib -> String.format("%.1f KiB", v / kib)
+            else -> "$bytes B"
+        }
+    }
+
     fun saveConfig(config: AppConfigModel) {
         AppConfigStore.save(ctx, config)
         val oldDefaultDevice = _state.value.config.airvpn.defaultDevice
         _state.value = _state.value.copy(
             config = config,
+            autoConfig = config.auto,
             settingsMessage = "Config saved",
         )
 
@@ -387,6 +468,7 @@ class VpnViewModel(app: Application) : AndroidViewModel(app) {
         ) {
             selectAirvpnKey(config.airvpn.defaultDevice, persistAsDefault = false)
         }
+        evaluateAutoTunnel("config-saved")
     }
 
     fun refreshAirvpnSettingsData() {
@@ -440,7 +522,7 @@ class VpnViewModel(app: Application) : AndroidViewModel(app) {
                 airvpnDevices = devices,
                 settingsMessage = "",
             )
-        } catch (e: Exception) {
+        } catch (e: Throwable) {
             Log.e(TAG, "refreshAirvpnSettingsData failed", e)
             _state.value = _state.value.copy(
                 settingsMessage = "Failed to load AirVPN key/device data",
@@ -472,7 +554,7 @@ class VpnViewModel(app: Application) : AndroidViewModel(app) {
                         settingsMessage = resp.optString("error", "Failed to select AirVPN key"),
                     )
                 }
-            } catch (e: Exception) {
+            } catch (e: Throwable) {
                 Log.e(TAG, "selectAirvpnKey failed", e)
                 _state.value = _state.value.copy(
                     settingsMessage = "Failed to select AirVPN key",
@@ -501,7 +583,7 @@ class VpnViewModel(app: Application) : AndroidViewModel(app) {
                         settingsMessage = resp.optString("error", "Failed to add AirVPN device"),
                     )
                 }
-            } catch (e: Exception) {
+            } catch (e: Throwable) {
                 Log.e(TAG, "addAirvpnDevice failed", e)
                 _state.value = _state.value.copy(
                     settingsMessage = "Failed to add AirVPN device",
@@ -532,7 +614,7 @@ class VpnViewModel(app: Application) : AndroidViewModel(app) {
                         settingsMessage = resp.optString("error", "Failed to rename AirVPN device"),
                     )
                 }
-            } catch (e: Exception) {
+            } catch (e: Throwable) {
                 Log.e(TAG, "renameAirvpnDevice failed", e)
                 _state.value = _state.value.copy(
                     settingsMessage = "Failed to rename AirVPN device",
@@ -564,7 +646,7 @@ class VpnViewModel(app: Application) : AndroidViewModel(app) {
                         settingsMessage = resp.optString("error", "Failed to delete AirVPN device"),
                     )
                 }
-            } catch (e: Exception) {
+            } catch (e: Throwable) {
                 Log.e(TAG, "deleteAirvpnDevice failed", e)
                 _state.value = _state.value.copy(
                     settingsMessage = "Failed to delete AirVPN device",
@@ -574,23 +656,206 @@ class VpnViewModel(app: Application) : AndroidViewModel(app) {
     }
 
     fun setAutoTunnelEnabled(enabled: Boolean) {
-        _state.value = _state.value.copy(autoConfig = _state.value.autoConfig.copy(enabled = enabled))
+        updateAutoConfig { it.copy(enabled = enabled) }
     }
 
     fun setAutoOnWifi(enabled: Boolean) {
-        _state.value = _state.value.copy(autoConfig = _state.value.autoConfig.copy(onWifi = enabled))
+        updateAutoConfig { it.copy(onWifi = enabled) }
     }
 
     fun setAutoOnMobile(enabled: Boolean) {
-        _state.value = _state.value.copy(autoConfig = _state.value.autoConfig.copy(onMobile = enabled))
+        updateAutoConfig { it.copy(onMobile = enabled) }
+    }
+
+    fun setAutoOnEthernet(enabled: Boolean) {
+        updateAutoConfig { it.copy(onEthernet = enabled) }
     }
 
     fun setStopOnNoInternet(enabled: Boolean) {
-        _state.value = _state.value.copy(autoConfig = _state.value.autoConfig.copy(stopOnNoInternet = enabled))
+        updateAutoConfig { it.copy(stopOnNoInternet = enabled) }
     }
 
     fun setStartOnBoot(enabled: Boolean) {
-        _state.value = _state.value.copy(autoConfig = _state.value.autoConfig.copy(startOnBoot = enabled))
+        updateAutoConfig { it.copy(startOnBoot = enabled) }
+    }
+
+    fun setAppMode(mode: String) {
+        val normalized = if (mode.equals("split", ignoreCase = true)) "split" else "vpn"
+        val config = _state.value.config.copy(
+            general = _state.value.config.general.copy(appMode = normalized),
+        )
+        AppConfigStore.save(ctx, config)
+        _state.value = _state.value.copy(
+            config = config,
+            settingsMessage = "App mode set to $normalized",
+        )
+        evaluateAutoTunnel("app-mode-changed")
+    }
+
+    fun setSplitTunnelApp(packageName: String, enabled: Boolean) {
+        val current = _state.value.config.general.splitTunnelApps.toMutableSet()
+        if (enabled) {
+            current += packageName
+        } else {
+            current -= packageName
+        }
+
+        val config = _state.value.config.copy(
+            general = _state.value.config.general.copy(
+                splitTunnelApps = current.toList().sorted(),
+            ),
+        )
+        AppConfigStore.save(ctx, config)
+        _state.value = _state.value.copy(config = config)
+    }
+
+    fun setSplitTunnelOnlyAllowSelected(enabled: Boolean) {
+        val config = _state.value.config.copy(
+            general = _state.value.config.general.copy(
+                splitTunnelOnlyAllowSelected = enabled,
+            ),
+        )
+        AppConfigStore.save(ctx, config)
+        _state.value = _state.value.copy(config = config)
+    }
+
+    private fun updateAutoConfig(update: (AutoTunnelConfig) -> AutoTunnelConfig) {
+        val current = _state.value.autoConfig
+        val next = update(current)
+        val config = _state.value.config.copy(auto = next)
+        AppConfigStore.save(ctx, config)
+        _state.value = _state.value.copy(
+            config = config,
+            autoConfig = next,
+        )
+        evaluateAutoTunnel("auto-config-changed")
+    }
+
+    private fun startNetworkMonitoring() {
+        networkProfile = resolveNetworkProfile()
+        runCatching { connectivityManager?.registerDefaultNetworkCallback(networkCallback) }
+            .onFailure { Log.w(TAG, "network callback registration failed", it) }
+        evaluateAutoTunnel("network-monitor-start")
+    }
+
+    private fun onNetworkStateChanged() {
+        val next = resolveNetworkProfile()
+        if (next != networkProfile) {
+            networkProfile = next
+            evaluateAutoTunnel("network-changed:$next")
+        }
+    }
+
+    private fun resolveNetworkProfile(): NetworkProfile {
+        val cm = connectivityManager ?: return NetworkProfile.None
+        val network = cm.activeNetwork ?: return NetworkProfile.None
+        val caps = cm.getNetworkCapabilities(network) ?: return NetworkProfile.None
+        return when {
+            caps.hasTransport(NetworkCapabilities.TRANSPORT_WIFI) -> NetworkProfile.Wifi
+            caps.hasTransport(NetworkCapabilities.TRANSPORT_CELLULAR) -> NetworkProfile.Mobile
+            caps.hasTransport(NetworkCapabilities.TRANSPORT_ETHERNET) -> NetworkProfile.Ethernet
+            else -> NetworkProfile.Other
+        }
+    }
+
+    private fun evaluateAutoTunnel(reason: String) {
+        val auto = _state.value.autoConfig
+        if (!auto.enabled) return
+
+        val shouldTunnel = when (networkProfile) {
+            NetworkProfile.Wifi -> auto.onWifi
+            NetworkProfile.Mobile -> auto.onMobile
+            NetworkProfile.Ethernet -> auto.onEthernet
+            NetworkProfile.None -> false
+            NetworkProfile.Other -> false
+        }
+
+        val connectionState = _state.value.connectionState
+        if (!shouldTunnel) {
+            if ((networkProfile == NetworkProfile.None && auto.stopOnNoInternet) ||
+                networkProfile != NetworkProfile.None
+            ) {
+                if (connectionState == ConnectionState.Connected || connectionState == ConnectionState.Connecting) {
+                    Log.i(TAG, "auto-tunnel disconnect reason=$reason profile=$networkProfile")
+                    disconnect(ctx)
+                }
+            }
+            return
+        }
+
+        if (connectionState != ConnectionState.Disconnected || autoConnectCooldownJob != null) return
+
+        val runtime = AutoRuntimeStore.load(ctx)
+        val provider = _state.value.selectedProvider.ifBlank { runtime.provider }
+        if (provider.isBlank()) return
+
+        var candidateServers = _state.value.serverList
+        if (candidateServers.isEmpty()) {
+            fetchServersNow(provider)?.let { fetched ->
+                candidateServers = fetched
+                _state.value = _state.value.copy(serverList = fetched)
+            }
+        }
+
+        val targetServer = _state.value.activeServer.ifBlank {
+            runtime.server.ifBlank {
+                candidateServers.firstOrNull().orEmpty()
+            }
+        }
+        if (targetServer.isBlank()) return
+
+        if (_state.value.selectedProvider != provider) {
+            _state.value = _state.value.copy(selectedProvider = provider)
+        }
+
+        Log.i(TAG, "auto-tunnel connect reason=$reason profile=$networkProfile")
+        connect(ctx, targetServer)
+        autoConnectCooldownJob = viewModelScope.launch {
+            delay(4000)
+            autoConnectCooldownJob = null
+        }
+    }
+
+    private fun loadInstalledApps() {
+        viewModelScope.launch(Dispatchers.IO) {
+            val pm = ctx.packageManager
+            val selected = _state.value.config.general.splitTunnelApps.toSet()
+            val apps = mutableListOf<SplitTunnelApp>()
+            val launchIntent = Intent(Intent.ACTION_MAIN).addCategory(Intent.CATEGORY_LAUNCHER)
+            val launcherActivities = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                pm.queryIntentActivities(launchIntent, PackageManager.ResolveInfoFlags.of(0))
+            } else {
+                @Suppress("DEPRECATION")
+                pm.queryIntentActivities(launchIntent, 0)
+            }
+
+            val seenPackages = HashSet<String>()
+            for (resolveInfo in launcherActivities) {
+                val activityInfo = resolveInfo.activityInfo ?: continue
+                val packageName = activityInfo.packageName
+                if (packageName == ctx.packageName) continue
+                if (!seenPackages.add(packageName)) continue
+                val label = resolveInfo.loadLabel(pm)?.toString().orEmpty().ifBlank { packageName }
+                apps += SplitTunnelApp(packageName = packageName, label = label)
+            }
+
+            apps.sortBy { it.label.lowercase() }
+            val cleanedSelection = selected.intersect(apps.map { it.packageName }.toSet())
+                .toList()
+                .sorted()
+            val nextConfig = _state.value.config.copy(
+                general = _state.value.config.general.copy(
+                    splitTunnelApps = cleanedSelection,
+                ),
+            )
+            if (cleanedSelection != _state.value.config.general.splitTunnelApps) {
+                AppConfigStore.save(ctx, nextConfig)
+            }
+            _state.value = _state.value.copy(
+                splitTunnelApps = apps,
+                config = nextConfig,
+            )
+        }
     }
 
     fun navigateBack() {
@@ -598,5 +863,14 @@ class VpnViewModel(app: Application) : AndroidViewModel(app) {
             Screen.Login -> _state.value.copy(screen = Screen.ProviderSelect)
             Screen.ProviderSelect, Screen.Dashboard -> _state.value
         }
+    }
+}
+
+private fun JSONObject.optNullableLong(key: String): Long? {
+    if (!has(key) || isNull(key)) return null
+    return try {
+        getLong(key)
+    } catch (_: Exception) {
+        null
     }
 }

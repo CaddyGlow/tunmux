@@ -1366,13 +1366,30 @@ pub extern "system" fn Java_net_tunmux_RustBridge_airvpnDeleteDevice<'local>(
 
 #[no_mangle]
 pub extern "system" fn Java_net_tunmux_RustBridge_getConnectionStatus<'local>(
-    mut env: JNIEnv<'local>,
+    env: JNIEnv<'local>,
     _class: JClass,
 ) -> JString<'local> {
     ensure_logger();
     let tunnel = TUNNEL_STATE.lock().unwrap();
     let status = if let Some(t) = tunnel.as_ref() {
         if t.data_plane_ready {
+            let mut endpoint = t.endpoint.clone();
+            let mut latest_handshake_age_secs: Option<u64> = None;
+            let mut rx_bytes: Option<u64> = None;
+            let mut tx_bytes: Option<u64> = None;
+
+            if let Some(device) = t.wg_device.as_ref() {
+                let peers = get_runtime().block_on(async { device.read(async |d| d.peers().await).await });
+                if let Some(peer_stats) = peers.into_iter().next() {
+                    if let Some(peer_endpoint) = peer_stats.peer.endpoint {
+                        endpoint = peer_endpoint.to_string();
+                    }
+                    latest_handshake_age_secs = peer_stats.stats.last_handshake.map(|d| d.as_secs());
+                    rx_bytes = Some(peer_stats.stats.rx_bytes as u64);
+                    tx_bytes = Some(peer_stats.stats.tx_bytes as u64);
+                }
+            }
+
             json!({
                 "state": "connected",
                 "provider": t.provider,
@@ -1380,14 +1397,17 @@ pub extern "system" fn Java_net_tunmux_RustBridge_getConnectionStatus<'local>(
                 "interface": t.interface_name,
                 "server": t.selected_server,
                 "selected_key": t.selected_key,
-                "endpoint": t.endpoint,
+                "endpoint": endpoint,
                 "peer_public_key": t.peer_public_key,
                 "allowed_ips": t.allowed_ips,
                 "addresses": t.addresses,
                 "dns": t.dns_servers,
                 "mtu": t.mtu,
                 "keepalive_secs": t.keepalive_secs,
-                "connected_since_epoch_secs": t.connected_since_epoch_secs
+                "connected_since_epoch_secs": t.connected_since_epoch_secs,
+                "latest_handshake_age_secs": latest_handshake_age_secs,
+                "rx_bytes": rx_bytes,
+                "tx_bytes": tx_bytes
             })
             .to_string()
         } else {

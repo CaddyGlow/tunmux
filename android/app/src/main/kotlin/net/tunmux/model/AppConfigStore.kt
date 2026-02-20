@@ -1,6 +1,7 @@
 package net.tunmux.model
 
 import android.content.Context
+import org.json.JSONArray
 import org.json.JSONObject
 
 data class GeneralConfig(
@@ -16,6 +17,9 @@ data class GeneralConfig(
     val privilegedAuthorizedGroup: String = "",
     val privilegedAutostopMode: String = "never",
     val privilegedAutostopTimeoutMs: Long = 30000L,
+    val appMode: String = "vpn",
+    val splitTunnelApps: List<String> = emptyList(),
+    val splitTunnelOnlyAllowSelected: Boolean = false,
 )
 
 data class ProviderConfig(
@@ -27,12 +31,22 @@ data class AirvpnConfig(
     val defaultDevice: String = "",
 )
 
+data class AutoTunnelConfig(
+    val enabled: Boolean = false,
+    val onWifi: Boolean = true,
+    val onMobile: Boolean = true,
+    val onEthernet: Boolean = true,
+    val stopOnNoInternet: Boolean = true,
+    val startOnBoot: Boolean = false,
+)
+
 data class AppConfigModel(
     val general: GeneralConfig = GeneralConfig(),
     val proton: ProviderConfig = ProviderConfig(),
     val airvpn: AirvpnConfig = AirvpnConfig(),
     val mullvad: ProviderConfig = ProviderConfig(),
     val ivpn: ProviderConfig = ProviderConfig(),
+    val auto: AutoTunnelConfig = AutoTunnelConfig(),
 )
 
 object AppConfigStore {
@@ -64,6 +78,9 @@ object AppConfigStore {
             .put("privileged_authorized_group", config.general.privilegedAuthorizedGroup)
             .put("privileged_autostop_mode", config.general.privilegedAutostopMode)
             .put("privileged_autostop_timeout_ms", config.general.privilegedAutostopTimeoutMs)
+            .put("app_mode", config.general.appMode)
+            .put("split_tunnel_apps", JSONArray(config.general.splitTunnelApps))
+            .put("split_tunnel_only_allow_selected", config.general.splitTunnelOnlyAllowSelected)
 
         val proton = JSONObject().put("default_country", config.proton.defaultCountry)
         val airvpn = JSONObject()
@@ -71,6 +88,13 @@ object AppConfigStore {
             .put("default_device", config.airvpn.defaultDevice)
         val mullvad = JSONObject().put("default_country", config.mullvad.defaultCountry)
         val ivpn = JSONObject().put("default_country", config.ivpn.defaultCountry)
+        val auto = JSONObject()
+            .put("enabled", config.auto.enabled)
+            .put("on_wifi", config.auto.onWifi)
+            .put("on_mobile", config.auto.onMobile)
+            .put("on_ethernet", config.auto.onEthernet)
+            .put("stop_on_no_internet", config.auto.stopOnNoInternet)
+            .put("start_on_boot", config.auto.startOnBoot)
 
         return JSONObject()
             .put("general", general)
@@ -78,6 +102,7 @@ object AppConfigStore {
             .put("airvpn", airvpn)
             .put("mullvad", mullvad)
             .put("ivpn", ivpn)
+            .put("auto", auto)
     }
 
     private fun fromJson(root: JSONObject): AppConfigModel {
@@ -86,6 +111,7 @@ object AppConfigStore {
         val airvpnJson = root.optJSONObject("airvpn") ?: JSONObject()
         val mullvadJson = root.optJSONObject("mullvad") ?: JSONObject()
         val ivpnJson = root.optJSONObject("ivpn") ?: JSONObject()
+        val autoJson = root.optJSONObject("auto") ?: JSONObject()
 
         val general = GeneralConfig(
             backend = generalJson.optString("backend", "wg-quick"),
@@ -100,6 +126,9 @@ object AppConfigStore {
             privilegedAuthorizedGroup = generalJson.optString("privileged_authorized_group", ""),
             privilegedAutostopMode = generalJson.optString("privileged_autostop_mode", "never"),
             privilegedAutostopTimeoutMs = generalJson.optLong("privileged_autostop_timeout_ms", 30000L),
+            appMode = generalJson.optString("app_mode", "vpn"),
+            splitTunnelApps = generalJson.optStringArray("split_tunnel_apps"),
+            splitTunnelOnlyAllowSelected = generalJson.optBoolean("split_tunnel_only_allow_selected", false),
         )
 
         val proton = ProviderConfig(
@@ -115,6 +144,14 @@ object AppConfigStore {
         val ivpn = ProviderConfig(
             defaultCountry = ivpnJson.optString("default_country", ""),
         )
+        val auto = AutoTunnelConfig(
+            enabled = autoJson.optBoolean("enabled", false),
+            onWifi = autoJson.optBoolean("on_wifi", true),
+            onMobile = autoJson.optBoolean("on_mobile", true),
+            onEthernet = autoJson.optBoolean("on_ethernet", true),
+            stopOnNoInternet = autoJson.optBoolean("stop_on_no_internet", true),
+            startOnBoot = autoJson.optBoolean("start_on_boot", false),
+        )
 
         return AppConfigModel(
             general = general,
@@ -122,10 +159,21 @@ object AppConfigStore {
             airvpn = airvpn,
             mullvad = mullvad,
             ivpn = ivpn,
+            auto = auto,
         )
     }
 }
 
 private fun JSONObject.optNullableInt(key: String): Int? {
     return if (isNull(key) || !has(key)) null else optInt(key)
+}
+
+private fun JSONObject.optStringArray(key: String): List<String> {
+    val arr = optJSONArray(key) ?: return emptyList()
+    val out = mutableListOf<String>()
+    for (i in 0 until arr.length()) {
+        val value = arr.optString(i).trim()
+        if (value.isNotEmpty()) out += value
+    }
+    return out
 }
