@@ -10,6 +10,7 @@ use crate::cli::{MullvadCommand, MullvadPaymentCommand};
 use crate::config::{self, AppConfig, Provider};
 use crate::crypto;
 use crate::error;
+use crate::local_proxy;
 use crate::netns;
 use crate::proxy;
 use crate::wireguard;
@@ -146,6 +147,7 @@ pub async fn dispatch(command: MullvadCommand, config: &AppConfig) -> anyhow::Re
             country,
             backend,
             proxy,
+            local_proxy,
             socks_port,
             http_port,
             proxy_access_log,
@@ -155,6 +157,7 @@ pub async fn dispatch(command: MullvadCommand, config: &AppConfig) -> anyhow::Re
                 country,
                 backend,
                 proxy,
+                local_proxy,
                 socks_port,
                 http_port,
                 proxy_access_log,
@@ -383,6 +386,7 @@ async fn cmd_connect(
     country: Option<String>,
     backend_arg: Option<String>,
     use_proxy: bool,
+    use_local_proxy: bool,
     socks_port_arg: Option<u16>,
     http_port_arg: Option<u16>,
     proxy_access_log_arg: bool,
@@ -455,6 +459,8 @@ async fn cmd_connect(
             http_port_arg,
             proxy_access_log,
         )?;
+    } else if use_local_proxy {
+        connect_local_proxy(relay, &params, socks_port_arg, http_port_arg, proxy_access_log)?;
     } else {
         connect_direct(relay, &params, backend)?;
     }
@@ -531,6 +537,81 @@ fn connect_proxy(
         proxy_pid: Some(pid),
         socks_port: Some(proxy_config.socks_port),
         http_port: Some(proxy_config.http_port),
+        peer_public_key: None,
+        local_public_key: None,
+        virtual_ips: vec![],
+        keepalive_secs: None,
+    };
+    state.save()?;
+
+    println!(
+        "Connected {} ({}) -- SOCKS5 127.0.0.1:{}, HTTP 127.0.0.1:{}",
+        instance, relay.hostname, proxy_config.socks_port, proxy_config.http_port
+    );
+    Ok(())
+}
+
+fn connect_local_proxy(
+    relay: &MullvadRelay,
+    params: &wireguard::config::WgConfigParams<'_>,
+    socks_port_arg: Option<u16>,
+    http_port_arg: Option<u16>,
+    proxy_access_log: bool,
+) -> anyhow::Result<()> {
+    let instance = proxy::instance_name(&relay.hostname);
+
+    if wireguard::connection::ConnectionState::exists(&instance) {
+        anyhow::bail!(
+            "instance {:?} already exists (server {} already connected). Disconnect first or pick a different server.",
+            instance,
+            relay.hostname
+        );
+    }
+
+    let proxy_config = if let (Some(sp), Some(hp)) = (socks_port_arg, http_port_arg) {
+        proxy::ProxyConfig { socks_port: sp, http_port: hp, access_log: proxy_access_log }
+    } else {
+        let mut auto = proxy::next_available_ports()?;
+        if let Some(sp) = socks_port_arg {
+            auto.socks_port = sp;
+        }
+        if let Some(hp) = http_port_arg {
+            auto.http_port = hp;
+        }
+        auto.access_log = proxy_access_log;
+        auto
+    };
+
+    let cfg = local_proxy::local_proxy_config_from_params(
+        params,
+        Some(25),
+        proxy_config.socks_port,
+        proxy_config.http_port,
+    )?;
+    let local_public_key = local_proxy::derive_public_key_b64(params.private_key).ok();
+
+    println!("Connecting to {} ({})...", relay.hostname, params.server_ip);
+
+    let pid = local_proxy::spawn_daemon(&instance, &cfg, proxy_access_log)?;
+
+    let state = wireguard::connection::ConnectionState {
+        instance_name: instance.clone(),
+        provider: PROVIDER.dir_name().to_string(),
+        interface_name: String::new(),
+        backend: wireguard::backend::WgBackend::LocalProxy,
+        server_endpoint: format!("{}:{}", params.server_ip, params.server_port),
+        server_display_name: relay.hostname.clone(),
+        original_gateway_ip: None,
+        original_gateway_iface: None,
+        original_resolv_conf: None,
+        namespace_name: None,
+        proxy_pid: Some(pid),
+        socks_port: Some(proxy_config.socks_port),
+        http_port: Some(proxy_config.http_port),
+        peer_public_key: Some(params.server_public_key.to_string()),
+        local_public_key,
+        virtual_ips: params.addresses.iter().map(|s| s.to_string()).collect(),
+        keepalive_secs: cfg.keepalive,
     };
     state.save()?;
 
@@ -579,6 +660,10 @@ fn connect_direct(
                 proxy_pid: None,
                 socks_port: None,
                 http_port: None,
+                peer_public_key: None,
+                local_public_key: None,
+                virtual_ips: vec![],
+                keepalive_secs: None,
             };
             state.save()?;
         }
@@ -600,11 +685,18 @@ fn connect_direct(
                 proxy_pid: None,
                 socks_port: None,
                 http_port: None,
+                peer_public_key: None,
+                local_public_key: None,
+                virtual_ips: vec![],
+                keepalive_secs: None,
             };
             state.save()?;
         }
         wireguard::backend::WgBackend::Kernel => {
             wireguard::kernel::up(params, INTERFACE_NAME, PROVIDER.dir_name(), &relay.hostname)?;
+        }
+        wireguard::backend::WgBackend::LocalProxy => {
+            anyhow::bail!("use --local-proxy flag to start userspace WireGuard proxy mode");
         }
     }
 
@@ -683,6 +775,10 @@ fn cmd_disconnect(instance: Option<String>, all: bool) -> anyhow::Result<()> {
 }
 
 fn disconnect_one(state: &wireguard::connection::ConnectionState) -> anyhow::Result<()> {
+    if state.backend == wireguard::backend::WgBackend::LocalProxy {
+        return local_proxy::disconnect(state, &state.instance_name);
+    }
+
     if let Some(pid) = state.proxy_pid {
         proxy::stop_daemon(pid)?;
     }
@@ -712,6 +808,7 @@ fn disconnect_one(state: &wireguard::connection::ConnectionState) -> anyhow::Res
                 wireguard::userspace::down(&state.interface_name)?;
                 wireguard::connection::ConnectionState::remove(&state.instance_name)?;
             }
+            wireguard::backend::WgBackend::LocalProxy => unreachable!(),
         }
     }
 

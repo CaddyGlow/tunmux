@@ -1,6 +1,7 @@
 pub mod backend;
 pub mod config;
 pub mod connection;
+pub mod proxy_tunnel;
 
 #[cfg(not(target_os = "android"))]
 pub mod kernel;

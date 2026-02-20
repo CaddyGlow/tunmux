@@ -27,6 +27,18 @@ pub struct ConnectionState {
     pub proxy_pid: Option<u32>,
     pub socks_port: Option<u16>,
     pub http_port: Option<u16>,
+    /// Base64-encoded WireGuard public key of the remote peer (local-proxy mode).
+    #[serde(default)]
+    pub peer_public_key: Option<String>,
+    /// Base64-encoded WireGuard public key of this client (local-proxy mode).
+    #[serde(default)]
+    pub local_public_key: Option<String>,
+    /// Virtual IP/CIDR strings assigned to this client (local-proxy mode).
+    #[serde(default)]
+    pub virtual_ips: Vec<String>,
+    /// WireGuard persistent keepalive interval in seconds (local-proxy mode).
+    #[serde(default)]
+    pub keepalive_secs: Option<u16>,
 }
 
 impl ConnectionState {

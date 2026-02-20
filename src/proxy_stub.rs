@@ -42,7 +42,7 @@ pub fn instance_name(server_name: &str) -> String {
     }
 }
 
-/// Path helpers for instance files.
+/// Path helpers for privileged instance files (used by --proxy netns mode).
 #[must_use]
 pub fn pid_file(instance: &str) -> PathBuf {
     config::privileged_proxy_dir().join(format!("{}.pid", instance))
@@ -51,6 +51,17 @@ pub fn pid_file(instance: &str) -> PathBuf {
 #[must_use]
 pub fn log_file(instance: &str) -> PathBuf {
     config::privileged_proxy_dir().join(format!("{}.log", instance))
+}
+
+/// Path helpers for user-owned local-proxy instance files.
+#[must_use]
+pub fn local_pid_file(instance: &str) -> PathBuf {
+    config::user_proxy_dir().join(format!("{}.pid", instance))
+}
+
+#[must_use]
+pub fn local_log_file(instance: &str) -> PathBuf {
+    config::user_proxy_dir().join(format!("{}.log", instance))
 }
 
 /// Spawn the proxy daemon through the privileged service.
@@ -64,11 +75,39 @@ pub fn spawn_daemon(
 
 /// Find the next available port pair by scanning active connections.
 pub fn next_available_ports() -> anyhow::Result<ProxyConfig> {
+    use crate::wireguard::connection::ConnectionState;
+
+    let connections = ConnectionState::load_all().unwrap_or_default();
+
+    let used_socks: Vec<u16> = connections.iter().filter_map(|c| c.socks_port).collect();
+    let used_http: Vec<u16> = connections.iter().filter_map(|c| c.http_port).collect();
+
+    let socks_port = next_available_port(1080, &used_socks)?;
+    let http_port = next_available_port(8118, &used_http)?;
+
     Ok(ProxyConfig {
-        socks_port: 1080,
-        http_port: 8118,
+        socks_port,
+        http_port,
         access_log: false,
     })
+}
+
+fn next_available_port(start: u16, used: &[u16]) -> anyhow::Result<u16> {
+    let mut port = start;
+    loop {
+        if !used.contains(&port) && loopback_tcp_bind_available(port) {
+            return Ok(port);
+        }
+        port = port.checked_add(1).unwrap_or(1024);
+        if port == start {
+            anyhow::bail!("no available proxy port found from {}", start);
+        }
+    }
+}
+
+fn loopback_tcp_bind_available(port: u16) -> bool {
+    std::net::TcpListener::bind(("127.0.0.1", port)).is_ok()
+        || std::net::TcpListener::bind(("::1", port)).is_ok()
 }
 
 /// Stop a proxy daemon via the privileged API.

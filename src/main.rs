@@ -5,6 +5,7 @@ mod config;
 mod crypto;
 mod error;
 mod ivpn;
+mod local_proxy;
 mod logging;
 mod models;
 mod mullvad;
@@ -25,6 +26,8 @@ mod proxy;
 mod proxy;
 mod userspace_helper;
 mod wireguard;
+
+use base64::Engine as _;
 
 use clap::Parser;
 use tracing::error;
@@ -86,6 +89,21 @@ fn main() {
             }
         }
 
+        // LocalProxyDaemon: userspace WireGuard, no root/netns required.
+        TopCommand::LocalProxyDaemon {
+            socks_port: _,
+            http_port: _,
+            proxy_access_log: _,
+            pid_file,
+            log_file,
+            config_b64,
+        } => {
+            if let Err(e) = run_local_proxy_daemon(&pid_file, &log_file, &config_b64) {
+                eprintln!("local-proxy-daemon error: {}", e);
+                std::process::exit(1);
+            }
+        }
+
         // Status and Wg are quick sync commands, no tokio needed.
         TopCommand::Status => {
             init_logging(cli.verbose);
@@ -133,10 +151,72 @@ async fn run(command: TopCommand, config: config::AppConfig) -> anyhow::Result<(
         TopCommand::Status
         | TopCommand::Wg
         | TopCommand::ProxyDaemon { .. }
+        | TopCommand::LocalProxyDaemon { .. }
         | TopCommand::Privileged { .. } => {
             unreachable!()
         }
     }
+}
+
+fn run_local_proxy_daemon(
+    pid_file: &str,
+    log_file: &str,
+    config_b64: &str,
+) -> anyhow::Result<()> {
+    // Decode config before daemonizing so errors surface to the shell.
+    let json = base64::engine::general_purpose::STANDARD.decode(config_b64)?;
+    let cfg: wireguard::proxy_tunnel::LocalProxyConfig = serde_json::from_slice(&json)?;
+
+    // Ensure the user proxy dir exists before daemonizing.
+    config::ensure_user_proxy_dir()?;
+
+    // Daemonize (double-fork).
+    daemonize_local()?;
+
+    // Init file logging -- all subsequent output goes to the log file.
+    logging::init_file(log_file, false)?;
+
+    // Write PID file.
+    let pid = std::process::id();
+    std::fs::write(pid_file, pid.to_string())?;
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(pid_file, std::fs::Permissions::from_mode(0o644))?;
+    }
+
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()?;
+
+    rt.block_on(wireguard::proxy_tunnel::run_local_proxy(cfg))
+}
+
+/// Double-fork daemonize for the local-proxy daemon.
+fn daemonize_local() -> anyhow::Result<()> {
+    use nix::unistd::{fork, setsid, ForkResult};
+
+    match unsafe { fork() } {
+        Ok(ForkResult::Parent { .. }) => std::process::exit(0),
+        Ok(ForkResult::Child) => {}
+        Err(e) => anyhow::bail!("first fork failed: {}", e),
+    }
+
+    setsid().map_err(|e| anyhow::anyhow!("setsid failed: {}", e))?;
+
+    match unsafe { fork() } {
+        Ok(ForkResult::Parent { .. }) => std::process::exit(0),
+        Ok(ForkResult::Child) => {}
+        Err(e) => anyhow::bail!("second fork failed: {}", e),
+    }
+
+    use std::os::unix::io::AsRawFd;
+    let devnull = std::fs::File::open("/dev/null")?;
+    let fd = devnull.as_raw_fd();
+    nix::unistd::dup2(fd, 0)?;
+    nix::unistd::dup2(fd, 1)?;
+    nix::unistd::dup2(fd, 2)?;
+
+    Ok(())
 }
 
 fn cmd_status() -> anyhow::Result<()> {
@@ -188,11 +268,84 @@ fn cmd_status() -> anyhow::Result<()> {
 }
 
 fn cmd_wg() -> anyhow::Result<()> {
-    use wireguard::connection::{ConnectionState, DIRECT_INSTANCE};
+    use wireguard::backend::WgBackend;
+    use wireguard::connection::ConnectionState;
 
-    let state = ConnectionState::load(DIRECT_INSTANCE)?
-        .ok_or_else(|| anyhow::anyhow!("not connected (no active direct connection)"))?;
-    let output = privileged_client::PrivilegedClient::new().wg_show(&state.interface_name)?;
-    print!("{}", output);
+    let connections = ConnectionState::load_all()?;
+    if connections.is_empty() {
+        println!("No active connections.");
+        return Ok(());
+    }
+
+    let mut first = true;
+    for conn in &connections {
+        if !first {
+            println!();
+        }
+        first = false;
+
+        match conn.backend {
+            WgBackend::LocalProxy => print_local_proxy_info(conn),
+            _ => {
+                match privileged_client::PrivilegedClient::new().wg_show(&conn.interface_name) {
+                    Ok(output) => print!("{}", output),
+                    Err(e) => eprintln!(
+                        "wg show {} failed: {}",
+                        conn.interface_name, e
+                    ),
+                }
+            }
+        }
+    }
     Ok(())
+}
+
+fn print_local_proxy_info(conn: &wireguard::connection::ConnectionState) {
+    let running = conn
+        .proxy_pid
+        .map(|pid| std::path::Path::new(&format!("/proc/{}", pid)).exists())
+        .unwrap_or(false);
+
+    // ── interface block ──────────────────────────────────────────────────────
+    println!("interface: {}", conn.instance_name);
+    if let Some(ref k) = conn.local_public_key {
+        println!("  public key: {}", k);
+    }
+    println!("  private key: (hidden)");
+    println!("  listening port: n/a (userspace)");
+    if !conn.virtual_ips.is_empty() {
+        println!("  address: {}", conn.virtual_ips.join(", "));
+    }
+    let socks = conn
+        .socks_port
+        .map(|p| format!("127.0.0.1:{}", p))
+        .unwrap_or_else(|| "-".to_string());
+    let http = conn
+        .http_port
+        .map(|p| format!("127.0.0.1:{}", p))
+        .unwrap_or_else(|| "-".to_string());
+    println!("  socks5 proxy: {}", socks);
+    println!("  http proxy: {}", http);
+    match conn.proxy_pid {
+        Some(pid) => println!(
+            "  pid: {} ({})",
+            pid,
+            if running { "running" } else { "dead" }
+        ),
+        None => println!("  pid: unknown"),
+    }
+
+    // ── peer block ───────────────────────────────────────────────────────────
+    println!();
+    match conn.peer_public_key.as_deref() {
+        Some(k) => println!("peer: {}", k),
+        None => println!("peer: (unknown)"),
+    }
+    println!("  endpoint: {}", conn.server_endpoint);
+    println!("  allowed ips: 0.0.0.0/0, ::/0");
+    println!("  latest handshake: (userspace — not available)");
+    println!("  transfer: (userspace — not available)");
+    if let Some(ka) = conn.keepalive_secs {
+        println!("  persistent keepalive: every {} seconds", ka);
+    }
 }

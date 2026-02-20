@@ -8,6 +8,7 @@ pub enum WgBackend {
     WgQuick,
     Userspace,
     Kernel,
+    LocalProxy,
 }
 
 impl WgBackend {
@@ -17,8 +18,9 @@ impl WgBackend {
             "wg-quick" => Ok(Self::WgQuick),
             "userspace" => Ok(Self::Userspace),
             "kernel" => Ok(Self::Kernel),
+            "local-proxy" => Ok(Self::LocalProxy),
             other => anyhow::bail!(
-                "unknown backend {:?} (expected wg-quick, userspace, kernel)",
+                "unknown backend {:?} (expected wg-quick, userspace, kernel, local-proxy)",
                 other
             ),
         }
@@ -31,6 +33,7 @@ impl fmt::Display for WgBackend {
             Self::WgQuick => write!(f, "wg-quick"),
             Self::Userspace => write!(f, "userspace"),
             Self::Kernel => write!(f, "kernel"),
+            Self::LocalProxy => write!(f, "local-proxy"),
         }
     }
 }

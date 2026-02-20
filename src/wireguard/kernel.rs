@@ -37,6 +37,10 @@ pub fn up(
         proxy_pid: None,
         socks_port: None,
         http_port: None,
+        peer_public_key: None,
+        local_public_key: None,
+        virtual_ips: vec![],
+        keepalive_secs: None,
     };
     state.save()?;
 

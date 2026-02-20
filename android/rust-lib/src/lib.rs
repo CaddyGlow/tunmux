@@ -13,15 +13,31 @@ use std::os::fd::AsRawFd;
 use std::os::unix::io::RawFd;
 use std::sync::{Arc, Mutex, OnceLock};
 use tokio::runtime::Runtime;
+use tokio::task::AbortHandle;
 use tunmux::airvpn::api::AirVpnClient;
 use tunmux::airvpn::models::{AirManifest, AirServer, AirWgKey, AirWgMode};
 use tunmux::airvpn::web::AirVpnWeb;
+use tunmux::api;
+use tunmux::crypto;
+use tunmux::models::server::LogicalServer;
+use tunmux::models::session::Session;
+use tunmux::wireguard::proxy_tunnel::{run_local_proxy, LocalProxyConfig};
 
 static TOKIO_RUNTIME: OnceLock<Runtime> = OnceLock::new();
 static LOGGER_INIT: OnceLock<()> = OnceLock::new();
 static TUNNEL_STATE: Mutex<Option<TunnelHandle>> = Mutex::new(None);
 static APP_STATE: Mutex<Option<AppState>> = Mutex::new(None);
 static AIRVPN_STATE: Mutex<Option<AirVpnAndroidState>> = Mutex::new(None);
+static PROTON_STATE: Mutex<Option<ProtonAndroidState>> = Mutex::new(None);
+static LOCAL_PROXY_STATE: Mutex<Option<LocalProxyHandle>> = Mutex::new(None);
+
+struct LocalProxyHandle {
+    abort: AbortHandle,
+    #[allow(dead_code)]
+    socks_port: u16,
+    #[allow(dead_code)]
+    http_port: u16,
+}
 
 const UDP_RECV_BUFFER_SIZE: usize = 7 * 1024 * 1024;
 const UDP_SEND_BUFFER_SIZE: usize = 7 * 1024 * 1024;
@@ -68,9 +84,18 @@ struct AirVpnAndroidState {
     selected_key_name: String,
 }
 
+#[derive(Clone)]
+struct ProtonAndroidState {
+    username: String,
+    session: Session,
+    server_list_json: String,
+    servers: Vec<LogicalServer>,
+}
+
 struct LoginCredentials {
     username: String,
     password: String,
+    totp: Option<String>,
     device: Option<String>,
 }
 
@@ -112,11 +137,8 @@ impl AndroidUdpFactory {
             SocketAddr::V4(..) => socket2::Domain::IPV4,
             SocketAddr::V6(..) => socket2::Domain::IPV6,
         };
-        let socket = socket2::Socket::new(
-            domain,
-            socket2::Type::DGRAM,
-            Some(socket2::Protocol::UDP),
-        )?;
+        let socket =
+            socket2::Socket::new(domain, socket2::Type::DGRAM, Some(socket2::Protocol::UDP))?;
         socket.set_nonblocking(true)?;
         socket.set_reuse_address(true)?;
         socket.set_recv_buffer_size(UDP_RECV_BUFFER_SIZE)?;
@@ -294,38 +316,65 @@ pub extern "system" fn Java_net_tunmux_TunmuxVpnService_nativeConnect(
     };
 
     log::info!("nativeConnect called; provider={}", provider_norm);
-
-    if provider_norm != "airvpn" {
-        log::warn!("nativeConnect: provider '{}' not implemented", provider_norm);
-        return JNI_FALSE;
-    }
-
     let selected_server = extract_selected_server_label(&server_json);
-    let (tun_config, wg_runtime_cfg, selected_key_name) = {
-        let state = AIRVPN_STATE.lock().unwrap();
-        match state.as_ref() {
-            Some(s) => {
-                let key = match selected_airvpn_key(s) {
-                    Ok(k) => k,
-                    Err(e) => {
-                        log::error!("nativeConnect: failed to resolve AirVPN key: {e}");
-                        return JNI_FALSE;
-                    }
-                };
-                let cfg = build_airvpn_tun_config(key);
-                let wg = match build_airvpn_runtime_config(s, key, &selected_server) {
-                    Ok(v) => v,
-                    Err(e) => {
-                        log::error!("nativeConnect: failed to build AirVPN WireGuard config: {e}");
-                        return JNI_FALSE;
-                    }
-                };
-                (cfg, wg, key.name.clone())
+    let (tun_config, wg_runtime_cfg, selected_key_name) = match provider_norm.as_str() {
+        "airvpn" => {
+            let state = AIRVPN_STATE.lock().unwrap();
+            match state.as_ref() {
+                Some(s) => {
+                    let key = match selected_airvpn_key(s) {
+                        Ok(k) => k,
+                        Err(e) => {
+                            log::error!("nativeConnect: failed to resolve AirVPN key: {e}");
+                            return JNI_FALSE;
+                        }
+                    };
+                    let cfg = build_airvpn_tun_config(key);
+                    let wg = match build_airvpn_runtime_config(s, key, &selected_server) {
+                        Ok(v) => v,
+                        Err(e) => {
+                            log::error!(
+                                "nativeConnect: failed to build AirVPN WireGuard config: {e}"
+                            );
+                            return JNI_FALSE;
+                        }
+                    };
+                    (cfg, wg, key.name.clone())
+                }
+                None => {
+                    log::error!("nativeConnect: no AirVPN login state");
+                    return JNI_FALSE;
+                }
             }
-            None => {
-                log::error!("nativeConnect: no AirVPN login state");
-                return JNI_FALSE;
+        }
+        "proton" => {
+            let state = PROTON_STATE.lock().unwrap();
+            match state.as_ref() {
+                Some(s) => {
+                    let cfg = proton_tun_config();
+                    let wg = match build_proton_runtime_config(s, &selected_server) {
+                        Ok(v) => v,
+                        Err(e) => {
+                            log::error!(
+                                "nativeConnect: failed to build Proton WireGuard config: {e}"
+                            );
+                            return JNI_FALSE;
+                        }
+                    };
+                    (cfg, wg, String::new())
+                }
+                None => {
+                    log::error!("nativeConnect: no Proton login state");
+                    return JNI_FALSE;
+                }
             }
+        }
+        _ => {
+            log::warn!(
+                "nativeConnect: provider '{}' not implemented",
+                provider_norm
+            );
+            return JNI_FALSE;
         }
     };
 
@@ -379,7 +428,8 @@ pub extern "system" fn Java_net_tunmux_TunmuxVpnService_nativeConnect(
         selected_key: selected_key_name,
         endpoint: wg_runtime_cfg.endpoint.to_string(),
         allowed_ips: wg_runtime_cfg.allowed_ips.clone(),
-        peer_public_key: base64::engine::general_purpose::STANDARD.encode(wg_runtime_cfg.peer_public_key),
+        peer_public_key: base64::engine::general_purpose::STANDARD
+            .encode(wg_runtime_cfg.peer_public_key),
         addresses: tun_config.addresses,
         dns_servers: tun_config.dns_servers,
         mtu: tun_config.mtu,
@@ -538,15 +588,97 @@ fn parse_login_credentials(credential: &str) -> Result<LoginCredentials, String>
         .filter(|v| !v.is_empty())
         .map(ToOwned::to_owned);
 
+    let totp = parsed
+        .get("totp")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+        .map(ToOwned::to_owned);
+
     Ok(LoginCredentials {
         username,
         password,
+        totp,
         device,
     })
 }
 
+fn filter_proton_servers(max_tier: i32, mut servers: Vec<LogicalServer>) -> Vec<LogicalServer> {
+    servers.retain(|s| s.is_enabled() && s.best_physical().is_some() && s.tier <= max_tier);
+    servers.sort_by(|a, b| {
+        a.score
+            .partial_cmp(&b.score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    servers
+}
+
+fn build_proton_server_label(server: &LogicalServer) -> String {
+    let location = server
+        .city
+        .as_deref()
+        .filter(|v| !v.is_empty())
+        .or_else(|| server.region.as_deref().filter(|v| !v.is_empty()))
+        .unwrap_or("unknown");
+    format!("{} [{}] {}", server.name, server.exit_country, location)
+}
+
+fn build_proton_server_list_json(servers: &[LogicalServer]) -> String {
+    let mut labels: Vec<String> = servers.iter().map(build_proton_server_label).collect();
+    labels.sort();
+    serde_json::to_string(&labels).unwrap_or_else(|_| "[]".to_string())
+}
+
+fn proton_tun_config() -> TunConfig {
+    TunConfig {
+        addresses: vec!["10.2.0.2/32".to_string()],
+        routes: vec!["0.0.0.0/0".to_string(), "::/0".to_string()],
+        dns_servers: vec!["10.2.0.1".to_string()],
+        mtu: 1500,
+    }
+}
+
+fn find_proton_server<'a>(
+    state: &'a ProtonAndroidState,
+    selected_server_label: &str,
+) -> Option<&'a LogicalServer> {
+    let trimmed = selected_server_label.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    if let Some(found) = state
+        .servers
+        .iter()
+        .find(|s| build_proton_server_label(s) == trimmed)
+    {
+        return Some(found);
+    }
+
+    if let Some(found) = state
+        .servers
+        .iter()
+        .find(|s| s.name.eq_ignore_ascii_case(trimmed))
+    {
+        return Some(found);
+    }
+
+    let name_hint = trimmed.split(" [").next().unwrap_or("").trim();
+    if name_hint.is_empty() {
+        None
+    } else {
+        state
+            .servers
+            .iter()
+            .find(|s| s.name.eq_ignore_ascii_case(name_hint))
+    }
+}
+
 fn format_airvpn_server_label(server: &AirServer) -> String {
-    format!("{} [{}] {}", server.name, server.country_code, server.location)
+    format!(
+        "{} [{}] {}",
+        server.name, server.country_code, server.location
+    )
 }
 
 fn build_airvpn_server_list_json(manifest: &AirManifest) -> String {
@@ -621,7 +753,10 @@ fn selected_airvpn_key(state: &AirVpnAndroidState) -> Result<&AirWgKey, String> 
         .ok_or_else(|| "no WireGuard keys in AirVPN session".to_string())
 }
 
-fn set_selected_airvpn_key(state: &mut AirVpnAndroidState, key_name: &str) -> Result<String, String> {
+fn set_selected_airvpn_key(
+    state: &mut AirVpnAndroidState,
+    key_name: &str,
+) -> Result<String, String> {
     let trimmed = key_name.trim();
     if trimmed.is_empty() {
         return Err("AirVPN key name cannot be empty".to_string());
@@ -755,6 +890,119 @@ fn build_airvpn_runtime_config(
     })
 }
 
+fn build_proton_runtime_config(
+    state: &ProtonAndroidState,
+    selected_server_label: &str,
+) -> Result<WireGuardRuntimeConfig, String> {
+    let selected = if selected_server_label.is_empty() {
+        None
+    } else {
+        find_proton_server(state, selected_server_label)
+    };
+    let used_fallback = selected.is_none();
+    let server = selected
+        .or_else(|| state.servers.first())
+        .ok_or_else(|| "no Proton servers available".to_string())?;
+    if used_fallback && !selected_server_label.is_empty() {
+        log::warn!(
+            "nativeConnect: selected server '{}' not found, falling back to '{}'",
+            selected_server_label,
+            server.name
+        );
+    }
+
+    let physical = server
+        .best_physical()
+        .ok_or_else(|| "selected Proton server has no WireGuard endpoint".to_string())?;
+    let endpoint_ip: IpAddr = physical
+        .entry_ip
+        .parse()
+        .map_err(|e| format!("invalid Proton endpoint IP '{}': {}", physical.entry_ip, e))?;
+    let private_key = decode_key32("wg_private_key", &state.session.wg_private_key)?;
+    let server_public_key = physical
+        .x25519_public_key
+        .as_deref()
+        .ok_or_else(|| "selected Proton server is missing x25519 key".to_string())?;
+    let peer_public_key = decode_key32("server_x25519_public_key", server_public_key)?;
+
+    Ok(WireGuardRuntimeConfig {
+        server_name: server.name.clone(),
+        endpoint: SocketAddr::new(endpoint_ip, 51820),
+        private_key,
+        peer_public_key,
+        preshared_key: None,
+        allowed_ips: vec!["0.0.0.0/0".to_string(), "::/0".to_string()],
+        keepalive_secs: None,
+    })
+}
+
+async fn login_proton(login_credentials: &LoginCredentials) -> Result<ProtonAndroidState, String> {
+    let mut client = api::http::ProtonClient::new().map_err(|e| e.to_string())?;
+    let auth = api::auth::login(
+        &mut client,
+        &login_credentials.username,
+        &login_credentials.password,
+    )
+    .await
+    .map_err(|e| e.to_string())?;
+
+    if auth.two_factor.totp_required() {
+        let code = login_credentials
+            .totp
+            .as_deref()
+            .map(str::trim)
+            .unwrap_or("");
+        if code.is_empty() {
+            return Err("2FA code required for this Proton account".to_string());
+        }
+        api::auth::submit_2fa(&client, code)
+            .await
+            .map_err(|e| e.to_string())?;
+    }
+
+    let vpn_info = api::vpn_info::fetch_vpn_info(&client)
+        .await
+        .map_err(|e| e.to_string())?;
+    let keys = crypto::keys::VpnKeys::generate().map_err(|e| e.to_string())?;
+    let cert = api::certificate::fetch_certificate(&client, &keys.ed25519_pk_pem())
+        .await
+        .map_err(|e| e.to_string())?;
+
+    let session = Session {
+        uid: auth.uid,
+        access_token: auth.access_token,
+        refresh_token: auth.refresh_token,
+        vpn_username: vpn_info.vpn.name,
+        vpn_password: vpn_info.vpn.password,
+        plan_name: vpn_info.vpn.plan_name,
+        plan_title: vpn_info.vpn.plan_title,
+        max_tier: vpn_info.vpn.max_tier,
+        max_connections: vpn_info.vpn.max_connect,
+        ed25519_private_key: keys.ed25519_sk_base64(),
+        ed25519_public_key_pem: keys.ed25519_pk_pem(),
+        wg_private_key: keys.wg_private_key(),
+        wg_public_key: keys.wg_public_key(),
+        fingerprint: keys.fingerprint(),
+        certificate_pem: cert.certificate,
+    };
+
+    let servers_resp = api::servers::fetch_server_list(&client)
+        .await
+        .map_err(|e| e.to_string())?;
+    let servers = filter_proton_servers(session.max_tier, servers_resp.logical_servers);
+    if servers.is_empty() {
+        return Err("no Proton WireGuard servers available for this account".to_string());
+    }
+    let server_list_json = build_proton_server_list_json(&servers);
+
+    Ok(ProtonAndroidState {
+        username: login_credentials.username.clone(),
+        session,
+        server_list_json,
+        servers,
+    })
+}
+
 fn start_android_wireguard(
     tun_fd: RawFd,
     cfg: &WireGuardRuntimeConfig,
@@ -831,8 +1079,8 @@ pub extern "system" fn Java_net_tunmux_RustBridge_login<'local>(
         provider_norm
     );
 
-    let result = if provider_norm == "airvpn" {
-        match parse_login_credentials(&_credential) {
+    let result = match provider_norm.as_str() {
+        "airvpn" => match parse_login_credentials(&_credential) {
             Ok(login_credentials) => {
                 let username = login_credentials.username;
                 let password = login_credentials.password;
@@ -854,11 +1102,15 @@ pub extern "system" fn Java_net_tunmux_RustBridge_login<'local>(
                                 ))
                             })?
                     } else {
-                        session.keys.first().map(|k| k.name.clone()).ok_or_else(|| {
-                            tunmux::error::AppError::Other(
-                                "no WireGuard keys in AirVPN session".to_string(),
-                            )
-                        })?
+                        session
+                            .keys
+                            .first()
+                            .map(|k| k.name.clone())
+                            .ok_or_else(|| {
+                                tunmux::error::AppError::Other(
+                                    "no WireGuard keys in AirVPN session".to_string(),
+                                )
+                            })?
                     };
                     let wg_mode = manifest.wg_modes.first().cloned().ok_or_else(|| {
                         tunmux::error::AppError::Other(
@@ -919,17 +1171,66 @@ pub extern "system" fn Java_net_tunmux_RustBridge_login<'local>(
                 })
                 .to_string()
             }
+        },
+        "proton" => match parse_login_credentials(&_credential) {
+            Ok(login_credentials) => {
+                let login_result = get_runtime().block_on(login_proton(&login_credentials));
+                match login_result {
+                    Ok(login_data) => {
+                        let servers = login_data.servers.len();
+                        let username = login_data.username.clone();
+                        let plan_title = login_data.session.plan_title.clone();
+                        let max_tier = login_data.session.max_tier;
+                        let max_connections = login_data.session.max_connections;
+                        let mut state = PROTON_STATE.lock().unwrap();
+                        *state = Some(login_data);
+                        log::info!(
+                            "RustBridge.login proton success: user={} servers={} tier={}",
+                            username,
+                            servers,
+                            max_tier
+                        );
+                        json!({
+                            "status": "ok",
+                            "provider": "proton",
+                            "username": username,
+                            "plan_title": plan_title,
+                            "max_tier": max_tier,
+                            "max_connections": max_connections,
+                            "servers": servers
+                        })
+                        .to_string()
+                    }
+                    Err(e) => {
+                        log::error!("RustBridge.login proton failed: {}", e);
+                        json!({
+                            "status": "error",
+                            "error": e
+                        })
+                        .to_string()
+                    }
+                }
+            }
+            Err(msg) => {
+                log::warn!("RustBridge.login proton bad credentials payload: {}", msg);
+                json!({
+                    "status": "error",
+                    "error": msg
+                })
+                .to_string()
+            }
+        },
+        _ => {
+            log::warn!(
+                "RustBridge.login provider '{}' not implemented in JNI",
+                provider_norm
+            );
+            json!({
+                "status": "error",
+                "error": format!("provider '{}' is not implemented on Android", provider_norm)
+            })
+            .to_string()
         }
-    } else {
-        log::warn!(
-            "RustBridge.login provider '{}' not implemented in JNI",
-            provider_norm
-        );
-        json!({
-            "status": "error",
-            "error": format!("provider '{}' is not implemented on Android", provider_norm)
-        })
-        .to_string()
     };
 
     env.new_string(result).expect("failed to create JString")
@@ -951,6 +1252,9 @@ pub extern "system" fn Java_net_tunmux_RustBridge_logout(
     if provider_norm == "airvpn" {
         let mut state = AIRVPN_STATE.lock().unwrap();
         *state = None;
+    } else if provider_norm == "proton" {
+        let mut state = PROTON_STATE.lock().unwrap();
+        *state = None;
     }
 }
 
@@ -968,17 +1272,28 @@ pub extern "system" fn Java_net_tunmux_RustBridge_fetchServers<'local>(
     let provider_norm = provider.trim().to_ascii_lowercase();
     log::debug!("RustBridge.fetchServers: provider={}", provider_norm);
 
-    let result = if provider_norm == "airvpn" {
-        let state = AIRVPN_STATE.lock().unwrap();
-        match state.as_ref() {
-            Some(s) => s.server_list_json.clone(),
-            None => {
-                log::warn!("RustBridge.fetchServers airvpn without active session");
-                "[]".to_string()
+    let result = match provider_norm.as_str() {
+        "airvpn" => {
+            let state = AIRVPN_STATE.lock().unwrap();
+            match state.as_ref() {
+                Some(s) => s.server_list_json.clone(),
+                None => {
+                    log::warn!("RustBridge.fetchServers airvpn without active session");
+                    "[]".to_string()
+                }
             }
         }
-    } else {
-        "[]".to_string()
+        "proton" => {
+            let state = PROTON_STATE.lock().unwrap();
+            match state.as_ref() {
+                Some(s) => s.server_list_json.clone(),
+                None => {
+                    log::warn!("RustBridge.fetchServers proton without active session");
+                    "[]".to_string()
+                }
+            }
+        }
+        _ => "[]".to_string(),
     };
 
     env.new_string(result).expect("failed to create JString")
@@ -1241,9 +1556,7 @@ pub extern "system" fn Java_net_tunmux_RustBridge_airvpnRenameDevice<'local>(
                 Ok(()) => {
                     let mut state = AIRVPN_STATE.lock().unwrap();
                     if let Some(s) = state.as_mut() {
-                        let was_selected = s
-                            .selected_key_name
-                            .eq_ignore_ascii_case(&old_name_norm);
+                        let was_selected = s.selected_key_name.eq_ignore_ascii_case(&old_name_norm);
                         if let Err(e) = refresh_airvpn_keys_in_state(s) {
                             json!({
                                 "status": "error",
@@ -1379,12 +1692,14 @@ pub extern "system" fn Java_net_tunmux_RustBridge_getConnectionStatus<'local>(
             let mut tx_bytes: Option<u64> = None;
 
             if let Some(device) = t.wg_device.as_ref() {
-                let peers = get_runtime().block_on(async { device.read(async |d| d.peers().await).await });
+                let peers =
+                    get_runtime().block_on(async { device.read(async |d| d.peers().await).await });
                 if let Some(peer_stats) = peers.into_iter().next() {
                     if let Some(peer_endpoint) = peer_stats.peer.endpoint {
                         endpoint = peer_endpoint.to_string();
                     }
-                    latest_handshake_age_secs = peer_stats.stats.last_handshake.map(|d| d.as_secs());
+                    latest_handshake_age_secs =
+                        peer_stats.stats.last_handshake.map(|d| d.as_secs());
                     rx_bytes = Some(peer_stats.stats.rx_bytes as u64);
                     tx_bytes = Some(peer_stats.stats.tx_bytes as u64);
                 }
@@ -1424,4 +1739,239 @@ pub extern "system" fn Java_net_tunmux_RustBridge_getConnectionStatus<'local>(
         .to_string()
     };
     env.new_string(status).expect("failed to create JString")
+}
+
+#[no_mangle]
+pub extern "system" fn Java_net_tunmux_RustBridge_createAccount<'local>(
+    mut env: JNIEnv<'local>,
+    _class: JClass,
+    provider: JString,
+) -> JString<'local> {
+    ensure_logger();
+    let provider: String = env
+        .get_string(&provider)
+        .map(|s| s.into())
+        .unwrap_or_default();
+    let provider_norm = provider.trim().to_ascii_lowercase();
+
+    let result = get_runtime().block_on(async {
+        match provider_norm.as_str() {
+            "mullvad" => create_account_mullvad().await,
+            "ivpn" => create_account_ivpn().await,
+            other => json!({
+                "status": "error",
+                "error": format!("create account not supported for '{}'", other)
+            })
+            .to_string(),
+        }
+    });
+
+    env.new_string(result).expect("failed to create JString")
+}
+
+async fn create_account_mullvad() -> String {
+    #[derive(serde::Deserialize)]
+    struct Resp {
+        number: String,
+    }
+
+    let client = match reqwest::Client::builder().user_agent("tunmux").build() {
+        Ok(c) => c,
+        Err(e) => return json!({"status": "error", "error": e.to_string()}).to_string(),
+    };
+    match client
+        .post("https://api.mullvad.net/accounts/v1/accounts")
+        .send()
+        .await
+    {
+        Ok(resp) if resp.status().is_success() => match resp.json::<Resp>().await {
+            Ok(r) => json!({"status": "ok", "account_number": r.number}).to_string(),
+            Err(e) => json!({"status": "error", "error": e.to_string()}).to_string(),
+        },
+        Ok(resp) => {
+            let msg = resp.text().await.unwrap_or_default();
+            json!({"status": "error", "error": msg}).to_string()
+        }
+        Err(e) => json!({"status": "error", "error": e.to_string()}).to_string(),
+    }
+}
+
+async fn create_account_ivpn() -> String {
+    #[derive(serde::Deserialize)]
+    struct Account {
+        id: String,
+    }
+    #[derive(serde::Deserialize)]
+    struct Resp {
+        account: Account,
+    }
+
+    let client = match reqwest::Client::builder()
+        .user_agent("tunmux")
+        .local_address(std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED))
+        .build()
+    {
+        Ok(c) => c,
+        Err(e) => return json!({"status": "error", "error": e.to_string()}).to_string(),
+    };
+    let body = serde_json::json!({"product": "IVPN Standard"});
+    match client
+        .post("https://www.ivpn.net/web/accounts/create")
+        .json(&body)
+        .send()
+        .await
+    {
+        Ok(resp) if resp.status().is_success() => match resp.json::<Resp>().await {
+            Ok(r) => json!({"status": "ok", "account_id": r.account.id}).to_string(),
+            Err(e) => json!({"status": "error", "error": e.to_string()}).to_string(),
+        },
+        Ok(resp) => {
+            let msg = resp.text().await.unwrap_or_default();
+            json!({"status": "error", "error": msg}).to_string()
+        }
+        Err(e) => json!({"status": "error", "error": e.to_string()}).to_string(),
+    }
+}
+
+// ── Local proxy (no VpnService, no TUN) ───────────────────────────────────────
+
+fn find_free_port(start: u16) -> Option<u16> {
+    (start..=start + 100).find(|&p| std::net::TcpListener::bind(("127.0.0.1", p)).is_ok())
+}
+
+#[no_mangle]
+pub extern "system" fn Java_net_tunmux_RustBridge_startLocalProxy<'local>(
+    mut env: JNIEnv<'local>,
+    _class: JClass,
+    provider: JString,
+    server_json: JString,
+    socks_port: jni::sys::jint,
+    http_port: jni::sys::jint,
+) -> JString<'local> {
+    ensure_logger();
+
+    let provider: String = env
+        .get_string(&provider)
+        .map(|s| s.into())
+        .unwrap_or_default();
+    let server_json: String = env
+        .get_string(&server_json)
+        .map(|s| s.into())
+        .unwrap_or_default();
+    let provider_norm = provider.trim().to_ascii_lowercase();
+
+    let cfg_result: Result<LocalProxyConfig, String> = (|| {
+        if provider_norm != "airvpn" {
+            return Err(format!(
+                "local proxy not implemented for provider '{}'",
+                provider_norm
+            ));
+        }
+        let state = AIRVPN_STATE.lock().unwrap();
+        let s = state
+            .as_ref()
+            .ok_or_else(|| "AirVPN is not logged in".to_string())?;
+        let key = selected_airvpn_key(s)?;
+        let wg_cfg =
+            build_airvpn_runtime_config(s, key, &extract_selected_server_label(&server_json))?;
+
+        let resolved_socks = if socks_port > 0 {
+            socks_port as u16
+        } else {
+            find_free_port(1080).ok_or_else(|| "no free port for SOCKS5".to_string())?
+        };
+        let resolved_http = if http_port > 0 {
+            http_port as u16
+        } else {
+            find_free_port(8118).ok_or_else(|| "no free port for HTTP proxy".to_string())?
+        };
+
+        let mut virtual_ips = Vec::new();
+        if !key.wg_ipv4.is_empty() {
+            virtual_ips.push(key.wg_ipv4.clone());
+        }
+        if !key.wg_ipv6.is_empty() {
+            virtual_ips.push(key.wg_ipv6.clone());
+        }
+
+        Ok(LocalProxyConfig {
+            private_key: wg_cfg.private_key,
+            peer_public_key: wg_cfg.peer_public_key,
+            preshared_key: wg_cfg.preshared_key,
+            endpoint: wg_cfg.endpoint,
+            virtual_ips,
+            keepalive: wg_cfg.keepalive_secs,
+            socks_port: resolved_socks,
+            http_port: resolved_http,
+        })
+    })();
+
+    let cfg = match cfg_result {
+        Ok(c) => c,
+        Err(e) => {
+            log::error!("startLocalProxy: failed to build config: {}", e);
+            let result = json!({"status": "error", "error": e}).to_string();
+            return env.new_string(result).expect("failed to create JString");
+        }
+    };
+
+    let actual_socks = cfg.socks_port;
+    let actual_http = cfg.http_port;
+
+    // Stop any existing local proxy task
+    {
+        let mut prev = LOCAL_PROXY_STATE.lock().unwrap();
+        if let Some(h) = prev.take() {
+            h.abort.abort();
+        }
+    }
+
+    let runtime = get_runtime();
+    let handle = runtime.spawn(async move {
+        if let Err(e) = run_local_proxy(cfg).await {
+            log::error!("local_proxy_exited; error={}", e);
+        }
+    });
+    let abort = handle.abort_handle();
+
+    {
+        let mut state = LOCAL_PROXY_STATE.lock().unwrap();
+        *state = Some(LocalProxyHandle {
+            abort,
+            socks_port: actual_socks,
+            http_port: actual_http,
+        });
+    }
+
+    log::info!(
+        "startLocalProxy: socks={} http={}",
+        actual_socks,
+        actual_http
+    );
+    let result = json!({
+        "status": "ok",
+        "socks_port": actual_socks,
+        "http_port": actual_http
+    })
+    .to_string();
+    env.new_string(result).expect("failed to create JString")
+}
+
+#[no_mangle]
+pub extern "system" fn Java_net_tunmux_RustBridge_stopLocalProxy<'local>(
+    env: JNIEnv<'local>,
+    _class: JClass,
+) -> JString<'local> {
+    ensure_logger();
+    let mut state = LOCAL_PROXY_STATE.lock().unwrap();
+    let stopped = if let Some(h) = state.take() {
+        h.abort.abort();
+        true
+    } else {
+        false
+    };
+    drop(state);
+    log::info!("stopLocalProxy: stopped={}", stopped);
+    let result = json!({"status": "ok", "stopped": stopped}).to_string();
+    env.new_string(result).expect("failed to create JString")
 }

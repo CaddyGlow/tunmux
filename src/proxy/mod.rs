@@ -39,7 +39,7 @@ pub fn instance_name(server_name: &str) -> String {
     }
 }
 
-/// Path helpers for instance files.
+/// Path helpers for privileged instance files (used by --proxy netns mode).
 #[must_use]
 pub fn pid_file(instance: &str) -> PathBuf {
     config::privileged_proxy_dir().join(format!("{}.pid", instance))
@@ -48,6 +48,17 @@ pub fn pid_file(instance: &str) -> PathBuf {
 #[must_use]
 pub fn log_file(instance: &str) -> PathBuf {
     config::privileged_proxy_dir().join(format!("{}.log", instance))
+}
+
+/// Path helpers for user-owned local-proxy instance files.
+#[must_use]
+pub fn local_pid_file(instance: &str) -> PathBuf {
+    config::user_proxy_dir().join(format!("{}.pid", instance))
+}
+
+#[must_use]
+pub fn local_log_file(instance: &str) -> PathBuf {
+    config::user_proxy_dir().join(format!("{}.log", instance))
 }
 
 /// Spawn the proxy daemon through the privileged service.

@@ -28,6 +28,10 @@ pub mod wireguard;
 // Privileged API types (portable serde types only, no unix deps)
 pub mod privileged_api;
 
+// Local-proxy helpers (spawn/stop user-owned daemon, signal handling) -- non-Android only
+#[cfg(not(target_os = "android"))]
+pub mod local_proxy;
+
 // Network namespaces: real implementation on Linux, stub on other non-Android platforms
 #[cfg(all(not(target_os = "android"), target_os = "linux"))]
 pub mod netns;

@@ -20,6 +20,7 @@ data class GeneralConfig(
     val appMode: String = "vpn",
     val splitTunnelApps: List<String> = emptyList(),
     val splitTunnelOnlyAllowSelected: Boolean = false,
+    val favoriteServers: List<String> = emptyList(),
 )
 
 data class ProviderConfig(
@@ -31,12 +32,25 @@ data class AirvpnConfig(
     val defaultDevice: String = "",
 )
 
+enum class WifiDetectionMethod {
+    DEFAULT,
+    LEGACY;
+
+    companion object {
+        fun fromStored(value: String): WifiDetectionMethod {
+            return entries.firstOrNull { it.name.equals(value, ignoreCase = true) } ?: DEFAULT
+        }
+    }
+}
+
 data class AutoTunnelConfig(
     val enabled: Boolean = false,
     val onWifi: Boolean = true,
     val onMobile: Boolean = true,
     val onEthernet: Boolean = true,
     val wifiSsids: List<String> = emptyList(),
+    val wifiDetectionMethod: WifiDetectionMethod = WifiDetectionMethod.DEFAULT,
+    val debounceDelaySeconds: Int = 3,
     val disconnectOnMatchedWifi: Boolean = false,
     val stopOnNoInternet: Boolean = true,
     val startOnBoot: Boolean = false,
@@ -83,6 +97,7 @@ object AppConfigStore {
             .put("app_mode", config.general.appMode)
             .put("split_tunnel_apps", JSONArray(config.general.splitTunnelApps))
             .put("split_tunnel_only_allow_selected", config.general.splitTunnelOnlyAllowSelected)
+            .put("favorite_servers", JSONArray(config.general.favoriteServers))
 
         val proton = JSONObject().put("default_country", config.proton.defaultCountry)
         val airvpn = JSONObject()
@@ -96,6 +111,8 @@ object AppConfigStore {
             .put("on_mobile", config.auto.onMobile)
             .put("on_ethernet", config.auto.onEthernet)
             .put("wifi_ssids", JSONArray(config.auto.wifiSsids))
+            .put("wifi_detection_method", config.auto.wifiDetectionMethod.name.lowercase())
+            .put("debounce_delay_seconds", config.auto.debounceDelaySeconds)
             .put("disconnect_on_matched_wifi", config.auto.disconnectOnMatchedWifi)
             .put("stop_on_no_internet", config.auto.stopOnNoInternet)
             .put("start_on_boot", config.auto.startOnBoot)
@@ -133,6 +150,7 @@ object AppConfigStore {
             appMode = generalJson.optString("app_mode", "vpn"),
             splitTunnelApps = generalJson.optStringArray("split_tunnel_apps"),
             splitTunnelOnlyAllowSelected = generalJson.optBoolean("split_tunnel_only_allow_selected", false),
+            favoriteServers = generalJson.optStringArray("favorite_servers"),
         )
 
         val proton = ProviderConfig(
@@ -154,6 +172,11 @@ object AppConfigStore {
             onMobile = autoJson.optBoolean("on_mobile", true),
             onEthernet = autoJson.optBoolean("on_ethernet", true),
             wifiSsids = autoJson.optStringArray("wifi_ssids"),
+            wifiDetectionMethod =
+                WifiDetectionMethod.fromStored(
+                    autoJson.optString("wifi_detection_method", WifiDetectionMethod.DEFAULT.name)
+                ),
+            debounceDelaySeconds = autoJson.optInt("debounce_delay_seconds", 3).coerceIn(0, 60),
             disconnectOnMatchedWifi = autoJson.optBoolean("disconnect_on_matched_wifi", false),
             stopOnNoInternet = autoJson.optBoolean("stop_on_no_internet", true),
             startOnBoot = autoJson.optBoolean("start_on_boot", false),

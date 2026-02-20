@@ -82,6 +82,16 @@ anyhow = "1"
 # Keyring (optional)
 keyring = { version = "3", optional = true }
 
+# Userspace WireGuard crypto + virtual TCP/IP stack for local-proxy mode
+boringtun = "0.7"
+smoltcp = { version = "0.12", default-features = false, features = [
+    "socket-tcp",
+    "proto-ipv4",
+    "proto-ipv6",
+    "medium-ip",
+    "alloc",
+] }
+
 [target.'cfg(not(target_os = "android"))'.dependencies]
 # Password input (terminal only)
 rpassword = "7"

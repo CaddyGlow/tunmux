@@ -225,6 +225,22 @@ pub fn connections_dir() -> PathBuf {
     app_config_dir().join("connections")
 }
 
+/// User-owned proxy runtime directory: ~/.config/tunmux/proxy/
+/// Used by local-proxy daemon for pid/log files (no root needed).
+#[must_use]
+pub fn user_proxy_dir() -> PathBuf {
+    app_config_dir().join("proxy")
+}
+
+pub fn ensure_user_proxy_dir() -> crate::error::Result<()> {
+    let dir = user_proxy_dir();
+    if !dir.exists() {
+        fs::create_dir_all(&dir)?;
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o700))?;
+    }
+    Ok(())
+}
+
 pub fn ensure_connections_dir() -> Result<()> {
     let dir = connections_dir();
     if !dir.exists() {

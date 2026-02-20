@@ -7,8 +7,18 @@ import android.content.Intent
 import android.net.VpnService
 import android.os.ParcelFileDescriptor
 import android.util.Log
+import androidx.lifecycle.lifecycleScope
+import kotlinx.coroutines.FlowPreview
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.flow.collectLatest
+import kotlinx.coroutines.flow.debounce
+import kotlinx.coroutines.launch
+import net.tunmux.model.AndroidNetworkMonitor
+import net.tunmux.model.AppConfigStore
+import net.tunmux.model.AutoTunnelConfig
+import net.tunmux.model.NetworkProfile
 
-class TunmuxVpnService : VpnService() {
+class TunmuxVpnService : LifecycleVpnService() {
 
     companion object {
         const val ACTION_CONNECT = "net.tunmux.action.CONNECT"
@@ -18,7 +28,6 @@ class TunmuxVpnService : VpnService() {
         const val EXTRA_APP_MODE = "net.tunmux.extra.APP_MODE"
         const val EXTRA_SPLIT_TUNNEL_APPS = "net.tunmux.extra.SPLIT_TUNNEL_APPS"
         const val EXTRA_SPLIT_TUNNEL_ONLY_ALLOW_SELECTED = "net.tunmux.extra.SPLIT_TUNNEL_ONLY_ALLOW_SELECTED"
-        private const val NOTIF_CHANNEL_ID = "tunmux_vpn"
         private const val NOTIF_ID = 1
         private const val TAG = "tunmux"
 
@@ -31,6 +40,10 @@ class TunmuxVpnService : VpnService() {
     private var appMode: String = "vpn"
     private var splitTunnelApps: Set<String> = emptySet()
     private var splitTunnelOnlyAllowSelected: Boolean = false
+    private val notifChannelId by lazy { getString(R.string.vpn_channel_id) }
+    private val networkMonitor by lazy { AndroidNetworkMonitor(this) }
+    private var networkMonitorJob: Job? = null
+    private var tunnelStartedByService: Boolean = false
 
     // Called from Rust via JNI
     fun openTun(addresses: List<String>, routes: List<String>, dnsServers: List<String>, mtu: Int): Int {
@@ -107,9 +120,12 @@ class TunmuxVpnService : VpnService() {
         super.onCreate()
         createNotificationChannel()
         nativeInitialize(this, filesDir.absolutePath)
+        startConnectivityListener()
     }
 
     override fun onDestroy() {
+        networkMonitorJob?.cancel()
+        networkMonitor.stop()
         nativeShutdown()
         activeTunPfd?.close()
         activeTunPfd = null
@@ -117,7 +133,7 @@ class TunmuxVpnService : VpnService() {
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
-        startForeground(NOTIF_ID, buildNotification("tunmux VPN"))
+        startForeground(NOTIF_ID, buildNotification(getString(R.string.tunnel_running)))
         when (intent?.action) {
             ACTION_CONNECT -> {
                 val provider = intent.getStringExtra(EXTRA_PROVIDER) ?: return START_STICKY
@@ -130,30 +146,78 @@ class TunmuxVpnService : VpnService() {
                     false,
                 )
                 nativeConnect(provider, serverJson)
+                tunnelStartedByService = true
             }
             ACTION_DISCONNECT -> {
                 nativeDisconnect()
+                tunnelStartedByService = false
                 stopSelf()
             }
         }
         return START_STICKY
     }
 
+    @OptIn(FlowPreview::class)
+    private fun startConnectivityListener() {
+        val auto = AppConfigStore.load(this).auto
+        networkMonitor.start(auto.wifiDetectionMethod)
+        networkMonitorJob?.cancel()
+        networkMonitorJob = lifecycleScope.launch {
+            networkMonitor.state
+                .debounce(300)
+                .collectLatest { snapshot ->
+                    if (!tunnelStartedByService) return@collectLatest
+                    val latestAuto = AppConfigStore.load(this@TunmuxVpnService).auto
+                    if (!latestAuto.enabled) return@collectLatest
+                    networkMonitor.updateDetectionMethod(latestAuto.wifiDetectionMethod)
+
+                    val shouldTunnel = shouldTunnel(latestAuto, snapshot.profile, snapshot.wifiSsid)
+                    if (!shouldTunnel) {
+                        Log.i(
+                            TAG,
+                            "service auto-tunnel disconnect profile=${snapshot.profile} ssid=${snapshot.wifiSsid}",
+                        )
+                        nativeDisconnect()
+                        tunnelStartedByService = false
+                        stopSelf()
+                    }
+                }
+        }
+    }
+
+    private fun shouldTunnel(auto: AutoTunnelConfig, profile: NetworkProfile, ssid: String): Boolean {
+        return when (profile) {
+            NetworkProfile.Wifi -> shouldTunnelOnWifi(auto, ssid)
+            NetworkProfile.Mobile -> auto.onMobile
+            NetworkProfile.Ethernet -> auto.onEthernet
+            NetworkProfile.None -> !auto.stopOnNoInternet
+            NetworkProfile.Other -> false
+        }
+    }
+
+    private fun shouldTunnelOnWifi(auto: AutoTunnelConfig, ssid: String): Boolean {
+        if (!auto.onWifi) return false
+        if (auto.wifiSsids.isEmpty()) return true
+        val matched = ssid.isNotBlank() && auto.wifiSsids.any { it.equals(ssid, ignoreCase = true) }
+        return if (auto.disconnectOnMatchedWifi) !matched else matched
+    }
+
     private fun createNotificationChannel() {
         val channel = NotificationChannel(
-            NOTIF_CHANNEL_ID,
-            "VPN Status",
+            notifChannelId,
+            getString(R.string.vpn_channel_name),
             NotificationManager.IMPORTANCE_LOW
         )
+        channel.description = getString(R.string.vpn_channel_description)
         val nm = getSystemService(NotificationManager::class.java)
         nm.createNotificationChannel(channel)
     }
 
     private fun buildNotification(text: String): Notification =
-        Notification.Builder(this, NOTIF_CHANNEL_ID)
-            .setContentTitle("tunmux")
+        Notification.Builder(this, notifChannelId)
+            .setContentTitle(getString(R.string.app_name))
             .setContentText(text)
-            .setSmallIcon(android.R.drawable.ic_dialog_info)
+            .setSmallIcon(R.drawable.ic_notification)
             .build()
 
     private external fun nativeInitialize(service: TunmuxVpnService, filesDir: String)

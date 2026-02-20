@@ -64,6 +64,24 @@ pub enum TopCommand {
         log_file: String,
     },
 
+    /// Internal: userspace WireGuard local-proxy daemon (hidden)
+    #[command(hide = true)]
+    LocalProxyDaemon {
+        #[arg(long)]
+        socks_port: u16,
+        #[arg(long)]
+        http_port: u16,
+        #[arg(long)]
+        proxy_access_log: bool,
+        #[arg(long)]
+        pid_file: String,
+        #[arg(long)]
+        log_file: String,
+        /// base64(JSON(LocalProxyConfig))
+        #[arg(long)]
+        config_b64: String,
+    },
+
     /// Internal privileged service mode (hidden)
     #[command(hide = true)]
     Privileged {
@@ -134,6 +152,10 @@ pub enum ProtonCommand {
         #[arg(long)]
         proxy: bool,
 
+        /// Start a userspace SOCKS5/HTTP proxy without root or VpnService
+        #[arg(long)]
+        local_proxy: bool,
+
         /// SOCKS5 proxy port (default: auto-assign from 1080)
         #[arg(long)]
         socks_port: Option<u16>,
@@ -200,6 +222,10 @@ pub enum AirVpnCommand {
         /// Start a SOCKS5/HTTP proxy (Linux only; VPN traffic isolated in network namespace)
         #[arg(long)]
         proxy: bool,
+
+        /// Start a userspace SOCKS5/HTTP proxy without root or VpnService
+        #[arg(long)]
+        local_proxy: bool,
 
         /// SOCKS5 proxy port (default: auto-assign from 1080)
         #[arg(long)]
@@ -351,6 +377,10 @@ pub enum MullvadCommand {
         #[arg(long)]
         proxy: bool,
 
+        /// Start a userspace SOCKS5/HTTP proxy without root or VpnService
+        #[arg(long)]
+        local_proxy: bool,
+
         /// SOCKS5 proxy port (default: auto-assign from 1080)
         #[arg(long)]
         socks_port: Option<u16>,
@@ -434,6 +464,10 @@ pub enum IvpnCommand {
         /// Start a SOCKS5/HTTP proxy (Linux only; VPN traffic isolated in network namespace)
         #[arg(long)]
         proxy: bool,
+
+        /// Start a userspace SOCKS5/HTTP proxy without root or VpnService
+        #[arg(long)]
+        local_proxy: bool,
 
         /// SOCKS5 proxy port (default: auto-assign from 1080)
         #[arg(long)]

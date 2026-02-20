@@ -15,4 +15,7 @@ object RustBridge {
     external fun airvpnRenameDevice(device: String, name: String): String
     external fun airvpnDeleteDevice(device: String): String
     external fun getConnectionStatus(): String
+    external fun createAccount(provider: String): String
+    external fun startLocalProxy(provider: String, serverJson: String, socksPort: Int, httpPort: Int): String
+    external fun stopLocalProxy(): String
 }

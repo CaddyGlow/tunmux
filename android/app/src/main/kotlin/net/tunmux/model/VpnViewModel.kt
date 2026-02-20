@@ -4,17 +4,21 @@ import android.app.Application
 import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
-import android.net.ConnectivityManager
-import android.net.Network
-import android.net.NetworkCapabilities
-import android.net.wifi.WifiInfo
+import android.net.wifi.WifiManager
 import android.os.Build
 import android.util.Log
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.ExperimentalCoroutinesApi
+import kotlinx.coroutines.FlowPreview
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.flow.debounce
+import kotlinx.coroutines.flow.distinctUntilChanged
+import kotlinx.coroutines.flow.flatMapLatest
+import kotlinx.coroutines.flow.collectLatest
+import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.isActive
@@ -26,7 +30,7 @@ import org.json.JSONArray
 import org.json.JSONObject
 
 enum class Screen { ProviderSelect, Login, Dashboard }
-enum class DashboardTab { Main, Config, Settings, Auto }
+enum class DashboardTab { Main, Tunnels, Config, Settings, Auto }
 enum class ConnectionState { Disconnected, Connecting, Connected }
 
 data class AirvpnKey(
@@ -48,15 +52,11 @@ data class SplitTunnelApp(
     val label: String,
 )
 
-private enum class NetworkProfile { None, Wifi, Mobile, Ethernet, Other }
-private data class ActiveNetworkState(
-    val profile: NetworkProfile,
-    val wifiSsid: String = "",
-)
-
 data class UiState(
-    val screen: Screen = Screen.ProviderSelect,
-    val selectedProvider: String = "",
+    val screen: Screen = Screen.Dashboard,
+    val selectedProvider: String = "proton",
+    val isLoggedIn: Boolean = false,
+    val loggedInUsername: String = "",
     val activeTab: DashboardTab = DashboardTab.Main,
     val connectionState: ConnectionState = ConnectionState.Disconnected,
     val serverList: List<String> = emptyList(),
@@ -70,6 +70,11 @@ data class UiState(
     val settingsMessage: String = "",
     val autoConfig: AutoTunnelConfig = AutoTunnelConfig(),
     val splitTunnelApps: List<SplitTunnelApp> = emptyList(),
+    val connectedWifiSsid: String = "",
+    val knownWifiSsids: List<String> = emptyList(),
+    val locationPermissionGranted: Boolean = false,
+    val locationServicesEnabled: Boolean = false,
+    val localProxyAddress: String? = null,
 )
 
 class VpnViewModel(app: Application) : AndroidViewModel(app) {
@@ -84,24 +89,10 @@ class VpnViewModel(app: Application) : AndroidViewModel(app) {
 
     private var statusJob: Job? = null
     private var autoConnectCooldownJob: Job? = null
+    private var networkMonitorJob: Job? = null
     private var networkProfile: NetworkProfile = NetworkProfile.None
     private var currentWifiSsid: String = ""
-    private val connectivityManager: ConnectivityManager? by lazy {
-        ctx.getSystemService(ConnectivityManager::class.java)
-    }
-    private val networkCallback = object : ConnectivityManager.NetworkCallback() {
-        override fun onAvailable(network: Network) {
-            onNetworkStateChanged()
-        }
-
-        override fun onLost(network: Network) {
-            onNetworkStateChanged()
-        }
-
-        override fun onCapabilitiesChanged(network: Network, networkCapabilities: NetworkCapabilities) {
-            onNetworkStateChanged()
-        }
-    }
+    private val networkMonitor = AndroidNetworkMonitor(ctx)
 
     init {
         val config = AppConfigStore.load(ctx)
@@ -112,6 +103,7 @@ class VpnViewModel(app: Application) : AndroidViewModel(app) {
         ensureStatusPolling()
         startNetworkMonitoring()
         loadInstalledApps()
+        refreshKnownWifiSsids()
 
         // Attempt silent re-login with credentials stored in Keystore.
         val saved = KeystoreCredentials.load(ctx)
@@ -131,6 +123,8 @@ class VpnViewModel(app: Application) : AndroidViewModel(app) {
                             activeTab = DashboardTab.Main,
                             serverList = servers,
                             errorMessage = "",
+                            isLoggedIn = true,
+                            loggedInUsername = extractUsername(savedCredential),
                         )
                         if (provider == "airvpn") {
                             refreshAirvpnSettingsDataInternal()
@@ -145,20 +139,39 @@ class VpnViewModel(app: Application) : AndroidViewModel(app) {
     }
 
     override fun onCleared() {
-        runCatching { connectivityManager?.unregisterNetworkCallback(networkCallback) }
+        networkMonitor.stop()
+        networkMonitorJob?.cancel()
         statusJob?.cancel()
         autoConnectCooldownJob?.cancel()
         super.onCleared()
     }
 
     fun selectProvider(provider: String) {
+        val prev = _state.value
+        if (prev.isLoggedIn) {
+            val prevProvider = prev.selectedProvider
+            KeystoreCredentials.clear(ctx)
+            AutoRuntimeStore.clear(ctx)
+            viewModelScope.launch(Dispatchers.IO) {
+                runCatching { RustBridge.logout(prevProvider) }
+            }
+        }
         AutoRuntimeStore.saveProvider(ctx, provider)
-        _state.value = _state.value.copy(
+        _state.value = prev.copy(
             selectedProvider = provider,
-            screen = Screen.Login,
+            isLoggedIn = false,
+            loggedInUsername = "",
+            serverList = emptyList(),
+            activeServer = "",
+            connectionState = ConnectionState.Disconnected,
+            wgLikeStatus = "",
             errorMessage = "",
             settingsMessage = "",
         )
+    }
+
+    fun openLogin() {
+        _state.value = _state.value.copy(screen = Screen.Login, errorMessage = "")
     }
 
     fun switchTab(tab: DashboardTab) {
@@ -168,6 +181,10 @@ class VpnViewModel(app: Application) : AndroidViewModel(app) {
         }
         if (tab == DashboardTab.Settings) {
             loadInstalledApps()
+        }
+        if (tab == DashboardTab.Auto) {
+            refreshKnownWifiSsids()
+            networkMonitor.refreshPermissions()
         }
     }
 
@@ -211,6 +228,8 @@ class VpnViewModel(app: Application) : AndroidViewModel(app) {
                         activeTab = DashboardTab.Main,
                         serverList = servers,
                         errorMessage = "",
+                        isLoggedIn = true,
+                        loggedInUsername = username,
                     )
                     if (provider == "airvpn") {
                         refreshAirvpnSettingsDataInternal()
@@ -237,7 +256,10 @@ class VpnViewModel(app: Application) : AndroidViewModel(app) {
         val config = _state.value.config
         val splitApps = _state.value.splitTunnelApps
         _state.value = UiState(
-            screen = Screen.ProviderSelect,
+            screen = Screen.Dashboard,
+            selectedProvider = provider,
+            isLoggedIn = false,
+            loggedInUsername = "",
             config = config,
             autoConfig = config.auto,
             splitTunnelApps = splitApps,
@@ -678,16 +700,38 @@ class VpnViewModel(app: Application) : AndroidViewModel(app) {
     }
 
     fun setAutoWifiSsids(rawValue: String) {
-        val parsed = rawValue
-            .split(",", "\n")
-            .map { normalizeSsid(it) }
-            .filter { it.isNotEmpty() }
-            .distinctBy { it.lowercase() }
+        val parsed = parseWifiSsidInput(rawValue)
         updateAutoConfig { it.copy(wifiSsids = parsed) }
+    }
+
+    fun setAutoWifiDetectionMethod(method: WifiDetectionMethod) {
+        updateAutoConfig { it.copy(wifiDetectionMethod = method) }
+        networkMonitor.updateDetectionMethod(method)
+        networkMonitor.refreshPermissions()
+    }
+
+    fun setAutoDebounceDelaySeconds(seconds: Int) {
+        updateAutoConfig { it.copy(debounceDelaySeconds = seconds.coerceIn(0, 60)) }
+    }
+
+    fun refreshAutoNetworkPermissions() {
+        networkMonitor.refreshPermissions()
     }
 
     fun setAutoDisconnectOnMatchedWifi(enabled: Boolean) {
         updateAutoConfig { it.copy(disconnectOnMatchedWifi = enabled) }
+    }
+
+    fun addConnectedWifiToAutoList() {
+        addAutoWifiSsid(currentWifiSsid)
+    }
+
+    fun addAutoWifiSsid(ssid: String) {
+        val normalized = normalizeSsid(ssid)
+        if (normalized.isEmpty()) return
+        val merged = (_state.value.autoConfig.wifiSsids + normalized)
+            .distinctBy { it.lowercase() }
+        updateAutoConfig { it.copy(wifiSsids = merged) }
     }
 
     fun setStopOnNoInternet(enabled: Boolean) {
@@ -738,6 +782,25 @@ class VpnViewModel(app: Application) : AndroidViewModel(app) {
         _state.value = _state.value.copy(config = config)
     }
 
+    fun setServerFavorite(server: String, favorite: Boolean) {
+        val normalized = server.trim()
+        if (normalized.isEmpty()) return
+
+        val current = _state.value.config.general.favoriteServers
+        val next = if (favorite) {
+            (current + normalized).distinctBy { it.lowercase() }.sortedBy { it.lowercase() }
+        } else {
+            current.filterNot { it.equals(normalized, ignoreCase = true) }
+        }
+        if (next == current) return
+
+        val config = _state.value.config.copy(
+            general = _state.value.config.general.copy(favoriteServers = next),
+        )
+        AppConfigStore.save(ctx, config)
+        _state.value = _state.value.copy(config = config)
+    }
+
     private fun updateAutoConfig(update: (AutoTunnelConfig) -> AutoTunnelConfig) {
         val current = _state.value.autoConfig
         val next = update(current)
@@ -750,37 +813,46 @@ class VpnViewModel(app: Application) : AndroidViewModel(app) {
         evaluateAutoTunnel("auto-config-changed")
     }
 
+    @OptIn(FlowPreview::class, ExperimentalCoroutinesApi::class)
     private fun startNetworkMonitoring() {
-        val snapshot = resolveActiveNetworkState()
-        networkProfile = snapshot.profile
-        currentWifiSsid = snapshot.wifiSsid
-        runCatching { connectivityManager?.registerDefaultNetworkCallback(networkCallback) }
-            .onFailure { Log.w(TAG, "network callback registration failed", it) }
+        val detectionMethod = _state.value.autoConfig.wifiDetectionMethod
+        networkMonitor.start(detectionMethod)
+        networkMonitorJob?.cancel()
+        networkMonitorJob =
+            viewModelScope.launch {
+                _state
+                    .map { it.autoConfig.debounceDelaySeconds }
+                    .distinctUntilChanged()
+                    .flatMapLatest { seconds ->
+                        if (seconds <= 0) {
+                            networkMonitor.state
+                        } else {
+                            networkMonitor.state.debounce(seconds * 1000L)
+                        }
+                    }
+                    .collectLatest { snapshot ->
+                    val changed =
+                        snapshot.profile != networkProfile ||
+                            snapshot.wifiSsid != currentWifiSsid ||
+                            snapshot.locationPermissionGranted !=
+                                _state.value.locationPermissionGranted ||
+                            snapshot.locationServicesEnabled != _state.value.locationServicesEnabled
+
+                    networkProfile = snapshot.profile
+                    currentWifiSsid = snapshot.wifiSsid
+                    _state.value =
+                        _state.value.copy(
+                            connectedWifiSsid = snapshot.wifiSsid,
+                            locationPermissionGranted = snapshot.locationPermissionGranted,
+                            locationServicesEnabled = snapshot.locationServicesEnabled,
+                        )
+
+                    if (changed) {
+                        evaluateAutoTunnel("network-changed:${snapshot.profile}:${snapshot.wifiSsid}")
+                    }
+                    }
+            }
         evaluateAutoTunnel("network-monitor-start")
-    }
-
-    private fun onNetworkStateChanged() {
-        val next = resolveActiveNetworkState()
-        if (next.profile != networkProfile || next.wifiSsid != currentWifiSsid) {
-            networkProfile = next.profile
-            currentWifiSsid = next.wifiSsid
-            evaluateAutoTunnel("network-changed:${next.profile}:${next.wifiSsid}")
-        }
-    }
-
-    private fun resolveActiveNetworkState(): ActiveNetworkState {
-        val cm = connectivityManager ?: return ActiveNetworkState(NetworkProfile.None)
-        val network = cm.activeNetwork ?: return ActiveNetworkState(NetworkProfile.None)
-        val caps = cm.getNetworkCapabilities(network) ?: return ActiveNetworkState(NetworkProfile.None)
-        return when {
-            caps.hasTransport(NetworkCapabilities.TRANSPORT_WIFI) -> ActiveNetworkState(
-                profile = NetworkProfile.Wifi,
-                wifiSsid = readWifiSsid(caps),
-            )
-            caps.hasTransport(NetworkCapabilities.TRANSPORT_CELLULAR) -> ActiveNetworkState(NetworkProfile.Mobile)
-            caps.hasTransport(NetworkCapabilities.TRANSPORT_ETHERNET) -> ActiveNetworkState(NetworkProfile.Ethernet)
-            else -> ActiveNetworkState(NetworkProfile.Other)
-        }
     }
 
     private fun evaluateAutoTunnel(reason: String) {
@@ -848,12 +920,6 @@ class VpnViewModel(app: Application) : AndroidViewModel(app) {
         return if (auto.disconnectOnMatchedWifi) !matched else matched
     }
 
-    private fun readWifiSsid(caps: NetworkCapabilities): String {
-        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.Q) return ""
-        val info = caps.transportInfo as? WifiInfo ?: return ""
-        return normalizeSsid(info.ssid)
-    }
-
     private fun loadInstalledApps() {
         viewModelScope.launch(Dispatchers.IO) {
             val pm = ctx.packageManager
@@ -896,9 +962,88 @@ class VpnViewModel(app: Application) : AndroidViewModel(app) {
         }
     }
 
+    fun refreshKnownWifiSsids() {
+        viewModelScope.launch(Dispatchers.IO) {
+            val known = loadKnownWifiSsids()
+            _state.value = _state.value.copy(knownWifiSsids = known)
+        }
+    }
+
+    private fun loadKnownWifiSsids(): List<String> {
+        return try {
+            val wifiManager = ctx.applicationContext.getSystemService(WifiManager::class.java)
+                ?: return emptyList()
+            @Suppress("DEPRECATION")
+            val configured = wifiManager.configuredNetworks ?: emptyList()
+            configured
+                .mapNotNull { normalizeSsid(it.SSID) }
+                .filter { it.isNotEmpty() }
+                .distinctBy { it.lowercase() }
+                .sortedBy { it.lowercase() }
+        } catch (_: Throwable) {
+            emptyList()
+        }
+    }
+
+    fun connectLocalProxy(serverJson: String) {
+        val provider = _state.value.selectedProvider
+        viewModelScope.launch(Dispatchers.IO) {
+            try {
+                val result = JSONObject(RustBridge.startLocalProxy(provider, serverJson, 0, 0))
+                if (result.optString("status") == "ok") {
+                    val socks = result.optInt("socks_port", 0)
+                    val http = result.optInt("http_port", 0)
+                    _state.value = _state.value.copy(
+                        localProxyAddress = "SOCKS5 127.0.0.1:$socks  HTTP 127.0.0.1:$http",
+                        errorMessage = "",
+                    )
+                } else {
+                    _state.value = _state.value.copy(
+                        errorMessage = result.optString("error", "Failed to start local proxy"),
+                    )
+                }
+            } catch (e: Exception) {
+                Log.e(TAG, "connectLocalProxy failed provider=$provider", e)
+                _state.value = _state.value.copy(errorMessage = e.message ?: "unexpected error")
+            }
+        }
+    }
+
+    fun disconnectLocalProxy() {
+        viewModelScope.launch(Dispatchers.IO) {
+            try {
+                RustBridge.stopLocalProxy()
+            } catch (e: Exception) {
+                Log.e(TAG, "disconnectLocalProxy failed", e)
+            }
+            _state.value = _state.value.copy(localProxyAddress = null)
+        }
+    }
+
+    fun createAccount(provider: String) {
+        viewModelScope.launch(Dispatchers.IO) {
+            try {
+                val result = JSONObject(RustBridge.createAccount(provider))
+                if (result.optString("status") == "ok") {
+                    val id = result.optString("account_number").ifBlank { result.optString("account_id") }
+                    _state.value = _state.value.copy(settingsMessage = "Account created: $id")
+                } else {
+                    _state.value = _state.value.copy(
+                        errorMessage = result.optString("error", "Failed to create account"),
+                    )
+                }
+            } catch (e: Exception) {
+                _state.value = _state.value.copy(errorMessage = e.message ?: "unexpected error")
+            }
+        }
+    }
+
+    private fun extractUsername(credentialJson: String): String =
+        try { JSONObject(credentialJson).optString("username", "") } catch (_: Exception) { "" }
+
     fun navigateBack() {
         _state.value = when (_state.value.screen) {
-            Screen.Login -> _state.value.copy(screen = Screen.ProviderSelect)
+            Screen.Login -> _state.value.copy(screen = Screen.Dashboard)
             Screen.ProviderSelect, Screen.Dashboard -> _state.value
         }
     }
@@ -913,8 +1058,10 @@ private fun JSONObject.optNullableLong(key: String): Long? {
     }
 }
 
-private fun normalizeSsid(value: String?): String {
-    val trimmed = value?.trim().orEmpty().removePrefix("\"").removeSuffix("\"")
-    if (trimmed.equals("<unknown ssid>", ignoreCase = true)) return ""
-    return trimmed
+private fun parseWifiSsidInput(rawValue: String): List<String> {
+    return rawValue
+        .split(",", "\n")
+        .map { normalizeSsid(it) }
+        .filter { it.isNotEmpty() }
+        .distinctBy { it.lowercase() }
 }
