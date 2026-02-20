@@ -12,7 +12,7 @@ use std::net::{IpAddr, SocketAddr};
 #[cfg(unix)]
 use std::os::unix::net::UnixDatagram;
 #[cfg(unix)]
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 #[cfg(unix)]
 use std::process::Command;
 #[cfg(unix)]
@@ -446,7 +446,7 @@ fn helper_tun_name(interface: &str) -> String {
         if interface == "utun" || interface.starts_with("utun") {
             return interface.to_string();
         }
-        return "utun".to_string();
+        "utun".to_string()
     }
 
     #[cfg(not(target_os = "macos"))]
@@ -469,7 +469,7 @@ fn configure_network(
     #[cfg(target_os = "macos")]
     {
         let cleanup = configure_network_macos(interface, config)?;
-        return Ok(CleanupState::Macos(cleanup));
+        Ok(CleanupState::Macos(cleanup))
     }
 
     #[cfg(not(any(target_os = "linux", target_os = "macos")))]

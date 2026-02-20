@@ -41,7 +41,7 @@ fn platform_interface_name(name: &str) -> String {
         if name == "utun" || name.starts_with("utun") {
             return name.to_string();
         }
-        return "utun".to_string();
+        "utun".to_string()
     }
     #[cfg(not(target_os = "macos"))]
     name.to_string()

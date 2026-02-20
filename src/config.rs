@@ -60,7 +60,7 @@ impl Default for GeneralConfig {
 fn default_backend() -> &'static str {
     #[cfg(target_os = "macos")]
     {
-        return "userspace";
+        "userspace"
     }
     #[cfg(not(target_os = "macos"))]
     {
