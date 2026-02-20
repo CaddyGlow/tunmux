@@ -38,6 +38,23 @@ cargo build
 cargo build --features keyring
 ```
 
+## Release CI (Tag-Based)
+
+Pushing a git tag (for example `v1.2.3`) triggers `.github/workflows/release.yml` to:
+- build release binaries for Linux, macOS, and Android targets
+- upload tarballs and SHA256 files to a GitHub Release for that tag
+- build and publish a multi-arch Docker image to GHCR
+
+Binary version output follows the tag in CI builds:
+
+```bash
+tunmux --version
+```
+
+Container tags:
+- `ghcr.io/<owner>/tunmux:<tag>`
+- `ghcr.io/<owner>/tunmux:latest` (only for non-prerelease tags)
+
 ## Quick Start
 
 ### 1) Sign in and connect (direct mode)

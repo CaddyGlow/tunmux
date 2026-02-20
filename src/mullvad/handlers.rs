@@ -163,7 +163,6 @@ pub async fn dispatch(command: MullvadCommand, config: &AppConfig) -> anyhow::Re
             .await
         }
         MullvadCommand::Disconnect { instance, all } => cmd_disconnect(instance, all),
-        MullvadCommand::WgShow => cmd_wg_show(),
     }
 }
 
@@ -680,16 +679,6 @@ fn cmd_disconnect(instance: Option<String>, all: bool) -> anyhow::Result<()> {
         }
     }
 
-    Ok(())
-}
-
-fn cmd_wg_show() -> anyhow::Result<()> {
-    use wireguard::connection::DIRECT_INSTANCE;
-    let state = wireguard::connection::ConnectionState::load(DIRECT_INSTANCE)?
-        .ok_or_else(|| anyhow::anyhow!("not connected (no active direct connection)"))?;
-    let client = crate::privileged_client::PrivilegedClient::new();
-    let output = client.wg_show(&state.interface_name)?;
-    print!("{}", output);
     Ok(())
 }
 

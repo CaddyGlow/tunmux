@@ -86,11 +86,19 @@ fn main() {
             }
         }
 
-        // Status is a quick sync command, no tokio needed.
+        // Status and Wg are quick sync commands, no tokio needed.
         TopCommand::Status => {
             init_logging(cli.verbose);
             if let Err(e) = cmd_status() {
                 error!( command = ?"status", error = ?e.to_string(), "command_failed");
+                std::process::exit(1);
+            }
+        }
+
+        TopCommand::Wg => {
+            init_logging(cli.verbose);
+            if let Err(e) = cmd_wg() {
+                error!( command = ?"wg", error = ?e.to_string(), "command_failed");
                 std::process::exit(1);
             }
         }
@@ -122,7 +130,10 @@ async fn run(command: TopCommand, config: config::AppConfig) -> anyhow::Result<(
         TopCommand::Airvpn { command } => airvpn::handlers::dispatch(command, &config).await,
         TopCommand::Mullvad { command } => mullvad::handlers::dispatch(command, &config).await,
         TopCommand::Ivpn { command } => ivpn::handlers::dispatch(command, &config).await,
-        TopCommand::Status | TopCommand::ProxyDaemon { .. } | TopCommand::Privileged { .. } => {
+        TopCommand::Status
+        | TopCommand::Wg
+        | TopCommand::ProxyDaemon { .. }
+        | TopCommand::Privileged { .. } => {
             unreachable!()
         }
     }
@@ -173,5 +184,15 @@ fn cmd_status() -> anyhow::Result<()> {
         );
     }
 
+    Ok(())
+}
+
+fn cmd_wg() -> anyhow::Result<()> {
+    use wireguard::connection::{ConnectionState, DIRECT_INSTANCE};
+
+    let state = ConnectionState::load(DIRECT_INSTANCE)?
+        .ok_or_else(|| anyhow::anyhow!("not connected (no active direct connection)"))?;
+    let output = privileged_client::PrivilegedClient::new().wg_show(&state.interface_name)?;
+    print!("{}", output);
     Ok(())
 }

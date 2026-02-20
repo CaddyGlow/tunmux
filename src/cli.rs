@@ -1,7 +1,11 @@
 use clap::{Parser, Subcommand};
 
 #[derive(Parser)]
-#[command(name = "tunmux", about = "Multi-provider VPN CLI", version)]
+#[command(
+    name = "tunmux",
+    about = "Multi-provider VPN CLI",
+    version = env!("TUNMUX_BUILD_VERSION")
+)]
 pub struct Cli {
     #[command(subcommand)]
     pub command: TopCommand,
@@ -39,6 +43,9 @@ pub enum TopCommand {
 
     /// Show active VPN connections and proxy instances
     Status,
+
+    /// Show WireGuard tunnel state for active direct connection(s)
+    Wg,
 
     /// Internal: proxy daemon process (hidden)
     #[command(hide = true)]
@@ -150,9 +157,6 @@ pub enum ProtonCommand {
         #[arg(long)]
         all: bool,
     },
-
-    /// Show WireGuard tunnel state for the active connection (all backends)
-    WgShow,
 }
 
 #[derive(Subcommand)]
@@ -286,9 +290,6 @@ pub enum AirVpnCommand {
         #[command(subcommand)]
         action: ApiKeyAction,
     },
-
-    /// Show WireGuard tunnel state for the active connection (all backends)
-    WgShow,
 }
 
 #[derive(Subcommand)]
@@ -373,9 +374,6 @@ pub enum MullvadCommand {
         #[arg(long)]
         all: bool,
     },
-
-    /// Show WireGuard tunnel state for the active connection (all backends)
-    WgShow,
 }
 
 #[derive(Subcommand)]
@@ -460,9 +458,6 @@ pub enum IvpnCommand {
         #[arg(long)]
         all: bool,
     },
-
-    /// Show WireGuard tunnel state for the active connection (all backends)
-    WgShow,
 }
 
 #[derive(Subcommand)]
