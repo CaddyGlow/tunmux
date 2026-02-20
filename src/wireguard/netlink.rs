@@ -259,7 +259,7 @@ fn nl_recv(fd: &OwnedFd, buf: &mut [u8]) -> Result<usize> {
 
 /// Resolve the Generic Netlink family ID for "wireguard".
 fn get_wg_family_id(fd: &OwnedFd, seq: u32) -> Result<u16> {
-    let mut msg = NlMsg::new(GENL_ID_CTRL, NLM_F_REQUEST | NLM_F_ACK, seq);
+    let mut msg = NlMsg::new(GENL_ID_CTRL, NLM_F_REQUEST, seq);
     msg.add_genl(CTRL_CMD_GETFAMILY, 1);
     msg.add_attr_str(CTRL_ATTR_FAMILY_NAME, "wireguard");
     nl_send(fd, msg.finalize())?;
