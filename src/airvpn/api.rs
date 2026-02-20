@@ -25,6 +25,7 @@ impl AirVpnClient {
     pub fn new() -> Result<Self> {
         let http = reqwest::Client::builder()
             .user_agent(USER_AGENT)
+            .redirect(reqwest::redirect::Policy::none())
             .connect_timeout(std::time::Duration::from_secs(10))
             .timeout(std::time::Duration::from_secs(30))
             .build()
@@ -59,13 +60,28 @@ impl AirVpnClient {
                         continue;
                     }
 
-                    let body = resp.bytes().await.map_err(|e| {
-                        AppError::AirVpnApi(format!("failed to read response: {}", e))
-                    })?;
+                    let body = match resp.bytes().await {
+                        Ok(body) => body,
+                        Err(e) => {
+                            last_err =
+                                Some(AppError::AirVpnApi(format!("failed to read response: {}", e)));
+                            continue;
+                        }
+                    };
 
                     // Response is raw AES-CBC ciphertext (same key/IV as request)
-                    let xml = self.crypto.decrypt_response(&body, &session)?;
-                    return Ok(xml);
+                    match self.crypto.decrypt_response(&body, &session) {
+                        Ok(xml) => return Ok(xml),
+                        Err(e) => {
+                            warn!(
+                                url = ?*url,
+                                error = ?e.to_string(),
+                                "airvpn_bootstrap_decrypt_error"
+                            );
+                            last_err = Some(e);
+                            continue;
+                        }
+                    }
                 }
                 Err(e) => {
                     last_err = Some(AppError::AirVpnApi(format!(

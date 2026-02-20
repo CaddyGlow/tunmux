@@ -1,5 +1,5 @@
 [workspace]
-members = [".", "android/rust-lib"]
+members = ["."]
 resolver = "2"
 
 [package]

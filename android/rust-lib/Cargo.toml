@@ -1,3 +1,5 @@
+[workspace]
+
 [package]
 name = "tunmux-android"
 version = "0.1.0"
@@ -10,8 +12,12 @@ name = "tunmux_android"
 [dependencies]
 tunmux = { path = "../..", default-features = false }
 jni = "0.21"
-tokio = { version = "1", features = ["rt-multi-thread", "sync", "macros"] }
+tokio = { version = "1", features = ["rt-multi-thread", "sync", "macros", "net", "time"] }
 serde_json = "1"
 log = "0.4"
 android_logger = "0.14"
 libc = "0.2"
+base64 = "0.22"
+socket2 = "0.5"
+gotatun = { version = "0.2.0", features = ["device", "tun"] }
+tun = { version = "0.8.5", features = ["async"], default-features = false }
