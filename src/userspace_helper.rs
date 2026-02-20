@@ -12,7 +12,7 @@ use std::net::{IpAddr, SocketAddr};
 #[cfg(unix)]
 use std::os::unix::net::UnixDatagram;
 #[cfg(unix)]
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 #[cfg(unix)]
 use std::process::Command;
 #[cfg(unix)]

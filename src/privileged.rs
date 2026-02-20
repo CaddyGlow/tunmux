@@ -10,7 +10,9 @@ use std::time::{Duration, Instant};
 use nix::sys::signal::{kill, Signal};
 #[cfg(target_os = "linux")]
 use nix::sys::socket::{getsockopt, sockopt::PeerCredentials};
-use nix::unistd::{chown, Gid, Group, Pid};
+use nix::unistd::{chown, Gid, Pid};
+#[cfg(not(target_os = "android"))]
+use nix::unistd::Group;
 use tracing::{debug, info, warn};
 
 use crate::config;
@@ -735,12 +737,13 @@ fn execute_unit(result: Result<()>) -> PrivilegedResponse {
 }
 
 fn execute_route(op: &str, destination: &str, via: Option<&str>, dev: &str) -> PrivilegedResponse {
-    let mut args = vec!["ip", "route", op, destination, "dev", dev];
+    let mut args = vec!["ip", "route", op, destination];
     if let Some(gw) = via {
-        args.insert(3, gw);
-        args.insert(4, "via");
+        args.push("via");
+        args.push(gw);
     }
-
+    args.push("dev");
+    args.push(dev);
     execute_unit(run(&args))
 }
 
@@ -807,19 +810,210 @@ fn run_wg_quick_down(path: &std::path::Path) -> Result<()> {
 }
 
 fn run_wg_show(interface: &str) -> Result<String> {
-    debug!(cmd = format!("wg show {}", interface), "exec");
-    let output = Command::new("wg")
-        .args(["show", interface])
-        .output()
-        .map_err(|e| AppError::WireGuard(format!("wg show failed to run: {}", e)))?;
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+    use std::io::BufRead;
+
+    let socket_path = std::path::PathBuf::from("/var/run/wireguard")
+        .join(format!("{interface}.sock"));
+
+    if !socket_path.exists() {
         return Err(AppError::WireGuard(format!(
-            "wg show exited {}: {}",
-            output.status, stderr
+            "no UAPI socket at {} — is the interface active and using the userspace backend?",
+            socket_path.display()
         )));
     }
-    Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+
+    debug!(socket = ?socket_path.display().to_string(), "uapi_get");
+    let mut stream = UnixStream::connect(&socket_path)
+        .map_err(|e| AppError::WireGuard(format!("UAPI connect: {e}")))?;
+    std::io::Write::write_all(&mut stream, b"get=1\n\n")
+        .map_err(|e| AppError::WireGuard(format!("UAPI write: {e}")))?;
+
+    // The UAPI protocol terminates responses with errno=N\n\n (double newline)
+    // but keeps the socket open. Read line-by-line and stop after the empty
+    // line that follows the errno= line, rather than waiting for EOF.
+    let mut raw = String::new();
+    let reader = std::io::BufReader::new(&mut stream);
+    let mut saw_errno = false;
+    for line in reader.lines() {
+        let line = line.map_err(|e| AppError::WireGuard(format!("UAPI read: {e}")))?;
+        if line.starts_with("errno=") {
+            saw_errno = true;
+            raw.push_str(&line);
+            raw.push('\n');
+        } else if line.is_empty() && saw_errno {
+            break;
+        } else {
+            raw.push_str(&line);
+            raw.push('\n');
+        }
+    }
+
+    format_wg_show(&raw, interface)
+}
+
+fn format_wg_show(raw: &str, interface: &str) -> Result<String> {
+    use base64::Engine;
+    use gotatun::x25519::{PublicKey, StaticSecret};
+
+    struct PeerState {
+        public_key_b64: String,
+        endpoint: Option<String>,
+        allowed_ips: Vec<String>,
+        last_handshake_sec: u64,
+        rx_bytes: u64,
+        tx_bytes: u64,
+        keepalive: u32,
+    }
+
+    let now_secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+
+    let mut listen_port: u32 = 0;
+    let mut iface_pub_b64 = String::new();
+    let mut peers: Vec<PeerState> = Vec::new();
+    let mut current_peer: Option<PeerState> = None;
+
+    for line in raw.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let Some((key, value)) = line.split_once('=') else {
+            continue;
+        };
+
+        match key {
+            "private_key" => {
+                if let Ok(bytes) = wg_hex_to_32(value) {
+                    let secret = StaticSecret::from(bytes);
+                    let public = PublicKey::from(&secret);
+                    iface_pub_b64 = base64::engine::general_purpose::STANDARD
+                        .encode(public.as_bytes());
+                }
+            }
+            "listen_port" => listen_port = value.parse().unwrap_or(0),
+            "public_key" => {
+                if let Some(peer) = current_peer.take() {
+                    peers.push(peer);
+                }
+                if let Ok(bytes) = wg_hex_to_32(value) {
+                    current_peer = Some(PeerState {
+                        public_key_b64: base64::engine::general_purpose::STANDARD.encode(bytes),
+                        endpoint: None,
+                        allowed_ips: Vec::new(),
+                        last_handshake_sec: 0,
+                        rx_bytes: 0,
+                        tx_bytes: 0,
+                        keepalive: 0,
+                    });
+                }
+            }
+            _ => {
+                if let Some(ref mut peer) = current_peer {
+                    match key {
+                        "endpoint" => peer.endpoint = Some(value.to_string()),
+                        "allowed_ip" => peer.allowed_ips.push(value.to_string()),
+                        "last_handshake_time_sec" => {
+                            peer.last_handshake_sec = value.parse().unwrap_or(0)
+                        }
+                        "rx_bytes" => peer.rx_bytes = value.parse().unwrap_or(0),
+                        "tx_bytes" => peer.tx_bytes = value.parse().unwrap_or(0),
+                        "persistent_keepalive_interval" => {
+                            peer.keepalive = value.parse().unwrap_or(0)
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+    }
+    if let Some(peer) = current_peer.take() {
+        peers.push(peer);
+    }
+
+    let mut out = String::new();
+    out.push_str(&format!("interface: {interface}\n"));
+    if !iface_pub_b64.is_empty() {
+        out.push_str(&format!("  public key: {iface_pub_b64}\n"));
+    }
+    out.push_str("  private key: (hidden)\n");
+    if listen_port != 0 {
+        out.push_str(&format!("  listening port: {listen_port}\n"));
+    }
+
+    for peer in &peers {
+        out.push('\n');
+        out.push_str(&format!("peer: {}\n", peer.public_key_b64));
+        if let Some(ref ep) = peer.endpoint {
+            out.push_str(&format!("  endpoint: {ep}\n"));
+        }
+        if !peer.allowed_ips.is_empty() {
+            out.push_str(&format!("  allowed ips: {}\n", peer.allowed_ips.join(", ")));
+        }
+        if peer.last_handshake_sec > 0 {
+            let ago = now_secs.saturating_sub(peer.last_handshake_sec);
+            out.push_str(&format!("  latest handshake: {}\n", wg_format_ago(ago)));
+        } else {
+            out.push_str("  latest handshake: (none)\n");
+        }
+        out.push_str(&format!(
+            "  transfer: {} received, {} sent\n",
+            wg_format_bytes(peer.rx_bytes),
+            wg_format_bytes(peer.tx_bytes)
+        ));
+        if peer.keepalive > 0 {
+            out.push_str(&format!(
+                "  persistent keepalive: every {} seconds\n",
+                peer.keepalive
+            ));
+        }
+    }
+
+    Ok(out)
+}
+
+fn wg_hex_to_32(s: &str) -> std::result::Result<[u8; 32], ()> {
+    if s.len() != 64 {
+        return Err(());
+    }
+    let mut bytes = [0u8; 32];
+    for (i, b) in bytes.iter_mut().enumerate() {
+        *b = u8::from_str_radix(&s[i * 2..i * 2 + 2], 16).map_err(|_| ())?;
+    }
+    Ok(bytes)
+}
+
+fn wg_format_ago(secs: u64) -> String {
+    if secs < 60 {
+        return format!("{secs} second{}", if secs == 1 { "" } else { "s" });
+    }
+    let mins = secs / 60;
+    if mins < 60 {
+        return format!("{mins} minute{}", if mins == 1 { "" } else { "s" });
+    }
+    let hours = mins / 60;
+    if hours < 24 {
+        return format!("{hours} hour{}", if hours == 1 { "" } else { "s" });
+    }
+    let days = hours / 24;
+    format!("{days} day{}", if days == 1 { "" } else { "s" })
+}
+
+fn wg_format_bytes(bytes: u64) -> String {
+    const KIB: u64 = 1024;
+    const MIB: u64 = 1024 * KIB;
+    const GIB: u64 = 1024 * MIB;
+    if bytes >= GIB {
+        format!("{:.2} GiB", bytes as f64 / GIB as f64)
+    } else if bytes >= MIB {
+        format!("{:.2} MiB", bytes as f64 / MIB as f64)
+    } else if bytes >= KIB {
+        format!("{:.2} KiB", bytes as f64 / KIB as f64)
+    } else {
+        format!("{bytes} B")
+    }
 }
 
 fn run_gotatun_up(interface: &str, config_content: &str) -> Result<()> {
@@ -1107,11 +1301,17 @@ fn is_authorized(peer_uid: u32, peer_gid: u32, authorized_group: Option<&str>) -
     false
 }
 
+#[cfg(not(target_os = "android"))]
 fn read_group_gid(group_name: &str) -> Option<u32> {
     Group::from_name(group_name)
         .ok()
         .flatten()
         .map(|g| g.gid.as_raw())
+}
+
+#[cfg(target_os = "android")]
+fn read_group_gid(_group_name: &str) -> Option<u32> {
+    None
 }
 
 fn managed_pid_registry_dir() -> std::path::PathBuf {

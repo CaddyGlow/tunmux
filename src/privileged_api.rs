@@ -182,7 +182,8 @@ impl PrivilegedRequest {
                 via,
                 dev,
             } => {
-                validate_interface_name(dev)?;
+                // dev may be a physical uplink (eth0, wlan0, enp2s0, …) not just a VPN interface
+                validate_host_interface_name(dev)?;
                 validate_route_destination(destination)?;
                 if let Some(gateway) = via {
                     validate_ipv4_like(gateway)?;
@@ -323,6 +324,21 @@ fn validate_interface_name(interface: &str) -> Result<(), String> {
         .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
     {
         return Err("wg-* interface name contains invalid characters".into());
+    }
+    Ok(())
+}
+
+/// Accepts any plausible Linux network interface name (eth0, wlan0, enp2s0, …).
+/// Used for route `dev` fields where the device may be a physical uplink.
+fn validate_host_interface_name(name: &str) -> Result<(), String> {
+    if name.is_empty() || name.len() > 15 {
+        return Err("interface name must be 1..=15 chars".into());
+    }
+    if !name
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.')
+    {
+        return Err("interface name contains invalid characters".into());
     }
     Ok(())
 }
