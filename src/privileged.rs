@@ -15,7 +15,9 @@ use tracing::{debug, info, warn};
 
 use crate::config;
 use crate::error::{AppError, Result};
-use crate::privileged_api::{KillSignal, PrivilegedRequest, PrivilegedResponse, WgQuickAction};
+use crate::privileged_api::{
+    GotaTunAction, KillSignal, PrivilegedRequest, PrivilegedResponse, WgQuickAction,
+};
 
 const AUTH_GROUP_NAME: &str = "tunmux";
 struct ControlState {
@@ -359,6 +361,7 @@ fn describe_request(request: &PrivilegedRequest) -> &'static str {
         PrivilegedRequest::WireguardSet { .. } => "WireguardSet",
         PrivilegedRequest::WireguardSetPsk { .. } => "WireguardSetPsk",
         PrivilegedRequest::WgQuickRun { .. } => "WgQuickRun",
+        PrivilegedRequest::GotaTunRun { .. } => "GotaTunRun",
         PrivilegedRequest::EnsureDir { .. } => "EnsureDir",
         PrivilegedRequest::WriteFile { .. } => "WriteFile",
         PrivilegedRequest::RemoveDirAll { .. } => "RemoveDirAll",
@@ -528,6 +531,29 @@ fn dispatch(request: PrivilegedRequest, control_state: &mut ControlState) -> Pri
                 }
             }
         }
+
+        PrivilegedRequest::GotaTunRun {
+            action,
+            interface,
+            config_content,
+        } => match action {
+            GotaTunAction::Up => {
+                match run_gotatun_up(interface.as_str(), config_content.as_str()) {
+                    Ok(()) => PrivilegedResponse::Unit,
+                    Err(e) => PrivilegedResponse::Error {
+                        code: categorize_error(&e),
+                        message: e.to_string(),
+                    },
+                }
+            }
+            GotaTunAction::Down => match run_gotatun_down(interface.as_str()) {
+                Ok(()) => PrivilegedResponse::Unit,
+                Err(e) => PrivilegedResponse::Error {
+                    code: categorize_error(&e),
+                    message: e.to_string(),
+                },
+            },
+        },
 
         PrivilegedRequest::EnsureDir { path, mode } => match std::fs::create_dir_all(&path) {
             Err(e) => PrivilegedResponse::Error {
@@ -732,6 +758,13 @@ fn run_wg_quick_up(
     let mut command = Command::new("wg-quick");
     if prefer_userspace {
         command.env("WG_I_PREFER_BUGGY_USERSPACE_TO_POLISHED_KMOD", "1");
+        command.env("TUNMUX_GOTATUN_HELPER", "1");
+        let helper_exe = self_executable_for_spawn()?;
+        command.env("WG_QUICK_USERSPACE_IMPLEMENTATION", &helper_exe);
+        debug!(
+            helper = ?helper_exe.display().to_string(),
+            "wg_quick_userspace_helper"
+        );
     }
 
     debug!(cmd = format!("wg-quick up {}", path.display()), "exec");
@@ -760,6 +793,44 @@ fn run_wg_quick_down(path: &std::path::Path) -> Result<()> {
             "wg-quick down exited {}",
             status
         )));
+    }
+    Ok(())
+}
+
+fn run_gotatun_up(interface: &str, config_content: &str) -> Result<()> {
+    use base64::Engine;
+
+    let exe = self_executable_for_spawn()?;
+    let config_b64 = base64::engine::general_purpose::STANDARD.encode(config_content);
+
+    debug!(
+        cmd = format!("{} {} [TUNMUX_GOTATUN_HELPER=1]", exe.display(), interface),
+        "exec"
+    );
+    let status = Command::new(exe)
+        .env("TUNMUX_GOTATUN_HELPER", "1")
+        .env("TUNMUX_GOTATUN_CONFIG_B64", config_b64)
+        .arg(interface)
+        .status()
+        .map_err(|e| AppError::Other(format!("gotatun up failed to start: {}", e)))?;
+
+    if !status.success() {
+        return Err(AppError::WireGuard(format!("gotatun up exited {}", status)));
+    }
+    Ok(())
+}
+
+fn run_gotatun_down(interface: &str) -> Result<()> {
+    let socket_path =
+        std::path::PathBuf::from("/var/run/wireguard").join(format!("{interface}.sock"));
+    if socket_path.exists() {
+        std::fs::remove_file(&socket_path).map_err(|e| {
+            AppError::Other(format!(
+                "failed to remove gotatun control socket {}: {}",
+                socket_path.display(),
+                e
+            ))
+        })?;
     }
     Ok(())
 }

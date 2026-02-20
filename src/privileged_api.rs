@@ -10,6 +10,12 @@ pub enum WgQuickAction {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum GotaTunAction {
+    Up,
+    Down,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum KillSignal {
     Term,
     Kill,
@@ -82,6 +88,11 @@ pub enum PrivilegedRequest {
         config_content: String,
         #[serde(default)]
         prefer_userspace: bool,
+    },
+    GotaTunRun {
+        action: GotaTunAction,
+        interface: String,
+        config_content: String,
     },
 
     EnsureDir {
@@ -209,6 +220,17 @@ impl PrivilegedRequest {
             } => {
                 validate_interface_name(interface)?;
                 validate_provider(provider)?;
+                Ok(())
+            }
+            Self::GotaTunRun {
+                action,
+                interface,
+                config_content,
+            } => {
+                validate_interface_name(interface)?;
+                if matches!(action, GotaTunAction::Up) && config_content.trim().is_empty() {
+                    return Err("config_content cannot be empty".into());
+                }
                 Ok(())
             }
             Self::EnsureDir { path, .. } => validate_ensure_dir_path(path),

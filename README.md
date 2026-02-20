@@ -16,14 +16,16 @@ It supports Proton VPN, AirVPN, Mullvad, and IVPN with WireGuard connectivity in
 - Run multiple VPN exits side-by-side in proxy mode
 - In proxy mode, keep host traffic unchanged unless an app explicitly uses a proxy
 - Manage provider-specific account and utility commands from one CLI
-- Support multiple WireGuard backends: `auto`, `wg-quick`, `userspace`, `kernel`
+- Support multiple WireGuard backends: `wg-quick`, `userspace`, `kernel`
 
 ## Platform And Requirements
 
 - Rust (stable, edition 2021)
 - Linux for full feature set (kernel backend + network namespace proxy isolation)
-- macOS for direct mode (`--proxy` is Linux-only; use `--backend userspace`, requires `wg-quick`)
+- macOS for direct mode (`--proxy` is Linux-only; use `--backend userspace` or `--backend wg-quick`)
 - `sudo` access for privileged operations (`tunmux privileged --serve`)
+
+`userspace` mode uses the embedded `gotatun` library through a built-in helper; no separate `gotatun` CLI install is required.
 
 Optional:
 - systemd socket activation via `systemd/tunmux-privileged.socket`
@@ -42,7 +44,7 @@ cargo build --features keyring
 
 ```bash
 tunmux proton login <username>
-tunmux proton connect --country CH --backend auto
+tunmux proton connect --country CH --backend wg-quick
 tunmux status
 tunmux proton disconnect
 ```
@@ -201,7 +203,7 @@ Example:
 
 ```toml
 [general]
-backend = "auto"                  # auto, wg-quick, userspace, kernel
+backend = "wg-quick"              # wg-quick, userspace, kernel
 credential_store = "keyring"      # keyring or file
 proxy_access_log = false
 privileged_transport = "socket"   # socket or stdio

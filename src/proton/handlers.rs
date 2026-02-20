@@ -99,7 +99,9 @@ async fn cmd_login(username: &str, config: &AppConfig) -> anyhow::Result<()> {
 
 async fn cmd_logout(config: &AppConfig) -> anyhow::Result<()> {
     // Disconnect if active
-    if wireguard::wg_quick::is_interface_active(INTERFACE_NAME) {
+    if wireguard::wg_quick::is_interface_active(INTERFACE_NAME)
+        || wireguard::userspace::is_interface_active(INTERFACE_NAME)
+    {
         println!("Disconnecting active VPN connection...");
         disconnect_instance_direct()?;
     }
@@ -200,7 +202,7 @@ async fn cmd_connect(
 
     if use_proxy {
         // Proxy mode requires kernel backend
-        if matches!(backend_str, "wg-quick" | "userspace" | "user-space") {
+        if matches!(backend_str, "wg-quick" | "userspace") {
             anyhow::bail!(
                 "--proxy requires kernel backend (incompatible with --backend {})",
                 backend_str
@@ -388,7 +390,9 @@ fn connect_direct(
     if wireguard::connection::ConnectionState::exists(DIRECT_INSTANCE) {
         anyhow::bail!("Already connected via direct VPN. Disconnect first.");
     }
-    if wireguard::wg_quick::is_interface_active(INTERFACE_NAME) {
+    if wireguard::wg_quick::is_interface_active(INTERFACE_NAME)
+        || wireguard::userspace::is_interface_active(INTERFACE_NAME)
+    {
         anyhow::bail!("Already connected. Run `tunmux proton disconnect` first.");
     }
 
@@ -418,7 +422,7 @@ fn connect_direct(
         }
         wireguard::backend::WgBackend::Userspace => {
             let wg_config = wireguard::config::generate_config(params);
-            wireguard::wg_quick::up(&wg_config, INTERFACE_NAME, PROVIDER, true)?;
+            wireguard::userspace::up(&wg_config, INTERFACE_NAME)?;
 
             let state = wireguard::connection::ConnectionState {
                 instance_name: DIRECT_INSTANCE.to_string(),
@@ -549,8 +553,12 @@ fn disconnect_one(state: &wireguard::connection::ConnectionState) -> anyhow::Res
             wireguard::backend::WgBackend::Kernel => {
                 wireguard::kernel::down(state)?;
             }
-            wireguard::backend::WgBackend::WgQuick | wireguard::backend::WgBackend::Userspace => {
+            wireguard::backend::WgBackend::WgQuick => {
                 wireguard::wg_quick::down(&state.interface_name, PROVIDER)?;
+                wireguard::connection::ConnectionState::remove(&state.instance_name)?;
+            }
+            wireguard::backend::WgBackend::Userspace => {
+                wireguard::userspace::down(&state.interface_name)?;
                 wireguard::connection::ConnectionState::remove(&state.instance_name)?;
             }
         }

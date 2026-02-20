@@ -232,8 +232,8 @@ struct IvpnBasicResponse {
 
 pub async fn dispatch(command: IvpnCommand, config: &AppConfig) -> anyhow::Result<()> {
     match command {
-        IvpnCommand::Login { account } => cmd_login(&account, config).await,
-        IvpnCommand::CreateAccount { product } => cmd_create_account(&product).await,
+        IvpnCommand::Login { account, .. } => cmd_login(&account, config).await,
+        IvpnCommand::CreateAccount { product, .. } => cmd_create_account(&product).await,
         IvpnCommand::Payment { action } => match action {
             IvpnPaymentCommand::Monero { account, duration } => {
                 cmd_monero_payment(account.as_deref(), &duration, config).await
@@ -495,7 +495,7 @@ async fn cmd_connect(
         anyhow::bail!("--proxy is available only on Linux");
     }
 
-    if use_proxy && matches!(backend_str, "wg-quick" | "userspace" | "user-space") {
+    if use_proxy && matches!(backend_str, "wg-quick" | "userspace") {
         anyhow::bail!(
             "--proxy requires kernel backend (incompatible with --backend {})",
             backend_str
@@ -660,7 +660,9 @@ fn connect_direct(
     if wireguard::connection::ConnectionState::exists(DIRECT_INSTANCE) {
         anyhow::bail!("Already connected via direct VPN. Disconnect first.");
     }
-    if wireguard::wg_quick::is_interface_active(INTERFACE_NAME) {
+    if wireguard::wg_quick::is_interface_active(INTERFACE_NAME)
+        || wireguard::userspace::is_interface_active(INTERFACE_NAME)
+    {
         anyhow::bail!("Already connected. Run `tunmux ivpn disconnect` first.");
     }
 
@@ -690,7 +692,7 @@ fn connect_direct(
         }
         wireguard::backend::WgBackend::Userspace => {
             let wg_config = wireguard::config::generate_config(params);
-            wireguard::wg_quick::up(&wg_config, INTERFACE_NAME, PROVIDER, true)?;
+            wireguard::userspace::up(&wg_config, INTERFACE_NAME)?;
 
             let state = wireguard::connection::ConnectionState {
                 instance_name: DIRECT_INSTANCE.to_string(),
@@ -813,8 +815,12 @@ fn disconnect_one(state: &wireguard::connection::ConnectionState) -> anyhow::Res
             wireguard::backend::WgBackend::Kernel => {
                 wireguard::kernel::down(state)?;
             }
-            wireguard::backend::WgBackend::WgQuick | wireguard::backend::WgBackend::Userspace => {
+            wireguard::backend::WgBackend::WgQuick => {
                 wireguard::wg_quick::down(&state.interface_name, PROVIDER)?;
+                wireguard::connection::ConnectionState::remove(&state.instance_name)?;
+            }
+            wireguard::backend::WgBackend::Userspace => {
+                wireguard::userspace::down(&state.interface_name)?;
                 wireguard::connection::ConnectionState::remove(&state.instance_name)?;
             }
         }

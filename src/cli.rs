@@ -119,7 +119,7 @@ pub enum ProtonCommand {
         #[arg(long)]
         p2p: bool,
 
-        /// WireGuard backend: auto, wg-quick, userspace, kernel
+        /// WireGuard backend: wg-quick, userspace, kernel
         #[arg(long)]
         backend: Option<String>,
 
@@ -186,7 +186,7 @@ pub enum AirVpnCommand {
         #[arg(short, long)]
         key: Option<String>,
 
-        /// WireGuard backend: auto, wg-quick, userspace, kernel
+        /// WireGuard backend: wg-quick, userspace, kernel
         #[arg(long)]
         backend: Option<String>,
 
@@ -336,7 +336,7 @@ pub enum MullvadCommand {
         #[arg(short, long)]
         country: Option<String>,
 
-        /// WireGuard backend: auto, wg-quick, userspace, kernel
+        /// WireGuard backend: wg-quick, userspace, kernel
         #[arg(long)]
         backend: Option<String>,
 
@@ -420,7 +420,7 @@ pub enum IvpnCommand {
         #[arg(short, long)]
         country: Option<String>,
 
-        /// WireGuard backend: auto, wg-quick, userspace, kernel
+        /// WireGuard backend: wg-quick, userspace, kernel
         #[arg(long)]
         backend: Option<String>,
 

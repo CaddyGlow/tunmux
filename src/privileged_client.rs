@@ -17,7 +17,9 @@ use crate::config;
 use crate::config::{PrivilegedAutostopMode, PrivilegedTransport};
 use crate::error::{AppError, Result};
 
-use crate::privileged_api::{KillSignal, PrivilegedRequest, PrivilegedResponse, WgQuickAction};
+use crate::privileged_api::{
+    GotaTunAction, KillSignal, PrivilegedRequest, PrivilegedResponse, WgQuickAction,
+};
 
 const FALLBACK_AUTH_GROUP: &str = "tunmux";
 
@@ -305,6 +307,19 @@ impl PrivilegedClient {
             provider: provider.to_string(),
             config_content: config_content.to_string(),
             prefer_userspace,
+        })
+    }
+
+    pub fn gotatun_run(
+        &self,
+        action: GotaTunAction,
+        interface: &str,
+        config_content: &str,
+    ) -> Result<()> {
+        self.send_unit(PrivilegedRequest::GotaTunRun {
+            action,
+            interface: interface.to_string(),
+            config_content: config_content.to_string(),
         })
     }
 
@@ -1154,6 +1169,7 @@ fn request_kind(request: &PrivilegedRequest) -> &'static str {
         PrivilegedRequest::WireguardSet { .. } => "WireguardSet",
         PrivilegedRequest::WireguardSetPsk { .. } => "WireguardSetPsk",
         PrivilegedRequest::WgQuickRun { .. } => "WgQuickRun",
+        PrivilegedRequest::GotaTunRun { .. } => "GotaTunRun",
         PrivilegedRequest::EnsureDir { .. } => "EnsureDir",
         PrivilegedRequest::WriteFile { .. } => "WriteFile",
         PrivilegedRequest::RemoveDirAll { .. } => "RemoveDirAll",

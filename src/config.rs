@@ -41,7 +41,7 @@ pub struct GeneralConfig {
 impl Default for GeneralConfig {
     fn default() -> Self {
         Self {
-            backend: "auto".to_string(),
+            backend: default_backend().to_string(),
             credential_store: "file".to_string(),
             proxy: false,
             socks_port: None,
@@ -54,6 +54,17 @@ impl Default for GeneralConfig {
             privileged_autostop_mode: PrivilegedAutostopMode::Never,
             privileged_autostop_timeout_ms: 30000,
         }
+    }
+}
+
+fn default_backend() -> &'static str {
+    #[cfg(target_os = "macos")]
+    {
+        return "userspace";
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        return "wg-quick";
     }
 }
 

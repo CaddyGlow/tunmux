@@ -23,6 +23,7 @@ mod proxy;
 #[cfg(not(all(feature = "proxy", target_os = "linux")))]
 #[path = "proxy_stub.rs"]
 mod proxy;
+mod userspace_helper;
 mod wireguard;
 
 use clap::Parser;
@@ -32,6 +33,10 @@ use cli::{Cli, TopCommand};
 use wireguard::connection::ConnectionState;
 
 fn main() {
+    if userspace_helper::maybe_run_from_env() {
+        return;
+    }
+
     let cli = Cli::parse();
 
     match cli.command {
