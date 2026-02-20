@@ -6,8 +6,11 @@ import android.content.Intent
 import android.net.ConnectivityManager
 import android.net.NetworkCapabilities
 import android.net.VpnService
+import android.net.wifi.WifiInfo
+import android.os.Build
 import android.util.Log
 import net.tunmux.model.AppConfigStore
+import net.tunmux.model.AutoTunnelConfig
 import net.tunmux.model.AutoRuntimeStore
 
 class BootCompletedReceiver : BroadcastReceiver() {
@@ -30,7 +33,7 @@ class BootCompletedReceiver : BroadcastReceiver() {
             Log.i(TAG, "boot auto-tunnel skipped: missing provider/server")
             return
         }
-        if (!shouldTunnelNow(context, auto.onWifi, auto.onMobile, auto.onEthernet)) {
+        if (!shouldTunnelNow(context, auto)) {
             Log.i(TAG, "boot auto-tunnel skipped: current network not selected")
             return
         }
@@ -60,18 +63,36 @@ class BootCompletedReceiver : BroadcastReceiver() {
 
     private fun shouldTunnelNow(
         context: Context,
-        onWifi: Boolean,
-        onMobile: Boolean,
-        onEthernet: Boolean,
+        auto: AutoTunnelConfig,
     ): Boolean {
         val cm = context.getSystemService(ConnectivityManager::class.java) ?: return false
         val activeNetwork = cm.activeNetwork ?: return false
         val caps = cm.getNetworkCapabilities(activeNetwork) ?: return false
         return when {
-            caps.hasTransport(NetworkCapabilities.TRANSPORT_WIFI) -> onWifi
-            caps.hasTransport(NetworkCapabilities.TRANSPORT_CELLULAR) -> onMobile
-            caps.hasTransport(NetworkCapabilities.TRANSPORT_ETHERNET) -> onEthernet
+            caps.hasTransport(NetworkCapabilities.TRANSPORT_WIFI) -> shouldTunnelOnWifi(auto, caps)
+            caps.hasTransport(NetworkCapabilities.TRANSPORT_CELLULAR) -> auto.onMobile
+            caps.hasTransport(NetworkCapabilities.TRANSPORT_ETHERNET) -> auto.onEthernet
             else -> false
         }
+    }
+
+    private fun shouldTunnelOnWifi(auto: AutoTunnelConfig, caps: NetworkCapabilities): Boolean {
+        if (!auto.onWifi) return false
+        if (auto.wifiSsids.isEmpty()) return true
+        val ssid = readWifiSsid(caps)
+        val matched = ssid.isNotBlank() && auto.wifiSsids.any { it.equals(ssid, ignoreCase = true) }
+        return if (auto.disconnectOnMatchedWifi) !matched else matched
+    }
+
+    private fun readWifiSsid(caps: NetworkCapabilities): String {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.Q) return ""
+        val info = caps.transportInfo as? WifiInfo ?: return ""
+        return normalizeSsid(info.ssid)
+    }
+
+    private fun normalizeSsid(value: String?): String {
+        val trimmed = value?.trim().orEmpty().removePrefix("\"").removeSuffix("\"")
+        if (trimmed.equals("<unknown ssid>", ignoreCase = true)) return ""
+        return trimmed
     }
 }

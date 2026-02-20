@@ -7,6 +7,7 @@ import android.content.pm.PackageManager
 import android.net.ConnectivityManager
 import android.net.Network
 import android.net.NetworkCapabilities
+import android.net.wifi.WifiInfo
 import android.os.Build
 import android.util.Log
 import androidx.lifecycle.AndroidViewModel
@@ -48,6 +49,10 @@ data class SplitTunnelApp(
 )
 
 private enum class NetworkProfile { None, Wifi, Mobile, Ethernet, Other }
+private data class ActiveNetworkState(
+    val profile: NetworkProfile,
+    val wifiSsid: String = "",
+)
 
 data class UiState(
     val screen: Screen = Screen.ProviderSelect,
@@ -80,6 +85,7 @@ class VpnViewModel(app: Application) : AndroidViewModel(app) {
     private var statusJob: Job? = null
     private var autoConnectCooldownJob: Job? = null
     private var networkProfile: NetworkProfile = NetworkProfile.None
+    private var currentWifiSsid: String = ""
     private val connectivityManager: ConnectivityManager? by lazy {
         ctx.getSystemService(ConnectivityManager::class.java)
     }
@@ -671,6 +677,19 @@ class VpnViewModel(app: Application) : AndroidViewModel(app) {
         updateAutoConfig { it.copy(onEthernet = enabled) }
     }
 
+    fun setAutoWifiSsids(rawValue: String) {
+        val parsed = rawValue
+            .split(",", "\n")
+            .map { normalizeSsid(it) }
+            .filter { it.isNotEmpty() }
+            .distinctBy { it.lowercase() }
+        updateAutoConfig { it.copy(wifiSsids = parsed) }
+    }
+
+    fun setAutoDisconnectOnMatchedWifi(enabled: Boolean) {
+        updateAutoConfig { it.copy(disconnectOnMatchedWifi = enabled) }
+    }
+
     fun setStopOnNoInternet(enabled: Boolean) {
         updateAutoConfig { it.copy(stopOnNoInternet = enabled) }
     }
@@ -732,29 +751,35 @@ class VpnViewModel(app: Application) : AndroidViewModel(app) {
     }
 
     private fun startNetworkMonitoring() {
-        networkProfile = resolveNetworkProfile()
+        val snapshot = resolveActiveNetworkState()
+        networkProfile = snapshot.profile
+        currentWifiSsid = snapshot.wifiSsid
         runCatching { connectivityManager?.registerDefaultNetworkCallback(networkCallback) }
             .onFailure { Log.w(TAG, "network callback registration failed", it) }
         evaluateAutoTunnel("network-monitor-start")
     }
 
     private fun onNetworkStateChanged() {
-        val next = resolveNetworkProfile()
-        if (next != networkProfile) {
-            networkProfile = next
-            evaluateAutoTunnel("network-changed:$next")
+        val next = resolveActiveNetworkState()
+        if (next.profile != networkProfile || next.wifiSsid != currentWifiSsid) {
+            networkProfile = next.profile
+            currentWifiSsid = next.wifiSsid
+            evaluateAutoTunnel("network-changed:${next.profile}:${next.wifiSsid}")
         }
     }
 
-    private fun resolveNetworkProfile(): NetworkProfile {
-        val cm = connectivityManager ?: return NetworkProfile.None
-        val network = cm.activeNetwork ?: return NetworkProfile.None
-        val caps = cm.getNetworkCapabilities(network) ?: return NetworkProfile.None
+    private fun resolveActiveNetworkState(): ActiveNetworkState {
+        val cm = connectivityManager ?: return ActiveNetworkState(NetworkProfile.None)
+        val network = cm.activeNetwork ?: return ActiveNetworkState(NetworkProfile.None)
+        val caps = cm.getNetworkCapabilities(network) ?: return ActiveNetworkState(NetworkProfile.None)
         return when {
-            caps.hasTransport(NetworkCapabilities.TRANSPORT_WIFI) -> NetworkProfile.Wifi
-            caps.hasTransport(NetworkCapabilities.TRANSPORT_CELLULAR) -> NetworkProfile.Mobile
-            caps.hasTransport(NetworkCapabilities.TRANSPORT_ETHERNET) -> NetworkProfile.Ethernet
-            else -> NetworkProfile.Other
+            caps.hasTransport(NetworkCapabilities.TRANSPORT_WIFI) -> ActiveNetworkState(
+                profile = NetworkProfile.Wifi,
+                wifiSsid = readWifiSsid(caps),
+            )
+            caps.hasTransport(NetworkCapabilities.TRANSPORT_CELLULAR) -> ActiveNetworkState(NetworkProfile.Mobile)
+            caps.hasTransport(NetworkCapabilities.TRANSPORT_ETHERNET) -> ActiveNetworkState(NetworkProfile.Ethernet)
+            else -> ActiveNetworkState(NetworkProfile.Other)
         }
     }
 
@@ -763,7 +788,7 @@ class VpnViewModel(app: Application) : AndroidViewModel(app) {
         if (!auto.enabled) return
 
         val shouldTunnel = when (networkProfile) {
-            NetworkProfile.Wifi -> auto.onWifi
+            NetworkProfile.Wifi -> shouldTunnelOnWifi(auto, currentWifiSsid)
             NetworkProfile.Mobile -> auto.onMobile
             NetworkProfile.Ethernet -> auto.onEthernet
             NetworkProfile.None -> false
@@ -814,6 +839,19 @@ class VpnViewModel(app: Application) : AndroidViewModel(app) {
             delay(4000)
             autoConnectCooldownJob = null
         }
+    }
+
+    private fun shouldTunnelOnWifi(auto: AutoTunnelConfig, ssid: String): Boolean {
+        if (!auto.onWifi) return false
+        if (auto.wifiSsids.isEmpty()) return true
+        val matched = ssid.isNotBlank() && auto.wifiSsids.any { it.equals(ssid, ignoreCase = true) }
+        return if (auto.disconnectOnMatchedWifi) !matched else matched
+    }
+
+    private fun readWifiSsid(caps: NetworkCapabilities): String {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.Q) return ""
+        val info = caps.transportInfo as? WifiInfo ?: return ""
+        return normalizeSsid(info.ssid)
     }
 
     private fun loadInstalledApps() {
@@ -873,4 +911,10 @@ private fun JSONObject.optNullableLong(key: String): Long? {
     } catch (_: Exception) {
         null
     }
+}
+
+private fun normalizeSsid(value: String?): String {
+    val trimmed = value?.trim().orEmpty().removePrefix("\"").removeSuffix("\"")
+    if (trimmed.equals("<unknown ssid>", ignoreCase = true)) return ""
+    return trimmed
 }

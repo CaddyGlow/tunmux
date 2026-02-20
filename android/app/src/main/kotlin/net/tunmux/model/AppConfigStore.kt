@@ -36,6 +36,8 @@ data class AutoTunnelConfig(
     val onWifi: Boolean = true,
     val onMobile: Boolean = true,
     val onEthernet: Boolean = true,
+    val wifiSsids: List<String> = emptyList(),
+    val disconnectOnMatchedWifi: Boolean = false,
     val stopOnNoInternet: Boolean = true,
     val startOnBoot: Boolean = false,
 )
@@ -93,6 +95,8 @@ object AppConfigStore {
             .put("on_wifi", config.auto.onWifi)
             .put("on_mobile", config.auto.onMobile)
             .put("on_ethernet", config.auto.onEthernet)
+            .put("wifi_ssids", JSONArray(config.auto.wifiSsids))
+            .put("disconnect_on_matched_wifi", config.auto.disconnectOnMatchedWifi)
             .put("stop_on_no_internet", config.auto.stopOnNoInternet)
             .put("start_on_boot", config.auto.startOnBoot)
 
@@ -149,6 +153,8 @@ object AppConfigStore {
             onWifi = autoJson.optBoolean("on_wifi", true),
             onMobile = autoJson.optBoolean("on_mobile", true),
             onEthernet = autoJson.optBoolean("on_ethernet", true),
+            wifiSsids = autoJson.optStringArray("wifi_ssids"),
+            disconnectOnMatchedWifi = autoJson.optBoolean("disconnect_on_matched_wifi", false),
             stopOnNoInternet = autoJson.optBoolean("stop_on_no_internet", true),
             startOnBoot = autoJson.optBoolean("start_on_boot", false),
         )

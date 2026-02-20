@@ -149,6 +149,8 @@ fun TunmuxApp(vm: VpnViewModel = viewModel()) {
             onSetAutoWifi = { vm.setAutoOnWifi(it) },
             onSetAutoMobile = { vm.setAutoOnMobile(it) },
             onSetAutoEthernet = { vm.setAutoOnEthernet(it) },
+            onSetAutoWifiSsids = { vm.setAutoWifiSsids(it) },
+            onSetAutoDisconnectOnMatchedWifi = { vm.setAutoDisconnectOnMatchedWifi(it) },
             onSetStopOnNoInternet = { vm.setStopOnNoInternet(it) },
             onSetStartOnBoot = { vm.setStartOnBoot(it) },
             onSetAppMode = { vm.setAppMode(it) },
@@ -288,6 +290,8 @@ fun DashboardScreen(
     onSetAutoWifi: (Boolean) -> Unit,
     onSetAutoMobile: (Boolean) -> Unit,
     onSetAutoEthernet: (Boolean) -> Unit,
+    onSetAutoWifiSsids: (String) -> Unit,
+    onSetAutoDisconnectOnMatchedWifi: (Boolean) -> Unit,
     onSetStopOnNoInternet: (Boolean) -> Unit,
     onSetStartOnBoot: (Boolean) -> Unit,
     onSetAppMode: (String) -> Unit,
@@ -387,6 +391,8 @@ fun DashboardScreen(
                     onSetAutoWifi = onSetAutoWifi,
                     onSetAutoMobile = onSetAutoMobile,
                     onSetAutoEthernet = onSetAutoEthernet,
+                    onSetAutoWifiSsids = onSetAutoWifiSsids,
+                    onSetAutoDisconnectOnMatchedWifi = onSetAutoDisconnectOnMatchedWifi,
                     onSetStopOnNoInternet = onSetStopOnNoInternet,
                     onSetStartOnBoot = onSetStartOnBoot,
                 )
@@ -877,9 +883,14 @@ private fun AutoTabContent(
     onSetAutoWifi: (Boolean) -> Unit,
     onSetAutoMobile: (Boolean) -> Unit,
     onSetAutoEthernet: (Boolean) -> Unit,
+    onSetAutoWifiSsids: (String) -> Unit,
+    onSetAutoDisconnectOnMatchedWifi: (Boolean) -> Unit,
     onSetStopOnNoInternet: (Boolean) -> Unit,
     onSetStartOnBoot: (Boolean) -> Unit,
 ) {
+    var wifiSsidInput by remember(autoConfig.wifiSsids) {
+        mutableStateOf(autoConfig.wifiSsids.joinToString(", "))
+    }
     Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
         Text("Auto-tunnel", style = MaterialTheme.typography.headlineSmall)
         ToggleRow(
@@ -892,6 +903,33 @@ private fun AutoTabContent(
             checked = autoConfig.onWifi,
             onToggle = onSetAutoWifi,
         )
+        if (autoConfig.onWifi) {
+            ToggleRow(
+                title = "Disconnect on matched Wi-Fi",
+                checked = autoConfig.disconnectOnMatchedWifi,
+                onToggle = onSetAutoDisconnectOnMatchedWifi,
+            )
+            OutlinedTextField(
+                value = wifiSsidInput,
+                onValueChange = {
+                    wifiSsidInput = it
+                    onSetAutoWifiSsids(it)
+                },
+                label = { Text("Wi-Fi SSIDs (comma-separated)") },
+                modifier = Modifier.fillMaxWidth(),
+                singleLine = false,
+            )
+            if (autoConfig.wifiSsids.isNotEmpty()) {
+                Text(
+                    if (autoConfig.disconnectOnMatchedWifi) {
+                        "VPN disconnects on listed SSIDs"
+                    } else {
+                        "VPN connects only on listed SSIDs"
+                    },
+                    style = MaterialTheme.typography.bodySmall,
+                )
+            }
+        }
         ToggleRow(
             title = "Tunnel on mobile data",
             checked = autoConfig.onMobile,
