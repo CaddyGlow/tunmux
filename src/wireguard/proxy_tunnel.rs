@@ -36,9 +36,11 @@ const REMOTE_PENDING_MAX_BYTES: usize = 2 * 1024 * 1024;
 const CLIENT_PENDING_MAX_BYTES: usize = 2 * 1024 * 1024;
 const UDP_RECV_BURST_MAX: usize = 64;
 const UDP_SEND_BURST_MAX: usize = 64;
-const ACTIVE_CONN_BATCH_MAX: usize = 256;
-const ACTIVE_CONN_FULL_SCAN_INTERVAL: Duration = Duration::from_millis(25);
+const ACTIVE_CONN_BATCH_MAX: usize = 384;
+const ACTIVE_CONN_TOPUP_TARGET: usize = 768;
+const ACTIVE_CONN_SWEEP_BATCH_MAX: usize = 384;
 const DNS_CACHE_TTL: Duration = Duration::from_secs(15);
+const PERF_LOG_INTERVAL: Duration = Duration::from_secs(5);
 
 type DnsCache = HashMap<String, (Instant, Vec<SocketAddr>)>;
 static DNS_CACHE: LazyLock<StdRwLock<DnsCache>> = LazyLock::new(|| StdRwLock::new(HashMap::new()));
@@ -247,6 +249,95 @@ struct ConnEntry {
     active: bool,
 }
 
+struct DataplanePerf {
+    enabled: bool,
+    last_log: Instant,
+    loops: u64,
+    iface_polls: u64,
+    iface_poll_ns: u64,
+    udp_rx_packets: u64,
+    udp_rx_bytes: u64,
+    udp_tx_packets: u64,
+    udp_tx_bytes: u64,
+    tunn_net_writes: u64,
+    tunn_net_write_copies: u64,
+    conn_visits: u64,
+    conn_requeues: u64,
+    active_q_peak: usize,
+    udp_pending_peak: usize,
+}
+
+impl DataplanePerf {
+    fn new(enabled: bool) -> Self {
+        Self {
+            enabled,
+            last_log: Instant::now(),
+            loops: 0,
+            iface_polls: 0,
+            iface_poll_ns: 0,
+            udp_rx_packets: 0,
+            udp_rx_bytes: 0,
+            udp_tx_packets: 0,
+            udp_tx_bytes: 0,
+            tunn_net_writes: 0,
+            tunn_net_write_copies: 0,
+            conn_visits: 0,
+            conn_requeues: 0,
+            active_q_peak: 0,
+            udp_pending_peak: 0,
+        }
+    }
+
+    fn observe_loop(&mut self, active_q_len: usize, udp_pending_len: usize) {
+        if !self.enabled {
+            return;
+        }
+        self.loops = self.loops.saturating_add(1);
+        self.active_q_peak = self.active_q_peak.max(active_q_len);
+        self.udp_pending_peak = self.udp_pending_peak.max(udp_pending_len);
+    }
+
+    fn maybe_log_and_reset(&mut self, conns: usize) {
+        if !self.enabled || self.last_log.elapsed() < PERF_LOG_INTERVAL {
+            return;
+        }
+        let elapsed = self.last_log.elapsed();
+        info!(
+            interval_ms = elapsed.as_millis() as u64,
+            conns = conns,
+            loops = self.loops,
+            iface_polls = self.iface_polls,
+            iface_poll_ms = self.iface_poll_ns as f64 / 1_000_000.0,
+            udp_rx_packets = self.udp_rx_packets,
+            udp_rx_mib = self.udp_rx_bytes as f64 / (1024.0 * 1024.0),
+            udp_tx_packets = self.udp_tx_packets,
+            udp_tx_mib = self.udp_tx_bytes as f64 / (1024.0 * 1024.0),
+            tunn_net_writes = self.tunn_net_writes,
+            tunn_net_write_copies = self.tunn_net_write_copies,
+            conn_visits = self.conn_visits,
+            conn_requeues = self.conn_requeues,
+            active_q_peak = self.active_q_peak,
+            udp_pending_peak = self.udp_pending_peak,
+            "local_proxy_perf"
+        );
+
+        self.last_log = Instant::now();
+        self.loops = 0;
+        self.iface_polls = 0;
+        self.iface_poll_ns = 0;
+        self.udp_rx_packets = 0;
+        self.udp_rx_bytes = 0;
+        self.udp_tx_packets = 0;
+        self.udp_tx_bytes = 0;
+        self.tunn_net_writes = 0;
+        self.tunn_net_write_copies = 0;
+        self.conn_visits = 0;
+        self.conn_requeues = 0;
+        self.active_q_peak = 0;
+        self.udp_pending_peak = 0;
+    }
+}
+
 // ── Public entry point ────────────────────────────────────────────────────────
 
 /// Run the local proxy. Returns when the tokio task is aborted or on fatal error.
@@ -307,6 +398,10 @@ pub async fn run_local_proxy(cfg: LocalProxyConfig) -> anyhow::Result<()> {
         endpoint = ?cfg.endpoint,
         "local_proxy_started"
     );
+    let perf_enabled = std::env::var_os("TUNMUX_LOCAL_PROXY_PERF").is_some();
+    if perf_enabled {
+        info!("local_proxy_perf_enabled");
+    }
 
     let (conn_req_tx, mut conn_req_rx) = mpsc::channel::<ConnRequest>(CLIENT_CHANNEL_CAP);
     let loop_notify = Arc::new(Notify::new());
@@ -366,17 +461,23 @@ pub async fn run_local_proxy(cfg: LocalProxyConfig) -> anyhow::Result<()> {
     let mut enc_buf = vec![0u8; UDP_BUF + 32];
     let mut conns: Vec<ConnEntry> = Vec::new();
     let mut next_port: u16 = LOCAL_PORT_START;
-    let mut wg_pending_tx: VecDeque<Vec<u8>> = VecDeque::new();
+    let mut wg_pending_tx: VecDeque<Bytes> = VecDeque::new();
     let mut active_conns: VecDeque<usize> = VecDeque::new();
-    let mut last_full_scan = Instant::now();
+    let mut scan_cursor: usize = 0;
     let mut wg_timer_deadline = Instant::now();
+    let mut perf = DataplanePerf::new(perf_enabled);
 
     loop {
         let now_std = Instant::now();
         let now = smoltcp_now();
 
         if now_std >= wg_timer_deadline {
-            queue_tunn_network_write(tunn.update_timers(&mut enc_buf), &mut wg_pending_tx);
+            queue_tunn_network_write(
+                tunn.update_timers(&mut enc_buf),
+                udp.as_ref(),
+                &mut wg_pending_tx,
+                &mut perf,
+            );
             wg_timer_deadline = now_std + WG_TIMER_TICK_MAX;
         }
 
@@ -397,10 +498,17 @@ pub async fn run_local_proxy(cfg: LocalProxyConfig) -> anyhow::Result<()> {
                 Ok(n) => match tunn.decapsulate(None, &udp_buf[..n], &mut decap_buf) {
                     TunnResult::WriteToTunnelV4(plain, _)
                     | TunnResult::WriteToTunnelV6(plain, _) => {
+                        perf.udp_rx_packets = perf.udp_rx_packets.saturating_add(1);
+                        perf.udp_rx_bytes = perf.udp_rx_bytes.saturating_add(n as u64);
                         device.inbound.push_back(Vec::from(plain));
                     }
                     TunnResult::WriteToNetwork(out) => {
-                        wg_pending_tx.push_back(out.to_vec());
+                        queue_tunn_network_write(
+                            TunnResult::WriteToNetwork(out),
+                            udp.as_ref(),
+                            &mut wg_pending_tx,
+                            &mut perf,
+                        );
                     }
                     _ => {}
                 },
@@ -411,22 +519,32 @@ pub async fn run_local_proxy(cfg: LocalProxyConfig) -> anyhow::Result<()> {
                 }
             }
         }
-        flush_udp_writes(udp.as_ref(), &mut wg_pending_tx);
+        flush_udp_writes(udp.as_ref(), &mut wg_pending_tx, &mut perf);
 
+        let poll_start = Instant::now();
         let _ = iface.poll(now, &mut device, &mut sockets);
+        perf.iface_polls = perf.iface_polls.saturating_add(1);
+        perf.iface_poll_ns = perf
+            .iface_poll_ns
+            .saturating_add(poll_start.elapsed().as_nanos() as u64);
 
         while let Some(plain) = device.outbound.pop_front() {
-            queue_tunn_network_write(tunn.encapsulate(&plain, &mut enc_buf), &mut wg_pending_tx);
+            queue_tunn_network_write(
+                tunn.encapsulate(&plain, &mut enc_buf),
+                udp.as_ref(),
+                &mut wg_pending_tx,
+                &mut perf,
+            );
         }
-        flush_udp_writes(udp.as_ref(), &mut wg_pending_tx);
+        flush_udp_writes(udp.as_ref(), &mut wg_pending_tx, &mut perf);
 
-        if active_conns.is_empty()
-            || now_std.saturating_duration_since(last_full_scan) >= ACTIVE_CONN_FULL_SCAN_INTERVAL
-        {
-            for i in 0..conns.len() {
-                mark_conn_active(&mut conns, &mut active_conns, i);
-            }
-            last_full_scan = now_std;
+        if active_conns.len() < ACTIVE_CONN_TOPUP_TARGET {
+            top_up_active_conns(
+                &mut conns,
+                &mut active_conns,
+                &mut scan_cursor,
+                ACTIVE_CONN_SWEEP_BATCH_MAX,
+            );
         }
 
         let mut remove: Vec<usize> = Vec::new();
@@ -439,6 +557,7 @@ pub async fn run_local_proxy(cfg: LocalProxyConfig) -> anyhow::Result<()> {
                 continue;
             }
             conns[i].active = false;
+            perf.conn_visits = perf.conn_visits.saturating_add(1);
 
             let mut requeue = false;
             let mut remove_current = false;
@@ -549,6 +668,7 @@ pub async fn run_local_proxy(cfg: LocalProxyConfig) -> anyhow::Result<()> {
             }
 
             if requeue {
+                perf.conn_requeues = perf.conn_requeues.saturating_add(1);
                 mark_conn_active(&mut conns, &mut active_conns, i);
             }
         }
@@ -568,6 +688,9 @@ pub async fn run_local_proxy(cfg: LocalProxyConfig) -> anyhow::Result<()> {
             for entry in &mut conns {
                 entry.active = false;
             }
+            if conns.is_empty() || scan_cursor >= conns.len() {
+                scan_cursor = 0;
+            }
         }
 
         let has_pending_work = !device.inbound.is_empty()
@@ -579,6 +702,8 @@ pub async fn run_local_proxy(cfg: LocalProxyConfig) -> anyhow::Result<()> {
                     || !entry.pending_to_client.is_empty()
                     || !entry.from_client_rx.is_empty()
             });
+        perf.observe_loop(active_conns.len(), wg_pending_tx.len());
+        perf.maybe_log_and_reset(conns.len());
         if has_pending_work {
             tokio::task::yield_now().await;
             continue;
@@ -620,19 +745,56 @@ pub async fn run_local_proxy(cfg: LocalProxyConfig) -> anyhow::Result<()> {
     }
 }
 
-fn queue_tunn_network_write(result: TunnResult<'_>, wg_pending_tx: &mut VecDeque<Vec<u8>>) {
+fn queue_tunn_network_write(
+    result: TunnResult<'_>,
+    udp: &UdpSocket,
+    wg_pending_tx: &mut VecDeque<Bytes>,
+    perf: &mut DataplanePerf,
+) {
     if let TunnResult::WriteToNetwork(out) = result {
-        wg_pending_tx.push_back(out.to_vec());
+        perf.tunn_net_writes = perf.tunn_net_writes.saturating_add(1);
+
+        if wg_pending_tx.is_empty() {
+            match udp.try_send(out) {
+                Ok(sent) if sent == out.len() => {
+                    perf.udp_tx_packets = perf.udp_tx_packets.saturating_add(1);
+                    perf.udp_tx_bytes = perf.udp_tx_bytes.saturating_add(sent as u64);
+                    return;
+                }
+                Ok(sent) => {
+                    warn!(sent = sent, expected = out.len(), "udp_send_partial");
+                    return;
+                }
+                Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
+                Err(e) => {
+                    warn!(error = ?e.to_string(), "udp_send_error");
+                    return;
+                }
+            }
+        }
+
+        wg_pending_tx.push_back(Bytes::copy_from_slice(out));
+        perf.tunn_net_write_copies = perf.tunn_net_write_copies.saturating_add(1);
     }
 }
 
-fn flush_udp_writes(udp: &UdpSocket, wg_pending_tx: &mut VecDeque<Vec<u8>>) {
+fn flush_udp_writes(
+    udp: &UdpSocket,
+    wg_pending_tx: &mut VecDeque<Bytes>,
+    perf: &mut DataplanePerf,
+) {
     for _ in 0..UDP_SEND_BURST_MAX {
         let Some(front) = wg_pending_tx.front() else {
             break;
         };
-        match udp.try_send(front) {
-            Ok(_) => {
+        match udp.try_send(front.as_ref()) {
+            Ok(sent) if sent == front.len() => {
+                perf.udp_tx_packets = perf.udp_tx_packets.saturating_add(1);
+                perf.udp_tx_bytes = perf.udp_tx_bytes.saturating_add(sent as u64);
+                let _ = wg_pending_tx.pop_front();
+            }
+            Ok(sent) => {
+                warn!(sent = sent, expected = front.len(), "udp_send_partial");
                 let _ = wg_pending_tx.pop_front();
             }
             Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
@@ -650,6 +812,33 @@ fn mark_conn_active(conns: &mut [ConnEntry], active_conns: &mut VecDeque<usize>,
     }
     conns[idx].active = true;
     active_conns.push_back(idx);
+}
+
+fn top_up_active_conns(
+    conns: &mut [ConnEntry],
+    active_conns: &mut VecDeque<usize>,
+    scan_cursor: &mut usize,
+    sweep_batch_max: usize,
+) {
+    if conns.is_empty() {
+        *scan_cursor = 0;
+        return;
+    }
+    if *scan_cursor >= conns.len() {
+        *scan_cursor = 0;
+    }
+
+    let mut scanned = 0usize;
+    let scan_limit = sweep_batch_max.min(conns.len());
+    while scanned < scan_limit && active_conns.len() < ACTIVE_CONN_TOPUP_TARGET {
+        let idx = *scan_cursor;
+        *scan_cursor += 1;
+        if *scan_cursor >= conns.len() {
+            *scan_cursor = 0;
+        }
+        mark_conn_active(conns, active_conns, idx);
+        scanned += 1;
+    }
 }
 
 fn add_virtual_connection(
