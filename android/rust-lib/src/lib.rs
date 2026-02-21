@@ -17,12 +17,13 @@ use tokio::runtime::Runtime;
 use tokio::task::AbortHandle;
 use tunmux::airvpn::api::AirVpnClient;
 use tunmux::airvpn::models::{AirManifest, AirServer, AirWgKey, AirWgMode};
-use tunmux::airvpn::web::AirVpnWeb;
+use tunmux::airvpn::web::{AirVpnWeb, AirVpnWebApi};
 use tunmux::ivpn::api as ivpn_api;
 use tunmux::mullvad::api as mullvad_api;
 use tunmux::proton::api;
 use tunmux::proton::models::server::LogicalServer;
 use tunmux::proton::models::session::Session;
+use tunmux::shared::credential_store::{self, AndroidCredentialCallbacks};
 use tunmux::shared::crypto;
 use tunmux::wireguard::proxy_tunnel::{run_local_proxy, LocalProxyConfig};
 
@@ -87,6 +88,7 @@ struct AirVpnAndroidState {
     wg_public_key: String,
     keys: Vec<AirWgKey>,
     selected_key_name: String,
+    api_key: Option<String>,
 }
 
 struct ProtonAndroidState {
@@ -392,6 +394,10 @@ pub extern "system" fn Java_net_tunmux_TunmuxVpnService_nativeInitialize(
         service_ref,
         files_dir,
     });
+
+    if let Some(state) = state.as_ref() {
+        register_credential_bridge_callbacks(&state.jvm);
+    }
 
     log::debug!("tunmux native initialized");
 }
@@ -720,6 +726,126 @@ fn protect_fd_from_app_state(fd: RawFd) -> Result<(), String> {
         .as_ref()
         .ok_or_else(|| "app state not initialized for socket protect".to_string())?;
     protect_fd_with_service(&app_state.jvm, &app_state.service_ref, fd)
+}
+
+fn call_credential_bridge_save(jvm: &JavaVM, provider: &str, payload_json: &str) -> Result<(), String> {
+    let mut env = jvm
+        .attach_current_thread()
+        .map_err(|e| format!("attach_current_thread failed: {e}"))?;
+    let provider_j = env
+        .new_string(provider)
+        .map_err(|e| format!("provider string creation failed: {e}"))?;
+    let payload_j = env
+        .new_string(payload_json)
+        .map_err(|e| format!("payload string creation failed: {e}"))?;
+    let result = env
+        .call_static_method(
+            "net/tunmux/CredentialBridge",
+            "save",
+            "(Ljava/lang/String;Ljava/lang/String;)Ljava/lang/String;",
+            &[(&provider_j).into(), (&payload_j).into()],
+        )
+        .map_err(|e| format!("CredentialBridge.save call failed: {e}"))?
+        .l()
+        .map_err(|e| format!("CredentialBridge.save returned non-string: {e}"))?;
+    let response: String = env
+        .get_string(&JString::from(result))
+        .map(|s| s.into())
+        .map_err(|e| format!("CredentialBridge.save response read failed: {e}"))?;
+    parse_bridge_status_response("save", &response)
+}
+
+fn call_credential_bridge_load(jvm: &JavaVM, provider: &str) -> Result<Option<String>, String> {
+    let mut env = jvm
+        .attach_current_thread()
+        .map_err(|e| format!("attach_current_thread failed: {e}"))?;
+    let provider_j = env
+        .new_string(provider)
+        .map_err(|e| format!("provider string creation failed: {e}"))?;
+    let result = env
+        .call_static_method(
+            "net/tunmux/CredentialBridge",
+            "load",
+            "(Ljava/lang/String;)Ljava/lang/String;",
+            &[(&provider_j).into()],
+        )
+        .map_err(|e| format!("CredentialBridge.load call failed: {e}"))?
+        .l()
+        .map_err(|e| format!("CredentialBridge.load returned non-string: {e}"))?;
+    let response: String = env
+        .get_string(&JString::from(result))
+        .map(|s| s.into())
+        .map_err(|e| format!("CredentialBridge.load response read failed: {e}"))?;
+    parse_bridge_load_response(&response)
+}
+
+fn call_credential_bridge_delete(jvm: &JavaVM, provider: &str) -> Result<(), String> {
+    let mut env = jvm
+        .attach_current_thread()
+        .map_err(|e| format!("attach_current_thread failed: {e}"))?;
+    let provider_j = env
+        .new_string(provider)
+        .map_err(|e| format!("provider string creation failed: {e}"))?;
+    let result = env
+        .call_static_method(
+            "net/tunmux/CredentialBridge",
+            "delete",
+            "(Ljava/lang/String;)Ljava/lang/String;",
+            &[(&provider_j).into()],
+        )
+        .map_err(|e| format!("CredentialBridge.delete call failed: {e}"))?
+        .l()
+        .map_err(|e| format!("CredentialBridge.delete returned non-string: {e}"))?;
+    let response: String = env
+        .get_string(&JString::from(result))
+        .map(|s| s.into())
+        .map_err(|e| format!("CredentialBridge.delete response read failed: {e}"))?;
+    parse_bridge_status_response("delete", &response)
+}
+
+fn parse_bridge_status_response(operation: &str, response: &str) -> Result<(), String> {
+    let value: Value =
+        serde_json::from_str(response).map_err(|e| format!("invalid {} response JSON: {e}", operation))?;
+    let ok = value.get("ok").and_then(Value::as_bool).unwrap_or(false);
+    if ok {
+        return Ok(());
+    }
+    let reason = value
+        .get("error")
+        .and_then(Value::as_str)
+        .unwrap_or("unknown credential bridge error");
+    Err(reason.to_string())
+}
+
+fn parse_bridge_load_response(response: &str) -> Result<Option<String>, String> {
+    let value: Value =
+        serde_json::from_str(response).map_err(|e| format!("invalid load response JSON: {e}"))?;
+    let ok = value.get("ok").and_then(Value::as_bool).unwrap_or(false);
+    if !ok {
+        let reason = value
+            .get("error")
+            .and_then(Value::as_str)
+            .unwrap_or("unknown credential bridge error");
+        return Err(reason.to_string());
+    }
+    match value.get("payload") {
+        Some(Value::String(payload)) => Ok(Some(payload.to_string())),
+        Some(Value::Null) | None => Ok(None),
+        Some(_) => Err("invalid payload type in load response".to_string()),
+    }
+}
+
+fn register_credential_bridge_callbacks(jvm: &JavaVM) {
+    let save_jvm = jvm.clone();
+    let load_jvm = jvm.clone();
+    let delete_jvm = jvm.clone();
+    credential_store::register_android_callbacks(AndroidCredentialCallbacks {
+        save: Box::new(move |provider, payload_json| {
+            call_credential_bridge_save(&save_jvm, provider.dir_name(), payload_json)
+        }),
+        load: Box::new(move |provider| call_credential_bridge_load(&load_jvm, provider.dir_name())),
+        delete: Box::new(move |provider| call_credential_bridge_delete(&delete_jvm, provider.dir_name())),
+    });
 }
 
 fn parse_login_credentials(credential: &str) -> Result<LoginCredentials, String> {
@@ -1815,6 +1941,23 @@ pub extern "system" fn Java_net_tunmux_RustBridge_login<'local>(
                             "no WireGuard modes in AirVPN manifest".to_string(),
                         )
                     })?;
+                    let api_key = match AirVpnWeb::login_or_restore(&username, &password).await {
+                        Ok(web) => {
+                            let key = match AirVpnWebApi::from_web(&web).await {
+                                Ok(api) => Some(api.api_key().to_string()),
+                                Err(e) => {
+                                    log::warn!("failed to load AirVPN API key via web API: {}", e);
+                                    None
+                                }
+                            };
+                            web.save();
+                            key
+                        }
+                        Err(e) => {
+                            log::warn!("failed to establish AirVPN web session for API key: {}", e);
+                            None
+                        }
+                    };
 
                     Ok::<AirVpnAndroidState, tunmux::error::AppError>(AirVpnAndroidState {
                         username: username.clone(),
@@ -1826,6 +1969,7 @@ pub extern "system" fn Java_net_tunmux_RustBridge_login<'local>(
                         wg_public_key: session.wg_public_key,
                         keys: session.keys,
                         selected_key_name,
+                        api_key,
                     })
                 });
 
@@ -1834,6 +1978,7 @@ pub extern "system" fn Java_net_tunmux_RustBridge_login<'local>(
                         let keys = login_data.key_count;
                         let servers = login_data.servers.len();
                         let selected_key = login_data.selected_key_name.clone();
+                        let api_key = login_data.api_key.clone();
                         let mut state = AIRVPN_STATE.lock().unwrap();
                         *state = Some(login_data);
                         log::info!(
@@ -1847,7 +1992,8 @@ pub extern "system" fn Java_net_tunmux_RustBridge_login<'local>(
                             "provider": "airvpn",
                             "keys": keys,
                             "servers": servers,
-                            "selected_key": selected_key
+                            "selected_key": selected_key,
+                            "api_key": api_key
                         })
                         .to_string()
                     }

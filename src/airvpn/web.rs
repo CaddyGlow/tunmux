@@ -944,6 +944,10 @@ impl AirVpnWebApi {
         })
     }
 
+    pub fn api_key(&self) -> &str {
+        &self.api_key
+    }
+
     /// Recover an existing API key via web session, or create one if none exist.
     pub async fn from_web(web: &AirVpnWeb) -> anyhow::Result<Self> {
         let keys = web.list_api_keys().await?;
