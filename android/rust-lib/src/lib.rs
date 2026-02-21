@@ -13,6 +13,8 @@ use std::net::{IpAddr, SocketAddr};
 use std::os::fd::AsRawFd;
 use std::os::unix::io::RawFd;
 use std::sync::{Arc, Mutex, OnceLock};
+#[cfg(target_os = "android")]
+use std::time::Duration;
 use tokio::runtime::Runtime;
 use tokio::task::AbortHandle;
 use tunmux::airvpn::api::AirVpnClient;
@@ -23,6 +25,7 @@ use tunmux::mullvad::api as mullvad_api;
 use tunmux::proton::api;
 use tunmux::proton::models::server::LogicalServer;
 use tunmux::proton::models::session::Session;
+#[cfg(target_os = "android")]
 use tunmux::shared::credential_store::{self, AndroidCredentialCallbacks};
 use tunmux::shared::crypto;
 use tunmux::wireguard::proxy_tunnel::{run_local_proxy, LocalProxyConfig};
@@ -48,6 +51,10 @@ struct LocalProxyHandle {
 const UDP_RECV_BUFFER_SIZE: usize = 7 * 1024 * 1024;
 const UDP_SEND_BUFFER_SIZE: usize = 7 * 1024 * 1024;
 const AIRVPN_KEEPALIVE_SECS: u16 = 25;
+#[cfg(any(target_os = "android", test))]
+const BRIDGE_CONTRACT_VERSION: u64 = 1;
+#[cfg(target_os = "android")]
+const CREDENTIAL_BRIDGE_TIMEOUT: Duration = Duration::from_secs(5);
 
 type AndroidWgDevice = Device<(AndroidUdpFactory, TunDevice, TunDevice)>;
 
@@ -395,8 +402,8 @@ pub extern "system" fn Java_net_tunmux_TunmuxVpnService_nativeInitialize(
         files_dir,
     });
 
-    if let Some(state) = state.as_ref() {
-        register_credential_bridge_callbacks(&state.jvm);
+    if state.is_some() {
+        register_credential_bridge_callbacks();
     }
 
     log::debug!("tunmux native initialized");
@@ -728,7 +735,50 @@ fn protect_fd_from_app_state(fd: RawFd) -> Result<(), String> {
     protect_fd_with_service(&app_state.jvm, &app_state.service_ref, fd)
 }
 
-fn call_credential_bridge_save(jvm: &JavaVM, provider: &str, payload_json: &str) -> Result<(), String> {
+#[cfg(target_os = "android")]
+fn with_jvm_from_app_state<T>(f: impl FnOnce(&JavaVM) -> Result<T, String>) -> Result<T, String> {
+    let state = APP_STATE.lock().unwrap();
+    let app_state = state
+        .as_ref()
+        .ok_or_else(|| "app state not initialized for credential bridge".to_string())?;
+    f(&app_state.jvm)
+}
+
+#[cfg(target_os = "android")]
+fn run_bridge_call_with_timeout<T: Send + 'static>(
+    operation: &str,
+    provider: &str,
+    call: impl FnOnce() -> Result<T, String> + Send + 'static,
+) -> Result<T, String> {
+    let operation_name = operation.to_string();
+    let provider_name = provider.to_string();
+    let (tx, rx) = std::sync::mpsc::sync_channel(1);
+    std::thread::spawn(move || {
+        let _ = tx.send(call());
+    });
+    match rx.recv_timeout(CREDENTIAL_BRIDGE_TIMEOUT) {
+        Ok(result) => result,
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => Err(format!(
+            "code=credential_store_timeout reason=credential bridge callback timed out operation={} provider={}",
+            operation_name, provider_name
+        )),
+        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => Err(format!(
+            "code=bridge_exception reason=credential bridge callback failed operation={} provider={}",
+            operation_name, provider_name
+        )),
+    }
+}
+
+#[cfg(target_os = "android")]
+fn call_credential_bridge_save(
+    jvm: &JavaVM,
+    provider: &str,
+    payload_json: &str,
+) -> Result<(), String> {
+    log::debug!(
+        "credential_bridge_call_start; operation=save provider={}",
+        provider
+    );
     let mut env = jvm
         .attach_current_thread()
         .map_err(|e| format!("attach_current_thread failed: {e}"))?;
@@ -752,10 +802,22 @@ fn call_credential_bridge_save(jvm: &JavaVM, provider: &str, payload_json: &str)
         .get_string(&JString::from(result))
         .map(|s| s.into())
         .map_err(|e| format!("CredentialBridge.save response read failed: {e}"))?;
-    parse_bridge_status_response("save", &response)
+    let parsed = parse_bridge_status_response("save", &response);
+    if parsed.is_ok() {
+        log::debug!(
+            "credential_bridge_call_ok; operation=save provider={}",
+            provider
+        );
+    }
+    parsed
 }
 
+#[cfg(target_os = "android")]
 fn call_credential_bridge_load(jvm: &JavaVM, provider: &str) -> Result<Option<String>, String> {
+    log::debug!(
+        "credential_bridge_call_start; operation=load provider={}",
+        provider
+    );
     let mut env = jvm
         .attach_current_thread()
         .map_err(|e| format!("attach_current_thread failed: {e}"))?;
@@ -776,10 +838,22 @@ fn call_credential_bridge_load(jvm: &JavaVM, provider: &str) -> Result<Option<St
         .get_string(&JString::from(result))
         .map(|s| s.into())
         .map_err(|e| format!("CredentialBridge.load response read failed: {e}"))?;
-    parse_bridge_load_response(&response)
+    let parsed = parse_bridge_load_response(&response);
+    if parsed.is_ok() {
+        log::debug!(
+            "credential_bridge_call_ok; operation=load provider={}",
+            provider
+        );
+    }
+    parsed
 }
 
+#[cfg(target_os = "android")]
 fn call_credential_bridge_delete(jvm: &JavaVM, provider: &str) -> Result<(), String> {
+    log::debug!(
+        "credential_bridge_call_start; operation=delete provider={}",
+        provider
+    );
     let mut env = jvm
         .attach_current_thread()
         .map_err(|e| format!("attach_current_thread failed: {e}"))?;
@@ -800,53 +874,257 @@ fn call_credential_bridge_delete(jvm: &JavaVM, provider: &str) -> Result<(), Str
         .get_string(&JString::from(result))
         .map(|s| s.into())
         .map_err(|e| format!("CredentialBridge.delete response read failed: {e}"))?;
-    parse_bridge_status_response("delete", &response)
+    let parsed = parse_bridge_status_response("delete", &response);
+    if parsed.is_ok() {
+        log::debug!(
+            "credential_bridge_call_ok; operation=delete provider={}",
+            provider
+        );
+    }
+    parsed
 }
 
-fn parse_bridge_status_response(operation: &str, response: &str) -> Result<(), String> {
-    let value: Value =
-        serde_json::from_str(response).map_err(|e| format!("invalid {} response JSON: {e}", operation))?;
-    let ok = value.get("ok").and_then(Value::as_bool).unwrap_or(false);
+#[cfg(any(target_os = "android", test))]
+fn parse_bridge_status_response(expected_operation: &str, response: &str) -> Result<(), String> {
+    let value: Value = serde_json::from_str(response).map_err(|e| {
+        format!(
+            "code=contract_violation reason=invalid {} response JSON: {}",
+            expected_operation, e
+        )
+    })?;
+    let obj = value
+        .as_object()
+        .ok_or_else(|| "code=contract_violation reason=response is not a JSON object".to_string())?;
+    ensure_only_fields(
+        obj,
+        &["version", "ok", "operation", "error_code", "error"],
+    )?;
+
+    let version = require_u64_field(obj, "version")?;
+    let ok = require_bool_field(obj, "ok")?;
+    let operation = require_string_field(obj, "operation")?;
+    validate_bridge_header(version, &operation, expected_operation)?;
+    let error_code = require_nullable_string_field(obj, "error_code")?;
+    let error = require_nullable_string_field(obj, "error")?;
     if ok {
+        if error_code.is_some() || error.is_some() {
+            return Err(
+                "code=contract_violation reason=ok response must have null error fields"
+                    .to_string(),
+            );
+        }
         return Ok(());
     }
-    let reason = value
-        .get("error")
-        .and_then(Value::as_str)
-        .unwrap_or("unknown credential bridge error");
-    Err(reason.to_string())
+    Err(format_bridge_error(
+        expected_operation,
+        error_code.as_deref(),
+        error.as_deref(),
+    ))
 }
 
+#[cfg(any(target_os = "android", test))]
 fn parse_bridge_load_response(response: &str) -> Result<Option<String>, String> {
-    let value: Value =
-        serde_json::from_str(response).map_err(|e| format!("invalid load response JSON: {e}"))?;
-    let ok = value.get("ok").and_then(Value::as_bool).unwrap_or(false);
-    if !ok {
-        let reason = value
-            .get("error")
-            .and_then(Value::as_str)
-            .unwrap_or("unknown credential bridge error");
-        return Err(reason.to_string());
+    let value: Value = serde_json::from_str(response)
+        .map_err(|e| format!("code=contract_violation reason=invalid load response JSON: {e}"))?;
+    let obj = value
+        .as_object()
+        .ok_or_else(|| "code=contract_violation reason=response is not a JSON object".to_string())?;
+    ensure_only_fields(
+        obj,
+        &["version", "ok", "operation", "payload", "error_code", "error"],
+    )?;
+
+    let version = require_u64_field(obj, "version")?;
+    let ok = require_bool_field(obj, "ok")?;
+    let operation = require_string_field(obj, "operation")?;
+    validate_bridge_header(version, &operation, "load")?;
+    let payload = require_nullable_string_field(obj, "payload")?;
+    let error_code = require_nullable_string_field(obj, "error_code")?;
+    let error = require_nullable_string_field(obj, "error")?;
+    if ok {
+        if error_code.is_some() || error.is_some() {
+            return Err(
+                "code=contract_violation reason=ok load response must have null error fields"
+                    .to_string(),
+            );
+        }
+        return Ok(payload);
     }
-    match value.get("payload") {
-        Some(Value::String(payload)) => Ok(Some(payload.to_string())),
-        Some(Value::Null) | None => Ok(None),
-        Some(_) => Err("invalid payload type in load response".to_string()),
+    Err(format_bridge_error(
+        "load",
+        error_code.as_deref(),
+        error.as_deref(),
+    ))
+}
+
+#[cfg(any(target_os = "android", test))]
+fn validate_bridge_header(version: u64, operation: &str, expected_operation: &str) -> Result<(), String> {
+    if version != BRIDGE_CONTRACT_VERSION {
+        return Err(format!(
+            "code=unsupported_contract_version reason=expected={} actual={}",
+            BRIDGE_CONTRACT_VERSION, version
+        ));
+    }
+    if operation != expected_operation {
+        return Err(format!(
+            "code=invalid_operation reason=expected={} actual={}",
+            expected_operation, operation
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(any(target_os = "android", test))]
+fn ensure_only_fields(
+    obj: &serde_json::Map<String, Value>,
+    allowed: &[&str],
+) -> Result<(), String> {
+    for key in obj.keys() {
+        if !allowed.iter().any(|candidate| key == candidate) {
+            return Err(format!(
+                "code=contract_violation reason=unknown field '{}'",
+                key
+            ));
+        }
+    }
+    Ok(())
+}
+
+#[cfg(any(target_os = "android", test))]
+fn require_u64_field(obj: &serde_json::Map<String, Value>, field_name: &str) -> Result<u64, String> {
+    let value = obj.get(field_name).ok_or_else(|| {
+        format!(
+            "code=contract_violation reason=missing field '{}'",
+            field_name
+        )
+    })?;
+    value.as_u64().ok_or_else(|| {
+        format!(
+            "code=contract_violation reason=field '{}' must be an unsigned integer",
+            field_name
+        )
+    })
+}
+
+#[cfg(any(target_os = "android", test))]
+fn require_bool_field(obj: &serde_json::Map<String, Value>, field_name: &str) -> Result<bool, String> {
+    let value = obj.get(field_name).ok_or_else(|| {
+        format!(
+            "code=contract_violation reason=missing field '{}'",
+            field_name
+        )
+    })?;
+    value.as_bool().ok_or_else(|| {
+        format!(
+            "code=contract_violation reason=field '{}' must be a boolean",
+            field_name
+        )
+    })
+}
+
+#[cfg(any(target_os = "android", test))]
+fn require_string_field(
+    obj: &serde_json::Map<String, Value>,
+    field_name: &str,
+) -> Result<String, String> {
+    let value = obj.get(field_name).ok_or_else(|| {
+        format!(
+            "code=contract_violation reason=missing field '{}'",
+            field_name
+        )
+    })?;
+    let text = value.as_str().ok_or_else(|| {
+        format!(
+            "code=contract_violation reason=field '{}' must be a string",
+            field_name
+        )
+    })?;
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return Err(format!(
+            "code=contract_violation reason=field '{}' cannot be empty",
+            field_name
+        ));
+    }
+    Ok(trimmed.to_string())
+}
+
+#[cfg(any(target_os = "android", test))]
+fn require_nullable_string_field(
+    obj: &serde_json::Map<String, Value>,
+    field_name: &str,
+) -> Result<Option<String>, String> {
+    let value = obj.get(field_name).ok_or_else(|| {
+        format!(
+            "code=contract_violation reason=missing field '{}'",
+            field_name
+        )
+    })?;
+    if value.is_null() {
+        return Ok(None);
+    }
+    let text = value.as_str().ok_or_else(|| {
+        format!(
+            "code=contract_violation reason=field '{}' must be a string or null",
+            field_name
+        )
+    })?;
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        Ok(None)
+    } else {
+        Ok(Some(trimmed.to_string()))
     }
 }
 
-fn register_credential_bridge_callbacks(jvm: &JavaVM) {
-    let save_jvm = jvm.clone();
-    let load_jvm = jvm.clone();
-    let delete_jvm = jvm.clone();
+#[cfg(any(target_os = "android", test))]
+fn format_bridge_error(operation: &str, error_code: Option<&str>, error: Option<&str>) -> String {
+    let default_code = match operation {
+        "save" => "store_failed",
+        "delete" => "delete_failed",
+        _ => "load_failed",
+    };
+    let code = error_code.unwrap_or(default_code);
+    let reason = error.unwrap_or("credential bridge reported failure");
+    format!("code={} reason={}", code, reason)
+}
+
+#[cfg(target_os = "android")]
+fn register_credential_bridge_callbacks() {
     credential_store::register_android_callbacks(AndroidCredentialCallbacks {
         save: Box::new(move |provider, payload_json| {
-            call_credential_bridge_save(&save_jvm, provider.dir_name(), payload_json)
+            let provider_name = provider.dir_name().to_string();
+            let provider_for_timeout = provider_name.clone();
+            let payload = payload_json.to_string();
+            run_bridge_call_with_timeout("save", &provider_for_timeout, move || {
+                with_jvm_from_app_state(|jvm| {
+                    call_credential_bridge_save(jvm, &provider_name, &payload)
+                })
+            })
         }),
-        load: Box::new(move |provider| call_credential_bridge_load(&load_jvm, provider.dir_name())),
-        delete: Box::new(move |provider| call_credential_bridge_delete(&delete_jvm, provider.dir_name())),
+        load: Box::new(move |provider| {
+            let provider_name = provider.dir_name().to_string();
+            let provider_for_timeout = provider_name.clone();
+            run_bridge_call_with_timeout("load", &provider_for_timeout, move || {
+                with_jvm_from_app_state(|jvm| {
+                    call_credential_bridge_load(jvm, &provider_name)
+                })
+            })
+        }),
+        delete: Box::new(move |provider| {
+            let provider_name = provider.dir_name().to_string();
+            let provider_for_timeout = provider_name.clone();
+            run_bridge_call_with_timeout("delete", &provider_for_timeout, move || {
+                with_jvm_from_app_state(|jvm| {
+                    call_credential_bridge_delete(jvm, &provider_name)
+                })
+            })
+        }),
     });
 }
+
+#[cfg(not(target_os = "android"))]
+fn register_credential_bridge_callbacks() {}
 
 fn parse_login_credentials(credential: &str) -> Result<LoginCredentials, String> {
     let parsed: Value =
@@ -3013,4 +3291,45 @@ pub extern "system" fn Java_net_tunmux_RustBridge_stopLocalProxy<'local>(
     log::info!("stopLocalProxy: stopped={}", stopped);
     let result = json!({"status": "ok", "stopped": stopped}).to_string();
     env.new_string(result).expect("failed to create JString")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{parse_bridge_load_response, parse_bridge_status_response};
+
+    #[test]
+    fn test_parse_status_response_ok_contract() {
+        let response = r#"{"version":1,"ok":true,"operation":"save","error_code":null,"error":null}"#;
+        let result = parse_bridge_status_response("save", response);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_parse_status_response_invalid_operation() {
+        let response = r#"{"version":1,"ok":true,"operation":"load","error_code":null,"error":null}"#;
+        let err = parse_bridge_status_response("save", response).expect_err("must fail");
+        assert!(err.contains("code=invalid_operation"));
+    }
+
+    #[test]
+    fn test_parse_status_response_contract_violation_missing_error_code() {
+        let response = r#"{"version":1,"ok":true,"operation":"delete","error":null}"#;
+        let err = parse_bridge_status_response("delete", response).expect_err("must fail");
+        assert!(err.contains("code=contract_violation"));
+    }
+
+    #[test]
+    fn test_parse_load_response_payload_none() {
+        let response =
+            r#"{"version":1,"ok":true,"operation":"load","payload":null,"error_code":null,"error":null}"#;
+        let value = parse_bridge_load_response(response).expect("load should parse");
+        assert!(value.is_none());
+    }
+
+    #[test]
+    fn test_parse_load_response_failure_uses_error_code() {
+        let response = r#"{"version":1,"ok":false,"operation":"load","payload":null,"error_code":"context_not_initialized","error":"bridge not initialized"}"#;
+        let err = parse_bridge_load_response(response).expect_err("must fail");
+        assert!(err.contains("code=context_not_initialized"));
+    }
 }

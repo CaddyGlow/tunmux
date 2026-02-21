@@ -201,7 +201,7 @@ mod tests {
         let keys = VpnKeys::from_ed25519_private_key(sk).unwrap();
 
         // Verify the x25519 private key matches SHA-512 clamping
-        let hash = Sha512::digest(&sk);
+        let hash = Sha512::digest(sk);
         let mut expected = [0u8; 32];
         expected.copy_from_slice(&hash[..32]);
         expected[0] &= 248;

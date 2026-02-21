@@ -1,0 +1,3 @@
+[submodule "third_party/smoltcp"]
+	path = third_party/smoltcp
+	url = git@github.com:CaddyGlow/smoltcp.git

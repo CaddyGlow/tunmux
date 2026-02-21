@@ -1,0 +1,99 @@
+name: Manual Build Android
+
+on:
+  workflow_call:
+    inputs:
+      ref:
+        description: Git ref to build (branch, tag, or SHA)
+        required: true
+        type: string
+      version:
+        description: Version label for packaged artifacts
+        required: true
+        type: string
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: Git ref to build (branch, tag, or SHA)
+        required: true
+        default: main
+        type: string
+      version:
+        description: Version label for packaged artifacts (for example v1.2.3-special)
+        required: true
+        type: string
+
+env:
+  APP_NAME: tunmux
+  CARGO_TERM_COLOR: always
+
+jobs:
+  android-app:
+    name: Build Android app
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref }}
+
+      - name: Install Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-linux-android,armv7-linux-androideabi,x86_64-linux-android
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Install Android SDK components
+        run: sdkmanager "platform-tools" "platforms;android-35" "build-tools;35.0.0" "ndk;27.3.13750724"
+
+      - name: Set up Gradle cache
+        uses: gradle/actions/setup-gradle@v4
+
+      - name: Assemble Android release app
+        working-directory: android
+        run: ./gradlew --no-daemon :app:assembleRelease
+
+      - name: Package Android artifact
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="${{ inputs.version }}"
+          mkdir -p dist
+
+          apk="android/app/build/outputs/apk/release/app-release-unsigned.apk"
+          if [ ! -f "${apk}" ]; then
+            shopt -s nullglob
+            apks=(android/app/build/outputs/apk/release/*.apk)
+            if [ ${#apks[@]} -eq 0 ]; then
+              echo "No APK file produced by Gradle"
+              exit 1
+            fi
+            apk="${apks[0]}"
+          fi
+
+          asset="${APP_NAME}-${version}-android-app.apk"
+          cp "${apk}" "dist/${asset}"
+
+          if command -v sha256sum >/dev/null 2>&1; then
+            sha256sum "dist/${asset}" > "dist/${asset}.sha256"
+          else
+            shasum -a 256 "dist/${asset}" > "dist/${asset}.sha256"
+          fi
+
+      - name: Upload Android app artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: android-app-${{ inputs.version }}
+          path: dist/*
+          if-no-files-found: error

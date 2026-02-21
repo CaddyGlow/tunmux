@@ -195,11 +195,15 @@ pub async fn restore_session(
     }
     let private_key = wg_private_key.trim();
     if private_key.is_empty() {
-        return Err(AppError::Other("IVPN WireGuard private key is empty".to_string()));
+        return Err(AppError::Other(
+            "IVPN WireGuard private key is empty".to_string(),
+        ));
     }
     let local_ip = wg_local_ip.trim();
     if local_ip.is_empty() {
-        return Err(AppError::Other("IVPN WireGuard local IP is empty".to_string()));
+        return Err(AppError::Other(
+            "IVPN WireGuard local IP is empty".to_string(),
+        ));
     }
 
     let client = api_client()?;

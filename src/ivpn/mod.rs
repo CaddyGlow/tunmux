@@ -1,3 +1,4 @@
+#[allow(dead_code)]
 pub mod api;
 
 #[cfg(not(target_os = "android"))]

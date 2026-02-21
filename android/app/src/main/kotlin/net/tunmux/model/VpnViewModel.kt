@@ -23,8 +23,8 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
-import net.tunmux.KeystoreCredentials
 import net.tunmux.AutoTunnelService
+import net.tunmux.CredentialBridge
 import net.tunmux.RustBridge
 import net.tunmux.TunmuxVpnService
 import org.json.JSONArray
@@ -111,8 +111,8 @@ class VpnViewModel(app: Application) : AndroidViewModel(app) {
         loadInstalledApps()
         refreshKnownWifiSsids()
 
-        // Attempt silent re-login with credentials stored in Keystore.
-        val saved = KeystoreCredentials.load(ctx)
+        // Attempt silent re-login with credentials stored in the bridge backend.
+        val saved = loadSavedCredentialForAutoLogin(runtime.provider, _state.value.selectedProvider)
         if (saved != null) {
             val (provider, savedCredential) = saved
             _state.value = _state.value.copy(
@@ -131,7 +131,7 @@ class VpnViewModel(app: Application) : AndroidViewModel(app) {
                     val json = JSONObject(result)
                     if (json.optString("status") == "ok") {
                         val refreshedStoredCredential = mergeStoredCredential(savedCredential, json)
-                        KeystoreCredentials.save(ctx, provider, refreshedStoredCredential)
+                        saveCredential(provider, refreshedStoredCredential)
                         val servers = fetchServersNow(provider) ?: return@launch
                         _state.value = _state.value.copy(
                             screen = Screen.Dashboard,
@@ -164,7 +164,7 @@ class VpnViewModel(app: Application) : AndroidViewModel(app) {
         val prev = _state.value
         if (prev.isLoggedIn) {
             val prevProvider = prev.selectedProvider
-            KeystoreCredentials.clear(ctx)
+            deleteCredential(prevProvider)
             AutoRuntimeStore.clear(ctx)
             viewModelScope.launch(Dispatchers.IO) {
                 runCatching { RustBridge.logout(prevProvider) }
@@ -234,7 +234,7 @@ class VpnViewModel(app: Application) : AndroidViewModel(app) {
                         }.toString(),
                         loginResponse = json,
                     )
-                    KeystoreCredentials.save(ctx, provider, storedCredential)
+                    saveCredential(provider, storedCredential)
                     val servers = fetchServersNow(provider) ?: return@launch
                     _state.value = _state.value.copy(
                         screen = Screen.Dashboard,
@@ -263,8 +263,8 @@ class VpnViewModel(app: Application) : AndroidViewModel(app) {
         val provider = _state.value.selectedProvider
         if (provider.isNotBlank()) {
             runCatching { RustBridge.logout(provider) }
+            deleteCredential(provider)
         }
-        KeystoreCredentials.clear(ctx)
         AutoRuntimeStore.clear(ctx)
         val config = _state.value.config
         val splitApps = _state.value.splitTunnelApps
@@ -1069,6 +1069,72 @@ class VpnViewModel(app: Application) : AndroidViewModel(app) {
             } catch (e: Exception) {
                 _state.value = _state.value.copy(errorMessage = e.message ?: "unexpected error")
             }
+        }
+    }
+
+    private fun loadSavedCredentialForAutoLogin(runtimeProvider: String, selectedProvider: String): Pair<String, String>? {
+        val providers = buildList {
+            val runtime = runtimeProvider.trim().lowercase()
+            val selected = selectedProvider.trim().lowercase()
+            if (runtime.isNotEmpty()) add(runtime)
+            if (selected.isNotEmpty() && selected != runtime) add(selected)
+            for (provider in listOf("proton", "airvpn", "mullvad", "ivpn")) {
+                if (!contains(provider)) add(provider)
+            }
+        }
+
+        for (provider in providers) {
+            val credential = loadCredential(provider) ?: continue
+            return provider to credential
+        }
+        return null
+    }
+
+    private fun loadCredential(provider: String): String? {
+        return try {
+            val response = JSONObject(CredentialBridge.load(provider))
+            val ok = response.optBoolean("ok", false)
+            if (!ok) {
+                val code = response.optString("error_code", "load_failed")
+                val reason = response.optString("error", "credential load failed")
+                Log.w(TAG, "credential_load_failed provider=$provider code=$code reason=$reason")
+                return null
+            }
+            if (!response.has("payload") || response.isNull("payload")) {
+                null
+            } else {
+                response.getString("payload")
+            }
+        } catch (e: Exception) {
+            Log.w(TAG, "credential_load_bridge_failure provider=$provider", e)
+            null
+        }
+    }
+
+    private fun saveCredential(provider: String, payload: String) {
+        try {
+            val response = JSONObject(CredentialBridge.save(provider, payload))
+            if (!response.optBoolean("ok", false)) {
+                val code = response.optString("error_code", "store_failed")
+                val reason = response.optString("error", "credential save failed")
+                Log.w(TAG, "credential_save_failed provider=$provider code=$code reason=$reason")
+            }
+        } catch (e: Exception) {
+            Log.w(TAG, "credential_save_bridge_failure provider=$provider", e)
+        }
+    }
+
+    private fun deleteCredential(provider: String) {
+        if (provider.isBlank()) return
+        try {
+            val response = JSONObject(CredentialBridge.delete(provider))
+            if (!response.optBoolean("ok", false)) {
+                val code = response.optString("error_code", "delete_failed")
+                val reason = response.optString("error", "credential delete failed")
+                Log.w(TAG, "credential_delete_failed provider=$provider code=$code reason=$reason")
+            }
+        } catch (e: Exception) {
+            Log.w(TAG, "credential_delete_bridge_failure provider=$provider", e)
         }
     }
 

@@ -25,7 +25,7 @@ pub struct AppConfig {
 #[serde(default)]
 pub struct GeneralConfig {
     pub backend: String,
-    pub credential_store: String,
+    pub credential_store: CredentialStore,
     pub proxy: bool,
     pub socks_port: Option<u16>,
     pub http_port: Option<u16>,
@@ -42,7 +42,7 @@ impl Default for GeneralConfig {
     fn default() -> Self {
         Self {
             backend: default_backend().to_string(),
-            credential_store: "file".to_string(),
+            credential_store: default_credential_store(),
             proxy: false,
             socks_port: None,
             http_port: None,
@@ -57,6 +57,16 @@ impl Default for GeneralConfig {
     }
 }
 
+#[derive(Debug, Clone, Copy, Default, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum CredentialStore {
+    #[default]
+    File,
+    Keyring,
+    AndroidKeystore,
+    Auto,
+}
+
 fn default_backend() -> &'static str {
     #[cfg(target_os = "macos")]
     {
@@ -65,6 +75,17 @@ fn default_backend() -> &'static str {
     #[cfg(not(target_os = "macos"))]
     {
         "wg-quick"
+    }
+}
+
+fn default_credential_store() -> CredentialStore {
+    #[cfg(target_os = "android")]
+    {
+        CredentialStore::Auto
+    }
+    #[cfg(not(target_os = "android"))]
+    {
+        CredentialStore::File
     }
 }
 
@@ -277,93 +298,18 @@ pub fn save_session<T: Serialize>(
     config: &AppConfig,
 ) -> Result<()> {
     let json = serde_json::to_string_pretty(session)?;
-
-    #[cfg(feature = "keyring")]
-    if config.general.credential_store == "keyring" {
-        return save_session_keyring(provider, &json);
-    }
-
-    let _ = config;
-    save_session_file(provider, &json)
+    crate::shared::credential_store::save_session_json(provider, &json, config)
 }
 
 pub fn load_session<T: DeserializeOwned>(provider: Provider, config: &AppConfig) -> Result<T> {
-    #[cfg(feature = "keyring")]
-    if config.general.credential_store == "keyring" {
-        return load_session_keyring(provider);
-    }
-
-    let _ = config;
-    load_session_file(provider)
+    let json = crate::shared::credential_store::load_session_json(provider, config)?
+        .ok_or(AppError::NotLoggedIn)?;
+    let session: T = serde_json::from_str(&json)?;
+    Ok(session)
 }
 
 pub fn delete_session(provider: Provider, config: &AppConfig) -> Result<()> {
-    #[cfg(feature = "keyring")]
-    if config.general.credential_store == "keyring" {
-        return delete_session_keyring(provider);
-    }
-
-    let _ = config;
-    delete_session_file(provider)
-}
-
-fn save_session_file(provider: Provider, json: &str) -> Result<()> {
-    ensure_config_dir(provider)?;
-    let path = session_path(provider);
-    fs::write(&path, json)?;
-    fs::set_permissions(&path, fs::Permissions::from_mode(0o600))?;
-    tracing::info!( path = ?path.display().to_string(), "session_saved");
-    Ok(())
-}
-
-fn load_session_file<T: DeserializeOwned>(provider: Provider) -> Result<T> {
-    let path = session_path(provider);
-    if !path.exists() {
-        return Err(AppError::NotLoggedIn);
-    }
-    let json = fs::read_to_string(&path)?;
-    let session: T = serde_json::from_str(&json)?;
-    Ok(session)
-}
-
-fn delete_session_file(provider: Provider) -> Result<()> {
-    let path = session_path(provider);
-    if path.exists() {
-        fs::remove_file(&path)?;
-        tracing::info!( path = ?path.display().to_string(), "session_deleted");
-    }
-    Ok(())
-}
-
-// ── Keyring helpers (feature-gated) ────────────────────────────
-
-#[cfg(feature = "keyring")]
-fn save_session_keyring(provider: Provider, json: &str) -> Result<()> {
-    let entry = keyring::Entry::new("tunmux", provider.dir_name())
-        .map_err(|e| AppError::Other(format!("keyring error: {}", e)))?;
-    entry
-        .set_password(json)
-        .map_err(|e| AppError::Other(format!("keyring set error: {}", e)))?;
-    tracing::info!( provider = ?provider.dir_name(), "session_saved_keyring");
-    Ok(())
-}
-
-#[cfg(feature = "keyring")]
-fn load_session_keyring<T: DeserializeOwned>(provider: Provider) -> Result<T> {
-    let entry = keyring::Entry::new("tunmux", provider.dir_name())
-        .map_err(|e| AppError::Other(format!("keyring error: {}", e)))?;
-    let json = entry.get_password().map_err(|_| AppError::NotLoggedIn)?;
-    let session: T = serde_json::from_str(&json)?;
-    Ok(session)
-}
-
-#[cfg(feature = "keyring")]
-fn delete_session_keyring(provider: Provider) -> Result<()> {
-    let entry = keyring::Entry::new("tunmux", provider.dir_name())
-        .map_err(|e| AppError::Other(format!("keyring error: {}", e)))?;
-    let _ = entry.delete_credential();
-    tracing::info!( provider = ?provider.dir_name(), "session_deleted_keyring");
-    Ok(())
+    crate::shared::credential_store::delete_session_json(provider, config)
 }
 
 // ── Provider file helpers (unchanged) ──────────────────────────
@@ -384,4 +330,135 @@ pub fn load_provider_file(provider: Provider, filename: &str) -> Result<Option<V
         return Ok(None);
     }
     Ok(Some(fs::read(&path)?))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        delete_session, load_session, save_session, session_path, AppConfig, CredentialStore,
+        Provider,
+    };
+    use crate::error::AppError;
+    use std::path::PathBuf;
+    use std::sync::{Mutex, OnceLock};
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn env_lock() -> &'static Mutex<()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+    }
+
+    fn unique_test_dir(name: &str) -> PathBuf {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        std::env::temp_dir().join(format!(
+            "tunmux-test-{}-{}-{}",
+            name,
+            std::process::id(),
+            now
+        ))
+    }
+
+    #[test]
+    fn test_load_missing_maps_to_not_logged_in() {
+        let _guard = env_lock().lock().expect("test env lock poisoned");
+        let previous = std::env::var_os("XDG_CONFIG_HOME");
+        let dir = unique_test_dir("load-missing");
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        std::env::set_var("XDG_CONFIG_HOME", &dir);
+
+        let mut config = AppConfig::default();
+        config.general.credential_store = CredentialStore::File;
+
+        let result = load_session::<serde_json::Value>(Provider::Proton, &config);
+        assert!(matches!(result, Err(AppError::NotLoggedIn)));
+
+        if let Some(value) = previous {
+            std::env::set_var("XDG_CONFIG_HOME", value);
+        } else {
+            std::env::remove_var("XDG_CONFIG_HOME");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_delete_session_is_idempotent() {
+        let _guard = env_lock().lock().expect("test env lock poisoned");
+        let previous = std::env::var_os("XDG_CONFIG_HOME");
+        let dir = unique_test_dir("delete-idempotent");
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        std::env::set_var("XDG_CONFIG_HOME", &dir);
+
+        let mut config = AppConfig::default();
+        config.general.credential_store = CredentialStore::File;
+
+        delete_session(Provider::Proton, &config).expect("first delete should succeed");
+        delete_session(Provider::Proton, &config).expect("second delete should succeed");
+
+        if let Some(value) = previous {
+            std::env::set_var("XDG_CONFIG_HOME", value);
+        } else {
+            std::env::remove_var("XDG_CONFIG_HOME");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_file_backend_roundtrip_save_load_delete() {
+        let _guard = env_lock().lock().expect("test env lock poisoned");
+        let previous = std::env::var_os("XDG_CONFIG_HOME");
+        let dir = unique_test_dir("file-roundtrip");
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        std::env::set_var("XDG_CONFIG_HOME", &dir);
+
+        let mut config = AppConfig::default();
+        config.general.credential_store = CredentialStore::File;
+
+        let session = serde_json::json!({"access_token":"abc123","refresh_token":"def456"});
+        save_session(Provider::Proton, &session, &config).expect("save should succeed");
+
+        let loaded: serde_json::Value =
+            load_session(Provider::Proton, &config).expect("load should succeed");
+        assert_eq!(loaded, session);
+
+        delete_session(Provider::Proton, &config).expect("delete should succeed");
+        let missing = load_session::<serde_json::Value>(Provider::Proton, &config);
+        assert!(matches!(missing, Err(AppError::NotLoggedIn)));
+
+        if let Some(value) = previous {
+            std::env::set_var("XDG_CONFIG_HOME", value);
+        } else {
+            std::env::remove_var("XDG_CONFIG_HOME");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_file_backend_load_corrupted_json_fails() {
+        let _guard = env_lock().lock().expect("test env lock poisoned");
+        let previous = std::env::var_os("XDG_CONFIG_HOME");
+        let dir = unique_test_dir("file-corrupted-json");
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        std::env::set_var("XDG_CONFIG_HOME", &dir);
+
+        let mut config = AppConfig::default();
+        config.general.credential_store = CredentialStore::File;
+
+        let path = session_path(Provider::Proton);
+        let parent = path.parent().expect("session path has parent");
+        std::fs::create_dir_all(parent).expect("create provider dir");
+        std::fs::write(&path, "{not valid json").expect("write corrupted json");
+
+        let result = load_session::<serde_json::Value>(Provider::Proton, &config);
+        assert!(matches!(result, Err(AppError::Json(_))));
+
+        if let Some(value) = previous {
+            std::env::set_var("XDG_CONFIG_HOME", value);
+        } else {
+            std::env::remove_var("XDG_CONFIG_HOME");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

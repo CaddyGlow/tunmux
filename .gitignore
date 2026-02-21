@@ -1,5 +1,8 @@
 # Rust
 /target
+.cargo/
+
+# Android Rust library
 android/rust-lib/target
 
 # Gradle
@@ -17,3 +20,23 @@ flake.lock
 
 # Cargo
 .cargo/registry
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+env/
+venv/ 
+
+# Direnv
+.envrc
+.direnv
+
+# Environment variables
+.env
+
+# LLMs
+.claude/
+CLAUDE.md

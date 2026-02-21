@@ -15,6 +15,7 @@ android {
         versionCode   = 1
         versionName   = "0.1.0"
         ndkVersion    = libs.versions.ndk.get()
+        testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
 
         ndk {
             abiFilters += listOf("arm64-v8a", "armeabi-v7a", "x86_64")
@@ -62,4 +63,7 @@ dependencies {
     implementation("androidx.compose.material:material-icons-extended")
     implementation(libs.androidx.activity.compose)
     debugImplementation(libs.androidx.ui.tooling)
+
+    androidTestImplementation("androidx.test.ext:junit:1.2.1")
+    androidTestImplementation("androidx.test:runner:1.6.2")
 }

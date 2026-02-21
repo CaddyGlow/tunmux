@@ -54,6 +54,15 @@ pub enum AppError {
     #[error("XML parse error: {0}")]
     Xml(String),
 
+    #[error("Credential store unavailable: {0}")]
+    CredentialStoreUnavailable(String),
+
+    #[error("Credential store misconfigured: {0}")]
+    CredentialStoreMisconfigured(String),
+
+    #[error("Credential store failure: {0}")]
+    CredentialStoreFailure(String),
+
     #[error("{0}")]
     Other(String),
 }

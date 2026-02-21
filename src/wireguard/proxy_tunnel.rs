@@ -10,9 +10,9 @@ use std::sync::{Arc, LazyLock, RwLock as StdRwLock};
 use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, Context};
-use bytes::{Bytes, BytesMut};
 use boringtun::noise::{Tunn, TunnResult};
 use boringtun::x25519::{PublicKey, StaticSecret};
+use bytes::{Bytes, BytesMut};
 use crossbeam_queue::ArrayQueue;
 use serde::{Deserialize, Serialize};
 use smoltcp::iface::{Config, Interface, SocketSet};
@@ -582,7 +582,9 @@ pub async fn run_local_proxy(cfg: LocalProxyConfig) -> anyhow::Result<()> {
                 }
             }
 
-            if !remove_current && sock.can_recv() && entry.pending_client_bytes < CLIENT_PENDING_MAX_BYTES
+            if !remove_current
+                && sock.can_recv()
+                && entry.pending_client_bytes < CLIENT_PENDING_MAX_BYTES
             {
                 let mut recv_buf = [0u8; STREAM_BUF];
                 if let Ok(n) = sock.recv_slice(&mut recv_buf) {

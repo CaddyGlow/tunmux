@@ -106,6 +106,7 @@ class TunmuxVpnService : LifecycleVpnService() {
     override fun onCreate() {
         super.onCreate()
         createNotificationChannel()
+        CredentialBridge.initialize(applicationContext)
         nativeInitialize(this, filesDir.absolutePath)
     }
 

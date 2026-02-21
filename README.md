@@ -40,10 +40,13 @@ cargo build --features keyring
 
 ## Release CI (Tag-Based)
 
-Pushing a git tag (for example `v1.2.3`) triggers `.github/workflows/release.yml` to:
-- build release binaries for Linux, macOS, and Android targets
+Pushing a `v*` tag (for example `v1.2.3`) triggers `.github/workflows/release.yml` to:
+- run `cargo test --locked`
+- build release binaries for Linux, macOS, and Android targets via `.github/workflows/manual-build.yml`
+- build an Android app APK from `android/` via `.github/workflows/manual-build-android.yml`
 - upload tarballs and SHA256 files to a GitHub Release for that tag
-- build and publish a multi-arch Docker image to GHCR
+
+Publishing that GitHub Release then triggers `.github/workflows/docker.yml` (which calls `.github/workflows/docker-publish.yml`) to build and publish a multi-arch Docker image to GHCR.
 
 Binary version output follows the tag in CI builds:
 

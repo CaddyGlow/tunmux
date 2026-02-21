@@ -1,12 +1,13 @@
 package net.tunmux.model
 
 import android.content.Context
+import android.util.Log
 import org.json.JSONArray
 import org.json.JSONObject
 
 data class GeneralConfig(
     val backend: String = "wg-quick",
-    val credentialStore: String = "file",
+    val credentialStore: CredentialStore = CredentialStore.AUTO,
     val proxy: Boolean = false,
     val socksPort: Int? = null,
     val httpPort: Int? = null,
@@ -43,6 +44,19 @@ enum class WifiDetectionMethod {
     }
 }
 
+enum class CredentialStore(val wireValue: String) {
+    FILE("file"),
+    KEYRING("keyring"),
+    ANDROID_KEYSTORE("android_keystore"),
+    AUTO("auto");
+
+    companion object {
+        fun fromStored(value: String): CredentialStore? {
+            return entries.firstOrNull { it.wireValue.equals(value.trim(), ignoreCase = true) }
+        }
+    }
+}
+
 data class AutoTunnelConfig(
     val enabled: Boolean = false,
     val onWifi: Boolean = true,
@@ -66,13 +80,17 @@ data class AppConfigModel(
 )
 
 object AppConfigStore {
+    private const val TAG = "tunmux"
     private const val PREFS = "tunmux_config"
     private const val KEY_JSON = "app_config_json"
 
     fun load(context: Context): AppConfigModel {
         val prefs = context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
         val jsonText = prefs.getString(KEY_JSON, null) ?: return AppConfigModel()
-        return runCatching { fromJson(JSONObject(jsonText)) }.getOrElse { AppConfigModel() }
+        return runCatching { fromJson(JSONObject(jsonText)) }.getOrElse { ex ->
+            Log.w(TAG, "app_config_load_failed", ex)
+            AppConfigModel()
+        }
     }
 
     fun save(context: Context, config: AppConfigModel) {
@@ -83,7 +101,7 @@ object AppConfigStore {
     private fun toJson(config: AppConfigModel): JSONObject {
         val general = JSONObject()
             .put("backend", config.general.backend)
-            .put("credential_store", config.general.credentialStore)
+            .put("credential_store", config.general.credentialStore.wireValue)
             .put("proxy", config.general.proxy)
             .put("socks_port", config.general.socksPort)
             .put("http_port", config.general.httpPort)
@@ -136,7 +154,7 @@ object AppConfigStore {
 
         val general = GeneralConfig(
             backend = generalJson.optString("backend", "wg-quick"),
-            credentialStore = generalJson.optString("credential_store", "file"),
+            credentialStore = parseCredentialStore(generalJson),
             proxy = generalJson.optBoolean("proxy", false),
             socksPort = generalJson.optNullableInt("socks_port"),
             httpPort = generalJson.optNullableInt("http_port"),
@@ -190,6 +208,12 @@ object AppConfigStore {
             ivpn = ivpn,
             auto = auto,
         )
+    }
+
+    private fun parseCredentialStore(generalJson: JSONObject): CredentialStore {
+        val raw = generalJson.optString("credential_store", CredentialStore.AUTO.wireValue)
+        return CredentialStore.fromStored(raw)
+            ?: throw IllegalArgumentException("unknown credential_store value: '$raw'")
     }
 }
 

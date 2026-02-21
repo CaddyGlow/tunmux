@@ -414,39 +414,6 @@ fn validate_netns_exec_args(args: &[String]) -> Result<(), String> {
     Err("disallowed netns exec command".into())
 }
 
-#[cfg(test)]
-mod tests {
-    use super::{validate_interface_name, validate_provider};
-
-    #[test]
-    fn direct_provider_interfaces_are_allowed() {
-        for iface in ["proton0", "airvpn0", "mullvad0", "ivpn0"] {
-            assert!(validate_interface_name(iface).is_ok(), "iface {}", iface);
-        }
-    }
-
-    #[test]
-    fn wg_prefixed_interfaces_are_allowed() {
-        for iface in ["wg-a", "wg-us-sjc-507", "wg-51820"] {
-            assert!(validate_interface_name(iface).is_ok(), "iface {}", iface);
-        }
-    }
-
-    #[test]
-    fn utun_interfaces_are_allowed() {
-        for iface in ["utun", "utun0", "utun5", "utun99"] {
-            assert!(validate_interface_name(iface).is_ok(), "iface {}", iface);
-        }
-    }
-
-    #[test]
-    fn known_providers_are_allowed() {
-        for provider in ["proton", "airvpn", "mullvad", "ivpn"] {
-            assert!(validate_provider(provider).is_ok(), "provider {}", provider);
-        }
-    }
-}
-
 fn validate_route_destination(destination: &str) -> Result<(), String> {
     if destination == "default" {
         return Ok(());
@@ -567,4 +534,37 @@ fn validate_no_parent_component(path: &str) -> Result<(), String> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{validate_interface_name, validate_provider};
+
+    #[test]
+    fn direct_provider_interfaces_are_allowed() {
+        for iface in ["proton0", "airvpn0", "mullvad0", "ivpn0"] {
+            assert!(validate_interface_name(iface).is_ok(), "iface {}", iface);
+        }
+    }
+
+    #[test]
+    fn wg_prefixed_interfaces_are_allowed() {
+        for iface in ["wg-a", "wg-us-sjc-507", "wg-51820"] {
+            assert!(validate_interface_name(iface).is_ok(), "iface {}", iface);
+        }
+    }
+
+    #[test]
+    fn utun_interfaces_are_allowed() {
+        for iface in ["utun", "utun0", "utun5", "utun99"] {
+            assert!(validate_interface_name(iface).is_ok(), "iface {}", iface);
+        }
+    }
+
+    #[test]
+    fn known_providers_are_allowed() {
+        for provider in ["proton", "airvpn", "mullvad", "ivpn"] {
+            assert!(validate_provider(provider).is_ok(), "provider {}", provider);
+        }
+    }
 }

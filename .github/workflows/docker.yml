@@ -1,0 +1,28 @@
+name: Docker Image
+
+on:
+  release:
+    types:
+      - published
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: Git ref to build image from (branch, tag, or SHA)
+        required: true
+        default: main
+        type: string
+      version:
+        description: Docker tag/version label (for example v1.2.3-special)
+        required: true
+        type: string
+
+jobs:
+  docker:
+    name: Publish Docker Image
+    permissions:
+      contents: read
+      packages: write
+    uses: ./.github/workflows/docker-publish.yml
+    with:
+      ref: ${{ github.event.release.tag_name || github.event.inputs.ref || github.ref }}
+      version: ${{ github.event.release.tag_name || github.event.inputs.version || github.ref_name }}

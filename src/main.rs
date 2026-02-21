@@ -15,13 +15,13 @@ mod privileged;
 mod privileged_api;
 mod privileged_client;
 mod proton;
-mod shared;
 #[cfg(all(feature = "proxy", target_os = "linux"))]
 #[path = "proxy/mod.rs"]
 mod proxy;
 #[cfg(not(all(feature = "proxy", target_os = "linux")))]
 #[path = "proxy_stub.rs"]
 mod proxy;
+mod shared;
 mod userspace_helper;
 mod wireguard;
 

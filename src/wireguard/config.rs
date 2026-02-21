@@ -58,27 +58,26 @@ pub fn parse_config(input: &str) -> Result<WgParsedConfig> {
     let mut peer_allowed: Option<String> = None;
     let mut peer_endpoint: Option<String> = None;
 
-    let flush_peer =
-        |peers: &mut Vec<WgParsedPeer>,
-         pubkey: &mut Option<String>,
-         psk: &mut Option<String>,
-         allowed: &mut Option<String>,
-         endpoint: &mut Option<String>|
-         -> Result<()> {
-            let public_key = pubkey.take().ok_or_else(|| {
-                AppError::WireGuard("peer section missing PublicKey".into())
-            })?;
-            let allowed_ips = allowed.take().ok_or_else(|| {
-                AppError::WireGuard("peer section missing AllowedIPs".into())
-            })?;
-            peers.push(WgParsedPeer {
-                public_key,
-                preshared_key: psk.take(),
-                allowed_ips,
-                endpoint: endpoint.take(),
-            });
-            Ok(())
-        };
+    let flush_peer = |peers: &mut Vec<WgParsedPeer>,
+                      pubkey: &mut Option<String>,
+                      psk: &mut Option<String>,
+                      allowed: &mut Option<String>,
+                      endpoint: &mut Option<String>|
+     -> Result<()> {
+        let public_key = pubkey
+            .take()
+            .ok_or_else(|| AppError::WireGuard("peer section missing PublicKey".into()))?;
+        let allowed_ips = allowed
+            .take()
+            .ok_or_else(|| AppError::WireGuard("peer section missing AllowedIPs".into()))?;
+        peers.push(WgParsedPeer {
+            public_key,
+            preshared_key: psk.take(),
+            allowed_ips,
+            endpoint: endpoint.take(),
+        });
+        Ok(())
+    };
 
     for line in input.lines() {
         let line = line.trim();
@@ -155,9 +154,7 @@ pub fn parse_config(input: &str) -> Result<WgParsedConfig> {
     let private_key = private_key
         .ok_or_else(|| AppError::WireGuard("missing PrivateKey in [Interface]".into()))?;
     if addresses.is_empty() {
-        return Err(AppError::WireGuard(
-            "missing Address in [Interface]".into(),
-        ));
+        return Err(AppError::WireGuard("missing Address in [Interface]".into()));
     }
     if peers.is_empty() {
         return Err(AppError::WireGuard("no [Peer] sections found".into()));
@@ -321,10 +318,7 @@ mod tests {
             parsed.addresses,
             &["10.5.0.1/32", "fd7d:76ee:e68f:a993::1/128"]
         );
-        assert_eq!(
-            parsed.dns_servers,
-            &["10.5.0.1", "fd7d:76ee:e68f:a993::1"]
-        );
+        assert_eq!(parsed.dns_servers, &["10.5.0.1", "fd7d:76ee:e68f:a993::1"]);
         assert_eq!(parsed.peers.len(), 1);
 
         let peer = &parsed.peers[0];
@@ -339,15 +333,15 @@ mod tests {
 
     #[test]
     fn test_parse_config_missing_private_key() {
-        let input = "[Interface]\nAddress = 10.0.0.1/32\n[Peer]\nPublicKey = abc\nAllowedIPs = 0.0.0.0/0\n";
+        let input =
+            "[Interface]\nAddress = 10.0.0.1/32\n[Peer]\nPublicKey = abc\nAllowedIPs = 0.0.0.0/0\n";
         let err = parse_config(input).unwrap_err();
         assert!(err.to_string().contains("PrivateKey"));
     }
 
     #[test]
     fn test_parse_config_no_peers() {
-        let input =
-            "[Interface]\nPrivateKey = abc\nAddress = 10.0.0.1/32\n";
+        let input = "[Interface]\nPrivateKey = abc\nAddress = 10.0.0.1/32\n";
         let err = parse_config(input).unwrap_err();
         assert!(err.to_string().contains("Peer"));
     }
