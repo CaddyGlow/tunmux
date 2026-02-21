@@ -128,8 +128,9 @@ fn next_available_port(start: u16, used: &[u16]) -> anyhow::Result<u16> {
 }
 
 fn loopback_tcp_bind_available(port: u16) -> bool {
+    // local-proxy binds on 127.0.0.1, so IPv4 loopback availability is the
+    // gating condition for safe auto-port selection.
     std::net::TcpListener::bind(("127.0.0.1", port)).is_ok()
-        || std::net::TcpListener::bind(("::1", port)).is_ok()
 }
 
 /// Stop a proxy daemon via the privileged API.
@@ -201,5 +202,12 @@ mod tests {
     #[test]
     fn test_loopback_tcp_bind_available_ephemeral() {
         assert!(loopback_tcp_bind_available(0));
+    }
+
+    #[test]
+    fn test_loopback_tcp_bind_available_respects_ipv4_conflict() {
+        let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        assert!(!loopback_tcp_bind_available(port));
     }
 }

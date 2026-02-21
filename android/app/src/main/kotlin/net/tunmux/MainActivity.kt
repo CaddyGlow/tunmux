@@ -80,7 +80,6 @@ import net.tunmux.model.AppConfigModel
 import net.tunmux.model.AutoTunnelConfig
 import net.tunmux.model.ConnectionState
 import net.tunmux.model.DashboardTab
-import net.tunmux.model.GeneralConfig
 import net.tunmux.model.ProviderConfig
 import net.tunmux.model.Screen
 import net.tunmux.model.SplitTunnelApp
@@ -188,6 +187,7 @@ fun TunmuxApp(vm: VpnViewModel = viewModel()) {
             airvpnKeys = state.airvpnKeys,
             selectedAirvpnKey = state.selectedAirvpnKey,
             airvpnDevices = state.airvpnDevices,
+            providerCurrentKeys = state.providerCurrentKeys,
             autoConfig = state.autoConfig,
             connectedWifiSsid = state.connectedWifiSsid,
             knownWifiSsids = state.knownWifiSsids,
@@ -388,6 +388,7 @@ fun DashboardScreen(
     airvpnKeys: List<AirvpnKey>,
     selectedAirvpnKey: String,
     airvpnDevices: List<AirvpnDevice>,
+    providerCurrentKeys: Map<String, String>,
     autoConfig: AutoTunnelConfig,
     connectedWifiSsid: String,
     knownWifiSsids: List<String>,
@@ -506,6 +507,14 @@ fun DashboardScreen(
                 )
                 DashboardTab.Tunnels -> TunnelsTabContent(
                     isLoggedIn = isLoggedIn,
+                    provider = provider,
+                    defaultCountry = when (provider) {
+                        "proton" -> config.proton.defaultCountry
+                        "airvpn" -> config.airvpn.defaultCountry
+                        "mullvad" -> config.mullvad.defaultCountry
+                        "ivpn" -> config.ivpn.defaultCountry
+                        else -> ""
+                    },
                     servers = servers,
                     favoriteServers = favoriteServers,
                     activeServer = activeServer,
@@ -520,6 +529,7 @@ fun DashboardScreen(
                     airvpnKeys = airvpnKeys,
                     selectedAirvpnKey = selectedAirvpnKey,
                     airvpnDevices = airvpnDevices,
+                    providerCurrentKeys = providerCurrentKeys,
                     onSaveConfig = onSaveConfig,
                     onRefreshAirvpn = onRefreshAirvpn,
                     onSelectAirvpnKey = onSelectAirvpnKey,
@@ -670,6 +680,8 @@ private enum class TunnelSortOption(val label: String) {
 @Composable
 private fun TunnelsTabContent(
     isLoggedIn: Boolean,
+    provider: String,
+    defaultCountry: String,
     servers: List<String>,
     favoriteServers: List<String>,
     activeServer: String,
@@ -680,7 +692,7 @@ private fun TunnelsTabContent(
 ) {
     var searchQuery by remember { mutableStateOf("") }
     var sortOption by remember { mutableStateOf(TunnelSortOption.FavoritesFirst) }
-    var countryFilter by remember { mutableStateOf("All") }
+    var countryFilter by remember(provider) { mutableStateOf("All") }
     var sortExpanded by remember { mutableStateOf(false) }
     var countryExpanded by remember { mutableStateOf(false) }
 
@@ -697,9 +709,16 @@ private fun TunnelsTabContent(
             )
         }
     }
-    LaunchedEffect(countries) {
-        if (countryFilter !in countries) {
-            countryFilter = "All"
+    LaunchedEffect(countries, activeServer, defaultCountry) {
+        val fromActiveServer = extractCountryCode(activeServer).takeIf { it != "--" }
+        val fromDefault = defaultCountry.trim().uppercase().takeIf { it.length == 2 }
+        val preferred = when {
+            fromActiveServer != null -> fromActiveServer
+            fromDefault != null -> fromDefault
+            else -> "All"
+        }
+        if (countryFilter !in countries || countryFilter == "All") {
+            countryFilter = if (preferred in countries) preferred else "All"
         }
     }
     val filteredServers = remember(servers, favoriteSet, searchQuery, sortOption, countryFilter) {
@@ -921,6 +940,7 @@ private fun ConfigTabContent(
     airvpnKeys: List<AirvpnKey>,
     selectedAirvpnKey: String,
     airvpnDevices: List<AirvpnDevice>,
+    providerCurrentKeys: Map<String, String>,
     onSaveConfig: (AppConfigModel) -> Unit,
     onRefreshAirvpn: () -> Unit,
     onSelectAirvpnKey: (String) -> Unit,
@@ -964,50 +984,70 @@ private fun ConfigTabContent(
         }
 
         item { Text("Provider defaults", style = MaterialTheme.typography.titleMedium) }
-        item {
-            OutlinedTextField(
-                value = protonCountry,
-                onValueChange = { protonCountry = it },
-                label = { Text("proton.default_country") },
-                modifier = Modifier.fillMaxWidth(),
-                singleLine = true,
-            )
+        when (provider) {
+            "proton" -> item {
+                OutlinedTextField(
+                    value = protonCountry,
+                    onValueChange = { protonCountry = it },
+                    label = { Text("proton.default_country") },
+                    modifier = Modifier.fillMaxWidth(),
+                    singleLine = true,
+                )
+            }
+
+            "airvpn" -> {
+                item {
+                    OutlinedTextField(
+                        value = airvpnCountry,
+                        onValueChange = { airvpnCountry = it },
+                        label = { Text("airvpn.default_country") },
+                        modifier = Modifier.fillMaxWidth(),
+                        singleLine = true,
+                    )
+                }
+                item {
+                    OutlinedTextField(
+                        value = airvpnDevice,
+                        onValueChange = { airvpnDevice = it },
+                        label = { Text("airvpn.last_key") },
+                        modifier = Modifier.fillMaxWidth(),
+                        singleLine = true,
+                    )
+                }
+            }
+
+            "mullvad" -> item {
+                OutlinedTextField(
+                    value = mullvadCountry,
+                    onValueChange = { mullvadCountry = it },
+                    label = { Text("mullvad.default_country") },
+                    modifier = Modifier.fillMaxWidth(),
+                    singleLine = true,
+                )
+            }
+
+            "ivpn" -> item {
+                OutlinedTextField(
+                    value = ivpnCountry,
+                    onValueChange = { ivpnCountry = it },
+                    label = { Text("ivpn.default_country") },
+                    modifier = Modifier.fillMaxWidth(),
+                    singleLine = true,
+                )
+            }
         }
+
+        item { Spacer(Modifier.height(6.dp)) }
+        item { Text("Current key by provider", style = MaterialTheme.typography.titleMedium) }
         item {
-            OutlinedTextField(
-                value = airvpnCountry,
-                onValueChange = { airvpnCountry = it },
-                label = { Text("airvpn.default_country") },
-                modifier = Modifier.fillMaxWidth(),
-                singleLine = true,
-            )
-        }
-        item {
-            OutlinedTextField(
-                value = airvpnDevice,
-                onValueChange = { airvpnDevice = it },
-                label = { Text("airvpn.default_device") },
-                modifier = Modifier.fillMaxWidth(),
-                singleLine = true,
-            )
-        }
-        item {
-            OutlinedTextField(
-                value = mullvadCountry,
-                onValueChange = { mullvadCountry = it },
-                label = { Text("mullvad.default_country") },
-                modifier = Modifier.fillMaxWidth(),
-                singleLine = true,
-            )
-        }
-        item {
-            OutlinedTextField(
-                value = ivpnCountry,
-                onValueChange = { ivpnCountry = it },
-                label = { Text("ivpn.default_country") },
-                modifier = Modifier.fillMaxWidth(),
-                singleLine = true,
-            )
+            Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                listOf("proton", "airvpn", "mullvad", "ivpn").forEach { name ->
+                    val key = providerCurrentKeys[name].orEmpty().ifBlank {
+                        if (name == "airvpn") config.airvpn.defaultDevice else ""
+                    }
+                    Text("$name: ${key.ifBlank { "none" }}")
+                }
+            }
         }
 
         if (provider == "airvpn") {
@@ -1111,209 +1151,11 @@ private fun SettingsTabContent(
     onSetSplitTunnelOnlyAllowSelected: (Boolean) -> Unit,
     onSetSplitTunnelApp: (String, Boolean) -> Unit,
 ) {
-    var backend by remember(config) { mutableStateOf(config.general.backend) }
-    var credentialStore by remember(config) { mutableStateOf(config.general.credentialStore) }
-    var proxy by remember(config) { mutableStateOf(config.general.proxy) }
-    var proxyAccessLog by remember(config) { mutableStateOf(config.general.proxyAccessLog) }
-    var socksPort by remember(config) { mutableStateOf(config.general.socksPort?.toString().orEmpty()) }
-    var httpPort by remember(config) { mutableStateOf(config.general.httpPort?.toString().orEmpty()) }
-    var privilegedTransport by remember(config) { mutableStateOf(config.general.privilegedTransport) }
-    var privilegedAutostart by remember(config) { mutableStateOf(config.general.privilegedAutostart) }
-    var privilegedAutostartTimeout by remember(config) {
-        mutableStateOf(config.general.privilegedAutostartTimeoutMs.toString())
-    }
-    var privilegedAuthorizedGroup by remember(config) {
-        mutableStateOf(config.general.privilegedAuthorizedGroup)
-    }
-    var privilegedAutostopMode by remember(config) { mutableStateOf(config.general.privilegedAutostopMode) }
-    var privilegedAutostopTimeout by remember(config) {
-        mutableStateOf(config.general.privilegedAutostopTimeoutMs.toString())
-    }
-
-    val saveConfig = {
-        onSaveConfig(
-            config.copy(
-                general = GeneralConfig(
-                    backend = backend.trim(),
-                    credentialStore = credentialStore.trim(),
-                    proxy = proxy,
-                    socksPort = parseIntOrNull(socksPort),
-                    httpPort = parseIntOrNull(httpPort),
-                    proxyAccessLog = proxyAccessLog,
-                    privilegedTransport = privilegedTransport.trim(),
-                    privilegedAutostart = privilegedAutostart,
-                    privilegedAutostartTimeoutMs = parseLongOrDefault(privilegedAutostartTimeout, 5000L),
-                    privilegedAuthorizedGroup = privilegedAuthorizedGroup.trim(),
-                    privilegedAutostopMode = privilegedAutostopMode.trim(),
-                    privilegedAutostopTimeoutMs = parseLongOrDefault(privilegedAutostopTimeout, 30000L),
-                    appMode = config.general.appMode,
-                    splitTunnelApps = config.general.splitTunnelApps,
-                    splitTunnelOnlyAllowSelected = config.general.splitTunnelOnlyAllowSelected,
-                    favoriteServers = config.general.favoriteServers,
-                )
-            )
-        )
-    }
-
-    val appMode = config.general.appMode
-    val selectedSplitApps = config.general.splitTunnelApps.toSet()
-
-    LazyColumn(verticalArrangement = Arrangement.spacedBy(8.dp)) {
-        item {
-            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                Button(onClick = saveConfig) { Text("Save") }
-            }
-        }
-
-        item { Text("Tunnel", style = MaterialTheme.typography.titleMedium) }
-        item {
-            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                OutlinedButton(
-                    onClick = { onSetAppMode("vpn") },
-                    enabled = appMode != "vpn",
-                ) { Text("App mode: VPN") }
-                OutlinedButton(
-                    onClick = { onSetAppMode("split") },
-                    enabled = appMode != "split",
-                ) { Text("Split tunnel") }
-            }
-        }
-        if (appMode == "split") {
-            item {
-                ToggleRow(
-                    title = "Only allow selected apps",
-                    checked = config.general.splitTunnelOnlyAllowSelected,
-                    onToggle = onSetSplitTunnelOnlyAllowSelected,
-                )
-            }
-            item {
-                Text(
-                    if (config.general.splitTunnelOnlyAllowSelected) {
-                        "Selected apps use VPN; all other apps bypass VPN"
-                    } else {
-                        "Selected apps bypass VPN; all other apps use VPN"
-                    }
-                )
-            }
-            if (splitTunnelApps.isEmpty()) {
-                item { Text("No launchable apps found") }
-            } else {
-                items(splitTunnelApps.take(200)) { app ->
-                    ToggleRow(
-                        title = app.label,
-                        checked = selectedSplitApps.contains(app.packageName),
-                        onToggle = { onSetSplitTunnelApp(app.packageName, it) },
-                    )
-                }
-            }
-        }
-        item {
-            OutlinedTextField(
-                value = backend,
-                onValueChange = { backend = it },
-                label = { Text("general.backend") },
-                modifier = Modifier.fillMaxWidth(),
-                singleLine = true,
-            )
-        }
-        item {
-            OutlinedTextField(
-                value = credentialStore,
-                onValueChange = { credentialStore = it },
-                label = { Text("general.credential_store") },
-                modifier = Modifier.fillMaxWidth(),
-                singleLine = true,
-            )
-        }
-
-        item { Text("Ports", style = MaterialTheme.typography.titleMedium) }
-        item {
-            OutlinedTextField(
-                value = socksPort,
-                onValueChange = { socksPort = it },
-                label = { Text("general.socks_port") },
-                modifier = Modifier.fillMaxWidth(),
-                singleLine = true,
-            )
-        }
-        item {
-            OutlinedTextField(
-                value = httpPort,
-                onValueChange = { httpPort = it },
-                label = { Text("general.http_port") },
-                modifier = Modifier.fillMaxWidth(),
-                singleLine = true,
-            )
-        }
-
-        item { Text("Privileged", style = MaterialTheme.typography.titleMedium) }
-        item {
-            OutlinedTextField(
-                value = privilegedTransport,
-                onValueChange = { privilegedTransport = it },
-                label = { Text("general.privileged_transport") },
-                modifier = Modifier.fillMaxWidth(),
-                singleLine = true,
-            )
-        }
-        item {
-            OutlinedTextField(
-                value = privilegedAuthorizedGroup,
-                onValueChange = { privilegedAuthorizedGroup = it },
-                label = { Text("general.privileged_authorized_group") },
-                modifier = Modifier.fillMaxWidth(),
-                singleLine = true,
-            )
-        }
-        item {
-            OutlinedTextField(
-                value = privilegedAutostopMode,
-                onValueChange = { privilegedAutostopMode = it },
-                label = { Text("general.privileged_autostop_mode") },
-                modifier = Modifier.fillMaxWidth(),
-                singleLine = true,
-            )
-        }
-        item {
-            OutlinedTextField(
-                value = privilegedAutostartTimeout,
-                onValueChange = { privilegedAutostartTimeout = it },
-                label = { Text("general.privileged_autostart_timeout_ms") },
-                modifier = Modifier.fillMaxWidth(),
-                singleLine = true,
-            )
-        }
-        item {
-            OutlinedTextField(
-                value = privilegedAutostopTimeout,
-                onValueChange = { privilegedAutostopTimeout = it },
-                label = { Text("general.privileged_autostop_timeout_ms") },
-                modifier = Modifier.fillMaxWidth(),
-                singleLine = true,
-            )
-        }
-
-        item {
-            ToggleRow(
-                title = "general.proxy",
-                checked = proxy,
-                onToggle = { proxy = it },
-            )
-        }
-        item {
-            ToggleRow(
-                title = "general.proxy_access_log",
-                checked = proxyAccessLog,
-                onToggle = { proxyAccessLog = it },
-            )
-        }
-        item {
-            ToggleRow(
-                title = "general.privileged_autostart",
-                checked = privilegedAutostart,
-                onToggle = { privilegedAutostart = it },
-            )
-        }
+    Box(
+        modifier = Modifier.fillMaxSize(),
+        contentAlignment = Alignment.Center,
+    ) {
+        Text("No Android settings yet.")
     }
 }
 
@@ -1542,14 +1384,4 @@ private fun ToggleRow(
             )
         }
     }
-}
-
-private fun parseIntOrNull(value: String): Int? {
-    val trimmed = value.trim()
-    if (trimmed.isEmpty()) return null
-    return trimmed.toIntOrNull()
-}
-
-private fun parseLongOrDefault(value: String, fallback: Long): Long {
-    return value.trim().toLongOrNull() ?: fallback
 }

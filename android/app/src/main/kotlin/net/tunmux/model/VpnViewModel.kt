@@ -68,6 +68,7 @@ data class UiState(
     val airvpnKeys: List<AirvpnKey> = emptyList(),
     val selectedAirvpnKey: String = "",
     val airvpnDevices: List<AirvpnDevice> = emptyList(),
+    val providerCurrentKeys: Map<String, String> = emptyMap(),
     val settingsMessage: String = "",
     val autoConfig: AutoTunnelConfig = AutoTunnelConfig(),
     val splitTunnelApps: List<SplitTunnelApp> = emptyList(),
@@ -95,9 +96,12 @@ class VpnViewModel(app: Application) : AndroidViewModel(app) {
 
     init {
         val config = AppConfigStore.load(ctx)
+        val runtime = AutoRuntimeStore.load(ctx)
         _state.value = _state.value.copy(
             config = config,
             autoConfig = config.auto,
+            selectedProvider = runtime.provider.ifBlank { _state.value.selectedProvider },
+            activeServer = runtime.server,
         )
         ensureStatusPolling()
         startNetworkMonitoring()
@@ -111,7 +115,14 @@ class VpnViewModel(app: Application) : AndroidViewModel(app) {
         val saved = KeystoreCredentials.load(ctx)
         if (saved != null) {
             val (provider, savedCredential) = saved
-            _state.value = _state.value.copy(selectedProvider = provider)
+            _state.value = _state.value.copy(
+                selectedProvider = provider,
+                activeServer = if (runtime.provider.equals(provider, ignoreCase = true)) {
+                    runtime.server
+                } else {
+                    ""
+                },
+            )
             AutoRuntimeStore.saveProvider(ctx, provider)
             viewModelScope.launch(Dispatchers.IO) {
                 try {
@@ -179,9 +190,6 @@ class VpnViewModel(app: Application) : AndroidViewModel(app) {
         _state.value = _state.value.copy(activeTab = tab, errorMessage = "")
         if (tab == DashboardTab.Config && _state.value.selectedProvider == "airvpn") {
             refreshAirvpnSettingsData()
-        }
-        if (tab == DashboardTab.Settings) {
-            loadInstalledApps()
         }
         if (tab == DashboardTab.Auto) {
             refreshKnownWifiSsids()
@@ -322,17 +330,27 @@ class VpnViewModel(app: Application) : AndroidViewModel(app) {
 
     fun connect(context: Context, serverJson: String) {
         val provider = _state.value.selectedProvider
-        val config = _state.value.config
-        AutoRuntimeStore.save(ctx, provider, serverJson)
+        val server = serverJson.trim()
+        var config = _state.value.config
+        val countryCode = extractCountryCodeFromServer(server)
+        if (countryCode.isNotBlank()) {
+            val updated = updateProviderDefaultCountry(config, provider, countryCode)
+            if (updated != config) {
+                config = updated
+                AppConfigStore.save(ctx, config)
+            }
+        }
+        AutoRuntimeStore.save(ctx, provider, server)
         _state.value = _state.value.copy(
             connectionState = ConnectionState.Connecting,
-            activeServer = serverJson,
+            activeServer = server,
+            config = config,
             errorMessage = "",
         )
         val intent = Intent(context, TunmuxVpnService::class.java).apply {
             action = TunmuxVpnService.ACTION_CONNECT
             putExtra(TunmuxVpnService.EXTRA_PROVIDER, provider)
-            putExtra(TunmuxVpnService.EXTRA_SERVER_JSON, serverJson)
+            putExtra(TunmuxVpnService.EXTRA_SERVER_JSON, server)
             putExtra(TunmuxVpnService.EXTRA_APP_MODE, config.general.appMode)
             putStringArrayListExtra(
                 TunmuxVpnService.EXTRA_SPLIT_TUNNEL_APPS,
@@ -370,12 +388,31 @@ class VpnViewModel(app: Application) : AndroidViewModel(app) {
     private fun refreshConnectionStatusOnce() {
         try {
             val statusJson = JSONObject(RustBridge.getConnectionStatus())
+            val prev = _state.value
+            val provider = statusJson.optString("provider", prev.selectedProvider).trim().lowercase()
+            val server = statusJson.optString("server", prev.activeServer).trim()
+            val selectedKey = statusJson.optString("selected_key", "").trim()
+            val providerKeys = if (provider.isNotBlank() && selectedKey.isNotBlank()) {
+                prev.providerCurrentKeys + (provider to selectedKey)
+            } else {
+                prev.providerCurrentKeys
+            }
             when (statusJson.optString("state")) {
                 "connected" -> {
                     _state.value = _state.value.copy(
                         connectionState = ConnectionState.Connected,
+                        selectedProvider = provider.ifBlank { prev.selectedProvider },
+                        activeServer = server.ifBlank { prev.activeServer },
+                        providerCurrentKeys = providerKeys,
                         wgLikeStatus = buildWgLikeStatus(statusJson),
                     )
+                    if (
+                        provider.isNotBlank() &&
+                        server.isNotBlank() &&
+                        (provider != prev.selectedProvider || server != prev.activeServer)
+                    ) {
+                        AutoRuntimeStore.save(ctx, provider, server)
+                    }
                 }
                 "degraded" -> {
                     _state.value = _state.value.copy(
@@ -480,6 +517,31 @@ class VpnViewModel(app: Application) : AndroidViewModel(app) {
         }
     }
 
+    private fun extractCountryCodeFromServer(server: String): String {
+        val match = "\\[([A-Za-z]{2})\\]".toRegex().find(server.trim()) ?: return ""
+        return match.groupValues.getOrNull(1)?.uppercase().orEmpty()
+    }
+
+    private fun updateProviderDefaultCountry(config: AppConfigModel, provider: String, countryCode: String): AppConfigModel {
+        val code = countryCode.trim().uppercase()
+        if (code.length != 2) return config
+        return when (provider.trim().lowercase()) {
+            "proton" ->
+                if (config.proton.defaultCountry.equals(code, ignoreCase = true)) config else
+                    config.copy(proton = config.proton.copy(defaultCountry = code))
+            "airvpn" ->
+                if (config.airvpn.defaultCountry.equals(code, ignoreCase = true)) config else
+                    config.copy(airvpn = config.airvpn.copy(defaultCountry = code))
+            "mullvad" ->
+                if (config.mullvad.defaultCountry.equals(code, ignoreCase = true)) config else
+                    config.copy(mullvad = config.mullvad.copy(defaultCountry = code))
+            "ivpn" ->
+                if (config.ivpn.defaultCountry.equals(code, ignoreCase = true)) config else
+                    config.copy(ivpn = config.ivpn.copy(defaultCountry = code))
+            else -> config
+        }
+    }
+
     fun saveConfig(config: AppConfigModel) {
         AppConfigStore.save(ctx, config)
         val oldDefaultDevice = _state.value.config.airvpn.defaultDevice
@@ -544,10 +606,29 @@ class VpnViewModel(app: Application) : AndroidViewModel(app) {
                 }
             }
 
+            val selected = keysResp.optString("selected", "").trim()
+            val previous = _state.value
+            val updatedConfig = if (
+                selected.isNotBlank() &&
+                !previous.config.airvpn.defaultDevice.equals(selected, ignoreCase = true)
+            ) {
+                previous.config.copy(
+                    airvpn = previous.config.airvpn.copy(defaultDevice = selected),
+                ).also { AppConfigStore.save(ctx, it) }
+            } else {
+                previous.config
+            }
+            val providerKeys = if (selected.isNotBlank()) {
+                previous.providerCurrentKeys + ("airvpn" to selected)
+            } else {
+                previous.providerCurrentKeys
+            }
             _state.value = _state.value.copy(
+                config = updatedConfig,
                 airvpnKeys = keys,
-                selectedAirvpnKey = keysResp.optString("selected", ""),
+                selectedAirvpnKey = selected,
                 airvpnDevices = devices,
+                providerCurrentKeys = providerKeys,
                 settingsMessage = "",
             )
         } catch (e: Throwable) {
@@ -574,6 +655,11 @@ class VpnViewModel(app: Application) : AndroidViewModel(app) {
                     _state.value = _state.value.copy(
                         config = config,
                         selectedAirvpnKey = selected,
+                        providerCurrentKeys = if (selected.isNotBlank()) {
+                            _state.value.providerCurrentKeys + ("airvpn" to selected)
+                        } else {
+                            _state.value.providerCurrentKeys
+                        },
                         settingsMessage = "Selected key: $selected",
                     )
                     refreshAirvpnSettingsDataInternal()
