@@ -18,12 +18,12 @@ use tokio::task::AbortHandle;
 use tunmux::airvpn::api::AirVpnClient;
 use tunmux::airvpn::models::{AirManifest, AirServer, AirWgKey, AirWgMode};
 use tunmux::airvpn::web::AirVpnWeb;
-use tunmux::api;
-use tunmux::crypto;
 use tunmux::ivpn::api as ivpn_api;
-use tunmux::models::server::LogicalServer;
-use tunmux::models::session::Session;
 use tunmux::mullvad::api as mullvad_api;
+use tunmux::proton::api;
+use tunmux::proton::models::server::LogicalServer;
+use tunmux::proton::models::session::Session;
+use tunmux::shared::crypto;
 use tunmux::wireguard::proxy_tunnel::{run_local_proxy, LocalProxyConfig};
 
 static TOKIO_RUNTIME: OnceLock<Runtime> = OnceLock::new();

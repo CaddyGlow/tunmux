@@ -6,11 +6,11 @@ use std::time::Duration;
 
 use crate::cli::{IvpnCommand, IvpnPaymentCommand};
 use crate::config::{self, AppConfig, Provider};
-use crate::crypto;
 use crate::error;
 use crate::local_proxy;
 use crate::netns;
 use crate::proxy;
+use crate::shared::crypto;
 use crate::wireguard;
 
 const PROVIDER: Provider = Provider::Ivpn;

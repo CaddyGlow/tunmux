@@ -1,10 +1,10 @@
 use serde_json::json;
 use tracing::{debug, info};
 
-use crate::api::http::{check_api_response, ProtonClient};
-use crate::api::srp;
+use super::http::{check_api_response, ProtonClient};
+use super::srp;
 use crate::error::Result;
-use crate::models::session::{AuthInfoResponse, AuthResponse, TwoFactorResponse};
+use crate::proton::models::session::{AuthInfoResponse, AuthResponse, TwoFactorResponse};
 
 /// Perform SRP login against the Proton API.
 ///

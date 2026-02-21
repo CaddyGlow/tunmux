@@ -9,11 +9,7 @@ pub mod cli;
 pub mod config;
 pub mod error;
 pub mod logging;
-
-// Proton-specific API/model/crypto layers (portable; handlers are gated below)
-pub mod api;
-pub mod crypto;
-pub mod models;
+pub mod shared;
 
 // Provider modules (handlers inside each mod are cfg-gated for Android)
 pub mod airvpn;

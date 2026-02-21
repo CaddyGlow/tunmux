@@ -1,8 +1,8 @@
 use reqwest::Client;
 use serde::de::DeserializeOwned;
 
-use crate::crypto;
 use crate::error::{AppError, Result};
+use crate::shared::crypto;
 
 const API_BASE: &str = "https://api.ivpn.net";
 const CODE_SUCCESS: i64 = 200;

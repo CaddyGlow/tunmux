@@ -1,13 +1,13 @@
-use crate::api;
 use crate::cli::ProtonCommand;
 use crate::config::{self, AppConfig, Provider};
-use crate::crypto;
 use crate::error;
 use crate::local_proxy;
-use crate::models;
 use crate::netns;
 use crate::proxy;
+use crate::shared::crypto;
 use crate::wireguard;
+
+use super::{api, models};
 
 const PROVIDER: Provider = Provider::Proton;
 const INTERFACE_NAME: &str = "proton0";

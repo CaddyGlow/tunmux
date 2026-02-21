@@ -8,11 +8,11 @@ use serde::de::DeserializeOwned;
 
 use crate::cli::{MullvadCommand, MullvadPaymentCommand};
 use crate::config::{self, AppConfig, Provider};
-use crate::crypto;
 use crate::error;
 use crate::local_proxy;
 use crate::netns;
 use crate::proxy;
+use crate::shared::crypto;
 use crate::wireguard;
 
 const PROVIDER: Provider = Provider::Mullvad;

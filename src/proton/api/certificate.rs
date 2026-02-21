@@ -1,9 +1,9 @@
 use serde_json::json;
 use tracing::info;
 
-use crate::api::http::{check_api_response, ProtonClient};
+use super::http::{check_api_response, ProtonClient};
 use crate::error::Result;
-use crate::models::session::CertificateResponse;
+use crate::proton::models::session::CertificateResponse;
 
 /// Refresh interval for certificates: 7 days in minutes.
 const CERT_DURATION_MIN: i64 = 7 * 24 * 60;

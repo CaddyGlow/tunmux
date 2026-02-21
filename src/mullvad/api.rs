@@ -1,8 +1,8 @@
 use reqwest::{Client, StatusCode};
 use serde::de::DeserializeOwned;
 
-use crate::crypto;
 use crate::error::{AppError, Result};
+use crate::shared::crypto;
 
 const API_BASE: &str = "https://api.mullvad.net";
 

@@ -1,13 +1,10 @@
 mod airvpn;
-mod api;
 mod cli;
 mod config;
-mod crypto;
 mod error;
 mod ivpn;
 mod local_proxy;
 mod logging;
-mod models;
 mod mullvad;
 #[cfg(target_os = "linux")]
 mod netns;
@@ -18,6 +15,7 @@ mod privileged;
 mod privileged_api;
 mod privileged_client;
 mod proton;
+mod shared;
 #[cfg(all(feature = "proxy", target_os = "linux"))]
 #[path = "proxy/mod.rs"]
 mod proxy;

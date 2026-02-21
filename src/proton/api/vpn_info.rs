@@ -1,8 +1,8 @@
 use tracing::info;
 
-use crate::api::http::{check_api_response, ProtonClient};
+use super::http::{check_api_response, ProtonClient};
 use crate::error::Result;
-use crate::models::session::VpnInfoResponse;
+use crate::proton::models::session::VpnInfoResponse;
 
 /// Fetch VPN account info (username, password, tier, plan).
 pub async fn fetch_vpn_info(client: &ProtonClient) -> Result<VpnInfoResponse> {

@@ -1,8 +1,8 @@
 use tracing::info;
 
-use crate::api::http::{check_api_response, ProtonClient};
+use super::http::{check_api_response, ProtonClient};
 use crate::error::Result;
-use crate::models::server::LogicalsResponse;
+use crate::proton::models::server::LogicalsResponse;
 
 /// Fetch the full server list from the Proton API.
 pub async fn fetch_server_list(client: &ProtonClient) -> Result<LogicalsResponse> {
