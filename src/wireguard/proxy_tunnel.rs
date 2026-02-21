@@ -25,17 +25,17 @@ use tokio::sync::{mpsc, oneshot, Notify};
 use tracing::{debug, info, warn};
 
 const UDP_BUF: usize = 65536;
-const TCP_SOCKET_BUF: usize = 262144;
+const TCP_SOCKET_BUF: usize = 1024 * 1024;
 const STREAM_BUF: usize = 65536;
 const LOCAL_PORT_START: u16 = 40000;
 const LOCAL_PORT_END: u16 = 65000;
 const WG_TIMER_TICK_MAX: Duration = Duration::from_millis(100);
-const ACTIVE_CONN_POLL_MAX: Duration = Duration::from_millis(1);
+const ACTIVE_CONN_POLL_MAX: Duration = Duration::from_micros(200);
 const CLIENT_CHANNEL_CAP: usize = 1024;
 const REMOTE_PENDING_MAX_BYTES: usize = 2 * 1024 * 1024;
 const CLIENT_PENDING_MAX_BYTES: usize = 2 * 1024 * 1024;
-const UDP_RECV_BURST_MAX: usize = 64;
-const UDP_SEND_BURST_MAX: usize = 64;
+const UDP_RECV_BURST_MAX: usize = 128;
+const UDP_SEND_BURST_MAX: usize = 128;
 const ACTIVE_CONN_BATCH_MAX: usize = 384;
 const ACTIVE_CONN_TOPUP_TARGET: usize = 768;
 const ACTIVE_CONN_SWEEP_BATCH_MAX: usize = 384;
@@ -397,6 +397,13 @@ pub async fn run_local_proxy(cfg: LocalProxyConfig) -> anyhow::Result<()> {
         http_port = cfg.http_port,
         endpoint = ?cfg.endpoint,
         "local_proxy_started"
+    );
+    info!(
+        tcp_socket_buf = TCP_SOCKET_BUF,
+        active_conn_poll_us = ACTIVE_CONN_POLL_MAX.as_micros() as u64,
+        udp_recv_burst_max = UDP_RECV_BURST_MAX,
+        udp_send_burst_max = UDP_SEND_BURST_MAX,
+        "local_proxy_tuning_enabled"
     );
     let perf_enabled = std::env::var_os("TUNMUX_LOCAL_PROXY_PERF").is_some();
     if perf_enabled {
