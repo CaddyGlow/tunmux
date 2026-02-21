@@ -59,6 +59,8 @@ rand = "0.8"
 
 # Encoding
 base64 = "0.22"
+bytes = "1"
+crossbeam-queue = "0.3"
 
 # Crypto - AirVPN API
 rsa = { version = "0.9", features = ["std"] }
@@ -102,3 +104,6 @@ nix = { version = "0.29", features = ["sched", "net", "fs", "signal", "process",
 # Daemonization and userspace WireGuard (unix, non-Android)
 daemonize = "0.5"
 gotatun = { version = "0.2.0", features = ["device", "tun"] }
+
+[patch.crates-io]
+smoltcp = { path = "third_party/smoltcp" }

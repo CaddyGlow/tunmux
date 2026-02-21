@@ -3,10 +3,10 @@
 //! Runs a WireGuard session backed by boringtun + smoltcp and exposes it as
 //! SOCKS5 and HTTP proxies on loopback -- no TUN device, root, or netns needed.
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
-use std::sync::Arc;
-use std::time::Duration;
+use std::sync::{Arc, LazyLock, RwLock as StdRwLock};
+use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, Context};
 use boringtun::noise::{Tunn, TunnResult};
@@ -22,9 +22,19 @@ use tokio::sync::{mpsc, oneshot};
 use tracing::{debug, info, warn};
 
 const UDP_BUF: usize = 65536;
-const TCP_SOCKET_BUF: usize = 65536;
+const TCP_SOCKET_BUF: usize = 262144;
+const STREAM_BUF: usize = 65536;
 const LOCAL_PORT_START: u16 = 40000;
 const LOCAL_PORT_END: u16 = 65000;
+const WG_TIMER_TICK_MAX: Duration = Duration::from_millis(100);
+const ACTIVE_CONN_POLL_MAX: Duration = Duration::from_millis(1);
+const CLIENT_CHANNEL_CAP: usize = 1024;
+const REMOTE_PENDING_MAX_BYTES: usize = 2 * 1024 * 1024;
+const CLIENT_PENDING_MAX_BYTES: usize = 2 * 1024 * 1024;
+const DNS_CACHE_TTL: Duration = Duration::from_secs(15);
+
+type DnsCache = HashMap<String, (Instant, Vec<SocketAddr>)>;
+static DNS_CACHE: LazyLock<StdRwLock<DnsCache>> = LazyLock::new(|| StdRwLock::new(HashMap::new()));
 
 fn smoltcp_now() -> smoltcp::time::Instant {
     let millis = std::time::SystemTime::UNIX_EPOCH
@@ -133,6 +143,10 @@ struct ConnEntry {
     from_client_rx: mpsc::Receiver<Vec<u8>>,
     /// Present until the virtual TCP handshake completes.
     connected_tx: Option<oneshot::Sender<Result<(), String>>>,
+    pending_to_remote: VecDeque<Vec<u8>>,
+    pending_to_client: VecDeque<Vec<u8>>,
+    pending_remote_bytes: usize,
+    pending_client_bytes: usize,
 }
 
 // ── Public entry point ────────────────────────────────────────────────────────
@@ -196,7 +210,7 @@ pub async fn run_local_proxy(cfg: LocalProxyConfig) -> anyhow::Result<()> {
         "local_proxy_started"
     );
 
-    let (conn_req_tx, mut conn_req_rx) = mpsc::channel::<ConnRequest>(64);
+    let (conn_req_tx, mut conn_req_rx) = mpsc::channel::<ConnRequest>(CLIENT_CHANNEL_CAP);
 
     let tx = conn_req_tx.clone();
     tokio::spawn(async move {
@@ -213,7 +227,9 @@ pub async fn run_local_proxy(cfg: LocalProxyConfig) -> anyhow::Result<()> {
                 }
                 Err(e) => {
                     warn!(error = ?e.to_string(), "socks5_accept_error");
-                    break;
+                    // Keep the listener alive across transient accept errors (e.g. fd pressure).
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                    continue;
                 }
             }
         }
@@ -234,36 +250,55 @@ pub async fn run_local_proxy(cfg: LocalProxyConfig) -> anyhow::Result<()> {
                 }
                 Err(e) => {
                     warn!(error = ?e.to_string(), "http_accept_error");
-                    break;
+                    // Keep the listener alive across transient accept errors (e.g. fd pressure).
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                    continue;
                 }
             }
         }
     });
 
     let mut udp_buf = vec![0u8; UDP_BUF];
+    let mut decap_buf = vec![0u8; UDP_BUF];
     let mut enc_buf = vec![0u8; UDP_BUF + 32];
     let mut conns: Vec<ConnEntry> = Vec::new();
     let mut next_port: u16 = LOCAL_PORT_START;
+    let mut wg_timer_deadline = Instant::now();
 
     loop {
-        // 1. Drain incoming UDP -> boringtun -> smoltcp inbound
+        let now_std = Instant::now();
+        let now = smoltcp_now();
+
+        if now_std >= wg_timer_deadline {
+            if let TunnResult::WriteToNetwork(out) = tunn.update_timers(&mut enc_buf) {
+                let _ = udp.try_send(out);
+            }
+            wg_timer_deadline = now_std + WG_TIMER_TICK_MAX;
+        }
+
+        while let Ok(req) = conn_req_rx.try_recv() {
+            add_virtual_connection(
+                req,
+                &mut next_port,
+                virtual_ip,
+                &mut iface,
+                &mut sockets,
+                &mut conns,
+            );
+        }
+
         loop {
             match udp.try_recv(&mut udp_buf) {
-                Ok(n) => {
-                    let mut tmp = vec![0u8; UDP_BUF];
-                    match tunn.decapsulate(None, &udp_buf[..n], &mut tmp) {
-                        TunnResult::WriteToTunnelV4(plain, _) => {
-                            device.inbound.push_back(plain.to_vec());
-                        }
-                        TunnResult::WriteToTunnelV6(plain, _) => {
-                            device.inbound.push_back(plain.to_vec());
-                        }
-                        TunnResult::WriteToNetwork(out) => {
-                            let _ = udp.try_send(out);
-                        }
-                        _ => {}
+                Ok(n) => match tunn.decapsulate(None, &udp_buf[..n], &mut decap_buf) {
+                    TunnResult::WriteToTunnelV4(plain, _)
+                    | TunnResult::WriteToTunnelV6(plain, _) => {
+                        device.inbound.push_back(Vec::from(plain));
                     }
-                }
+                    TunnResult::WriteToNetwork(out) => {
+                        let _ = udp.try_send(out);
+                    }
+                    _ => {}
+                },
                 Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
                 Err(e) => {
                     warn!(error = ?e.to_string(), "udp_recv_error");
@@ -272,57 +307,14 @@ pub async fn run_local_proxy(cfg: LocalProxyConfig) -> anyhow::Result<()> {
             }
         }
 
-        // 2. WireGuard keepalive / handshake timers
-        if let TunnResult::WriteToNetwork(out) = tunn.update_timers(&mut enc_buf) {
-            let _ = udp.try_send(out);
-        }
-
-        // 3. New connection requests
-        while let Ok(req) = conn_req_rx.try_recv() {
-            let local_port = next_port;
-            next_port = if next_port >= LOCAL_PORT_END {
-                LOCAL_PORT_START
-            } else {
-                next_port + 1
-            };
-
-            let mut sock = TcpSocket::new(
-                TcpSocketBuffer::new(vec![0u8; TCP_SOCKET_BUF]),
-                TcpSocketBuffer::new(vec![0u8; TCP_SOCKET_BUF]),
-            );
-            let remote = IpEndpoint::new(req.target_ip, req.target_port);
-            let local = IpListenEndpoint {
-                addr: Some(virtual_ip),
-                port: local_port,
-            };
-            match sock.connect(iface.context(), remote, local) {
-                Ok(()) => {
-                    let h = sockets.add(sock);
-                    conns.push(ConnEntry {
-                        handle: h,
-                        to_client_tx: req.to_client_tx,
-                        from_client_rx: req.from_client_rx,
-                        connected_tx: Some(req.connected_tx),
-                    });
-                }
-                Err(e) => {
-                    let _ = req.connected_tx.send(Err(format!("connect: {}", e)));
-                }
-            }
-        }
-
-        // 4. Poll smoltcp
-        let now = smoltcp_now();
         let _ = iface.poll(now, &mut device, &mut sockets);
 
-        // 5. smoltcp outbound -> boringtun -> UDP
         while let Some(plain) = device.outbound.pop_front() {
             if let TunnResult::WriteToNetwork(out) = tunn.encapsulate(&plain, &mut enc_buf) {
                 let _ = udp.try_send(out);
             }
         }
 
-        // 6. Service connections
         let mut remove: Vec<usize> = Vec::new();
         for (i, entry) in conns.iter_mut().enumerate() {
             let sock = sockets.get_mut::<TcpSocket>(entry.handle);
@@ -339,29 +331,66 @@ pub async fn run_local_proxy(cfg: LocalProxyConfig) -> anyhow::Result<()> {
                 }
             }
 
-            if sock.can_recv() {
-                let mut buf = vec![0u8; 16384];
-                if let Ok(n) = sock.recv_slice(&mut buf) {
+            if sock.can_recv() && entry.pending_client_bytes < CLIENT_PENDING_MAX_BYTES {
+                let mut recv_buf = [0u8; STREAM_BUF];
+                if let Ok(n) = sock.recv_slice(&mut recv_buf) {
                     if n > 0 {
-                        buf.truncate(n);
-                        if entry.to_client_tx.try_send(buf).is_err() {
-                            sock.close();
-                            remove.push(i);
-                            continue;
-                        }
+                        let chunk = recv_buf[..n].to_vec();
+                        entry.pending_client_bytes += chunk.len();
+                        entry.pending_to_client.push_back(chunk);
                     }
                 }
             }
 
-            loop {
+            while entry.pending_remote_bytes < REMOTE_PENDING_MAX_BYTES {
                 match entry.from_client_rx.try_recv() {
                     Ok(data) => {
-                        if sock.can_send() {
-                            let _ = sock.send_slice(&data);
-                        }
+                        entry.pending_remote_bytes += data.len();
+                        entry.pending_to_remote.push_back(data);
                     }
                     Err(mpsc::error::TryRecvError::Empty) => break,
                     Err(mpsc::error::TryRecvError::Disconnected) => {
+                        sock.close();
+                        remove.push(i);
+                        break;
+                    }
+                }
+            }
+
+            while sock.can_send() {
+                let Some(front) = entry.pending_to_remote.front_mut() else {
+                    break;
+                };
+                match sock.send_slice(front) {
+                    Ok(sent) => {
+                        if sent == front.len() {
+                            let sent_len = front.len();
+                            let _ = entry.pending_to_remote.pop_front();
+                            entry.pending_remote_bytes =
+                                entry.pending_remote_bytes.saturating_sub(sent_len);
+                        } else {
+                            front.drain(..sent);
+                            entry.pending_remote_bytes =
+                                entry.pending_remote_bytes.saturating_sub(sent);
+                            break;
+                        }
+                    }
+                    Err(_) => break,
+                }
+            }
+
+            while let Some(front) = entry.pending_to_client.pop_front() {
+                let front_len = front.len();
+                match entry.to_client_tx.try_send(front) {
+                    Ok(()) => {
+                        entry.pending_client_bytes =
+                            entry.pending_client_bytes.saturating_sub(front_len);
+                    }
+                    Err(mpsc::error::TrySendError::Full(front)) => {
+                        entry.pending_to_client.push_front(front);
+                        break;
+                    }
+                    Err(mpsc::error::TrySendError::Closed(_)) => {
                         sock.close();
                         remove.push(i);
                         break;
@@ -383,13 +412,91 @@ pub async fn run_local_proxy(cfg: LocalProxyConfig) -> anyhow::Result<()> {
             }
         }
 
-        // 7. Yield to tokio so the task can be aborted
+        let has_pending_work = !device.inbound.is_empty()
+            || !device.outbound.is_empty()
+            || conns.iter().any(|entry| {
+                !entry.pending_to_remote.is_empty() || !entry.pending_to_client.is_empty()
+            });
+        if has_pending_work {
+            tokio::task::yield_now().await;
+            continue;
+        }
+
         let delay = iface
             .poll_delay(now, &sockets)
             .map(|d| Duration::from_micros(d.total_micros()))
-            .unwrap_or(Duration::from_millis(5))
-            .min(Duration::from_millis(5));
-        tokio::time::sleep(delay).await;
+            .unwrap_or(WG_TIMER_TICK_MAX);
+
+        let activity_cap = if conns.is_empty() {
+            WG_TIMER_TICK_MAX
+        } else {
+            ACTIVE_CONN_POLL_MAX
+        };
+        let delay = delay.min(activity_cap);
+
+        let timer_wait = wg_timer_deadline.saturating_duration_since(Instant::now());
+        let wait_for = delay.min(timer_wait);
+
+        tokio::select! {
+            _ = udp.readable() => {}
+            maybe_req = conn_req_rx.recv() => {
+                if let Some(req) = maybe_req {
+                    add_virtual_connection(
+                        req,
+                        &mut next_port,
+                        virtual_ip,
+                        &mut iface,
+                        &mut sockets,
+                        &mut conns,
+                    );
+                }
+            }
+            _ = tokio::time::sleep(wait_for) => {}
+        }
+    }
+}
+
+fn add_virtual_connection(
+    req: ConnRequest,
+    next_port: &mut u16,
+    virtual_ip: IpAddress,
+    iface: &mut Interface,
+    sockets: &mut SocketSet<'_>,
+    conns: &mut Vec<ConnEntry>,
+) {
+    let local_port = *next_port;
+    *next_port = if *next_port >= LOCAL_PORT_END {
+        LOCAL_PORT_START
+    } else {
+        *next_port + 1
+    };
+
+    let mut sock = TcpSocket::new(
+        TcpSocketBuffer::new(vec![0u8; TCP_SOCKET_BUF]),
+        TcpSocketBuffer::new(vec![0u8; TCP_SOCKET_BUF]),
+    );
+    let remote = IpEndpoint::new(req.target_ip, req.target_port);
+    let local = IpListenEndpoint {
+        addr: Some(virtual_ip),
+        port: local_port,
+    };
+    match sock.connect(iface.context(), remote, local) {
+        Ok(()) => {
+            let h = sockets.add(sock);
+            conns.push(ConnEntry {
+                handle: h,
+                to_client_tx: req.to_client_tx,
+                from_client_rx: req.from_client_rx,
+                connected_tx: Some(req.connected_tx),
+                pending_to_remote: VecDeque::new(),
+                pending_to_client: VecDeque::new(),
+                pending_remote_bytes: 0,
+                pending_client_bytes: 0,
+            });
+        }
+        Err(e) => {
+            let _ = req.connected_tx.send(Err(format!("connect: {}", e)));
+        }
     }
 }
 
@@ -410,27 +517,39 @@ async fn socks5_serve(
     let mut hdr = [0u8; 4];
     stream.read_exact(&mut hdr).await?;
     if hdr[1] != 0x01 {
-        stream.write_all(&[0x05, 0x07, 0x00, 0x01, 0, 0, 0, 0, 0, 0]).await?;
+        stream
+            .write_all(&[0x05, 0x07, 0x00, 0x01, 0, 0, 0, 0, 0, 0])
+            .await?;
         anyhow::bail!("only CONNECT supported");
     }
 
     let (target_ip, target_port) = read_socks5_addr(&mut stream, hdr[3]).await?;
 
-    let (to_client_tx, mut to_client_rx) = mpsc::channel::<Vec<u8>>(64);
-    let (from_client_tx, from_client_rx) = mpsc::channel::<Vec<u8>>(64);
+    let (to_client_tx, mut to_client_rx) = mpsc::channel::<Vec<u8>>(CLIENT_CHANNEL_CAP);
+    let (from_client_tx, from_client_rx) = mpsc::channel::<Vec<u8>>(CLIENT_CHANNEL_CAP);
     let (connected_tx, connected_rx) = oneshot::channel();
 
     conn_req_tx
-        .send(ConnRequest { target_ip, target_port, to_client_tx, from_client_rx, connected_tx })
+        .send(ConnRequest {
+            target_ip,
+            target_port,
+            to_client_tx,
+            from_client_rx,
+            connected_tx,
+        })
         .await
         .map_err(|_| anyhow!("proxy tunnel exited"))?;
 
     match connected_rx.await {
         Ok(Ok(())) => {
-            stream.write_all(&[0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0]).await?;
+            stream
+                .write_all(&[0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0])
+                .await?;
         }
         Ok(Err(e)) => {
-            stream.write_all(&[0x05, 0x05, 0x00, 0x01, 0, 0, 0, 0, 0, 0]).await?;
+            stream
+                .write_all(&[0x05, 0x05, 0x00, 0x01, 0, 0, 0, 0, 0, 0])
+                .await?;
             anyhow::bail!("virtual connect: {}", e);
         }
         Err(_) => anyhow::bail!("proxy tunnel dropped response"),
@@ -501,8 +620,8 @@ async fn http_connect_serve(
         let port: u16 = port_str.parse()?;
         let sa = resolve_ipv4_preferred(host, port).await?;
 
-        let (to_client_tx, mut to_client_rx) = mpsc::channel::<Vec<u8>>(64);
-        let (from_client_tx, from_client_rx) = mpsc::channel::<Vec<u8>>(64);
+        let (to_client_tx, mut to_client_rx) = mpsc::channel::<Vec<u8>>(CLIENT_CHANNEL_CAP);
+        let (from_client_tx, from_client_rx) = mpsc::channel::<Vec<u8>>(CLIENT_CHANNEL_CAP);
         let (connected_tx, connected_rx) = oneshot::channel();
 
         conn_req_tx
@@ -518,10 +637,14 @@ async fn http_connect_serve(
 
         match connected_rx.await {
             Ok(Ok(())) => {
-                stream.write_all(b"HTTP/1.1 200 Connection established\r\n\r\n").await?;
+                stream
+                    .write_all(b"HTTP/1.1 200 Connection established\r\n\r\n")
+                    .await?;
             }
             Ok(Err(e)) => {
-                stream.write_all(b"HTTP/1.1 502 Bad Gateway\r\n\r\n").await?;
+                stream
+                    .write_all(b"HTTP/1.1 502 Bad Gateway\r\n\r\n")
+                    .await?;
                 anyhow::bail!("virtual connect: {}", e);
             }
             Err(_) => anyhow::bail!("proxy tunnel dropped response"),
@@ -552,8 +675,8 @@ async fn http_connect_serve(
 
         let sa = resolve_ipv4_preferred(&host, port).await?;
 
-        let (to_client_tx, mut to_client_rx) = mpsc::channel::<Vec<u8>>(64);
-        let (from_client_tx, from_client_rx) = mpsc::channel::<Vec<u8>>(64);
+        let (to_client_tx, mut to_client_rx) = mpsc::channel::<Vec<u8>>(CLIENT_CHANNEL_CAP);
+        let (from_client_tx, from_client_rx) = mpsc::channel::<Vec<u8>>(CLIENT_CHANNEL_CAP);
         let (connected_tx, connected_rx) = oneshot::channel();
 
         conn_req_tx
@@ -664,16 +787,48 @@ async fn bridge(
 /// targets would be unroutable. Prefer the first IPv4 result; fall back to
 /// the first address of any family only when no IPv4 address is returned.
 async fn resolve_ipv4_preferred(host: &str, port: u16) -> anyhow::Result<SocketAddr> {
+    let cache_key = format!("{}:{}", host, port);
+    if let Some(hit) = dns_cache_get(&cache_key) {
+        return select_ipv4_preferred(hit.into_iter())
+            .ok_or_else(|| anyhow!("DNS returned no addresses for {}", host));
+    }
+
     let addrs: Vec<SocketAddr> = tokio::net::lookup_host(format!("{}:{}", host, port))
         .await
         .with_context(|| format!("DNS lookup failed: {}", host))?
         .collect();
-    addrs
-        .iter()
-        .find(|a| a.is_ipv4())
-        .copied()
-        .or_else(|| addrs.into_iter().next())
+    dns_cache_put(cache_key, addrs.clone());
+    select_ipv4_preferred(addrs.into_iter())
         .ok_or_else(|| anyhow!("DNS returned no addresses for {}", host))
+}
+
+fn select_ipv4_preferred(mut addrs: impl Iterator<Item = SocketAddr>) -> Option<SocketAddr> {
+    let mut first: Option<SocketAddr> = None;
+    for addr in addrs.by_ref() {
+        if first.is_none() {
+            first = Some(addr);
+        }
+        if addr.is_ipv4() {
+            return Some(addr);
+        }
+    }
+    first
+}
+
+fn dns_cache_get(key: &str) -> Option<Vec<SocketAddr>> {
+    let map = DNS_CACHE.read().ok()?;
+    let (inserted_at, addrs) = map.get(key)?;
+    if inserted_at.elapsed() > DNS_CACHE_TTL {
+        return None;
+    }
+    Some(addrs.clone())
+}
+
+fn dns_cache_put(key: String, addrs: Vec<SocketAddr>) {
+    if let Ok(mut map) = DNS_CACHE.write() {
+        map.retain(|_, (inserted_at, _)| inserted_at.elapsed() <= DNS_CACHE_TTL);
+        map.insert(key, (Instant::now(), addrs));
+    }
 }
 
 fn ip_to_smoltcp(ip: IpAddr) -> IpAddress {

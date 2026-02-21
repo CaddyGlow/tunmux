@@ -10,9 +10,9 @@ use std::time::{Duration, Instant};
 use std::{fs, thread};
 
 use nix::libc;
+use nix::unistd::Uid;
 #[cfg(not(target_os = "android"))]
 use nix::unistd::{Gid, Group};
-use nix::unistd::Uid;
 use tracing::debug;
 
 use crate::config;

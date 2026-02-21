@@ -7,16 +7,6 @@ import android.content.Intent
 import android.net.VpnService
 import android.os.ParcelFileDescriptor
 import android.util.Log
-import androidx.lifecycle.lifecycleScope
-import kotlinx.coroutines.FlowPreview
-import kotlinx.coroutines.Job
-import kotlinx.coroutines.flow.collectLatest
-import kotlinx.coroutines.flow.debounce
-import kotlinx.coroutines.launch
-import net.tunmux.model.AndroidNetworkMonitor
-import net.tunmux.model.AppConfigStore
-import net.tunmux.model.AutoTunnelConfig
-import net.tunmux.model.NetworkProfile
 
 class TunmuxVpnService : LifecycleVpnService() {
 
@@ -41,9 +31,6 @@ class TunmuxVpnService : LifecycleVpnService() {
     private var splitTunnelApps: Set<String> = emptySet()
     private var splitTunnelOnlyAllowSelected: Boolean = false
     private val notifChannelId by lazy { getString(R.string.vpn_channel_id) }
-    private val networkMonitor by lazy { AndroidNetworkMonitor(this) }
-    private var networkMonitorJob: Job? = null
-    private var tunnelStartedByService: Boolean = false
 
     // Called from Rust via JNI
     fun openTun(addresses: List<String>, routes: List<String>, dnsServers: List<String>, mtu: Int): Int {
@@ -120,12 +107,9 @@ class TunmuxVpnService : LifecycleVpnService() {
         super.onCreate()
         createNotificationChannel()
         nativeInitialize(this, filesDir.absolutePath)
-        startConnectivityListener()
     }
 
     override fun onDestroy() {
-        networkMonitorJob?.cancel()
-        networkMonitor.stop()
         nativeShutdown()
         activeTunPfd?.close()
         activeTunPfd = null
@@ -146,60 +130,13 @@ class TunmuxVpnService : LifecycleVpnService() {
                     false,
                 )
                 nativeConnect(provider, serverJson)
-                tunnelStartedByService = true
             }
             ACTION_DISCONNECT -> {
                 nativeDisconnect()
-                tunnelStartedByService = false
                 stopSelf()
             }
         }
         return START_STICKY
-    }
-
-    @OptIn(FlowPreview::class)
-    private fun startConnectivityListener() {
-        val auto = AppConfigStore.load(this).auto
-        networkMonitor.start(auto.wifiDetectionMethod)
-        networkMonitorJob?.cancel()
-        networkMonitorJob = lifecycleScope.launch {
-            networkMonitor.state
-                .debounce(300)
-                .collectLatest { snapshot ->
-                    if (!tunnelStartedByService) return@collectLatest
-                    val latestAuto = AppConfigStore.load(this@TunmuxVpnService).auto
-                    if (!latestAuto.enabled) return@collectLatest
-                    networkMonitor.updateDetectionMethod(latestAuto.wifiDetectionMethod)
-
-                    val shouldTunnel = shouldTunnel(latestAuto, snapshot.profile, snapshot.wifiSsid)
-                    if (!shouldTunnel) {
-                        Log.i(
-                            TAG,
-                            "service auto-tunnel disconnect profile=${snapshot.profile} ssid=${snapshot.wifiSsid}",
-                        )
-                        nativeDisconnect()
-                        tunnelStartedByService = false
-                        stopSelf()
-                    }
-                }
-        }
-    }
-
-    private fun shouldTunnel(auto: AutoTunnelConfig, profile: NetworkProfile, ssid: String): Boolean {
-        return when (profile) {
-            NetworkProfile.Wifi -> shouldTunnelOnWifi(auto, ssid)
-            NetworkProfile.Mobile -> auto.onMobile
-            NetworkProfile.Ethernet -> auto.onEthernet
-            NetworkProfile.None -> !auto.stopOnNoInternet
-            NetworkProfile.Other -> false
-        }
-    }
-
-    private fun shouldTunnelOnWifi(auto: AutoTunnelConfig, ssid: String): Boolean {
-        if (!auto.onWifi) return false
-        if (auto.wifiSsids.isEmpty()) return true
-        val matched = ssid.isNotBlank() && auto.wifiSsids.any { it.equals(ssid, ignoreCase = true) }
-        return if (auto.disconnectOnMatchedWifi) !matched else matched
     }
 
     private fun createNotificationChannel() {

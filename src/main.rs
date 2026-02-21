@@ -158,11 +158,7 @@ async fn run(command: TopCommand, config: config::AppConfig) -> anyhow::Result<(
     }
 }
 
-fn run_local_proxy_daemon(
-    pid_file: &str,
-    log_file: &str,
-    config_b64: &str,
-) -> anyhow::Result<()> {
+fn run_local_proxy_daemon(pid_file: &str, log_file: &str, config_b64: &str) -> anyhow::Result<()> {
     // Decode config before daemonizing so errors surface to the shell.
     let json = base64::engine::general_purpose::STANDARD.decode(config_b64)?;
     let cfg: wireguard::proxy_tunnel::LocalProxyConfig = serde_json::from_slice(&json)?;
@@ -170,11 +166,40 @@ fn run_local_proxy_daemon(
     // Ensure the user proxy dir exists before daemonizing.
     config::ensure_user_proxy_dir()?;
 
-    // Daemonize (double-fork).
-    daemonize_local()?;
+    let foreground = std::env::var_os("TUNMUX_LOCAL_PROXY_FOREGROUND").is_some();
+    if !foreground {
+        // Daemonize (double-fork).
+        daemonize_local()?;
+    }
 
-    // Init file logging -- all subsequent output goes to the log file.
-    logging::init_file(log_file, false)?;
+    if foreground {
+        logging::init_terminal(true);
+    } else {
+        // Init file logging -- all subsequent output goes to the log file.
+        logging::init_file(log_file, false)?;
+    }
+
+    // Ensure panics are captured in logs instead of disappearing after daemonize.
+    std::panic::set_hook(Box::new(|info| {
+        let payload = if let Some(s) = info.payload().downcast_ref::<&str>() {
+            *s
+        } else if let Some(s) = info.payload().downcast_ref::<String>() {
+            s.as_str()
+        } else {
+            "non-string panic payload"
+        };
+        let location = info
+            .location()
+            .map(|l| format!("{}:{}:{}", l.file(), l.line(), l.column()))
+            .unwrap_or_else(|| "<unknown>".to_string());
+        let backtrace = std::backtrace::Backtrace::force_capture();
+        tracing::error!(
+            panic = %payload,
+            location = %location,
+            backtrace = %backtrace,
+            "local_proxy_daemon_panic"
+        );
+    }));
 
     // Write PID file.
     let pid = std::process::id();
@@ -184,7 +209,12 @@ fn run_local_proxy_daemon(
         std::fs::set_permissions(pid_file, std::fs::Permissions::from_mode(0o644))?;
     }
 
-    let rt = tokio::runtime::Builder::new_current_thread()
+    let workers = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(2)
+        .clamp(2, 8);
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(workers)
         .enable_all()
         .build()?;
 
@@ -286,15 +316,10 @@ fn cmd_wg() -> anyhow::Result<()> {
 
         match conn.backend {
             WgBackend::LocalProxy => print_local_proxy_info(conn),
-            _ => {
-                match privileged_client::PrivilegedClient::new().wg_show(&conn.interface_name) {
-                    Ok(output) => print!("{}", output),
-                    Err(e) => eprintln!(
-                        "wg show {} failed: {}",
-                        conn.interface_name, e
-                    ),
-                }
-            }
+            _ => match privileged_client::PrivilegedClient::new().wg_show(&conn.interface_name) {
+                Ok(output) => print!("{}", output),
+                Err(e) => eprintln!("wg show {} failed: {}", conn.interface_name, e),
+            },
         }
     }
     Ok(())

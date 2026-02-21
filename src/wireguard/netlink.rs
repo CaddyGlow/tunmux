@@ -97,8 +97,7 @@ impl NlMsg {
     /// Append a raw nlattr.
     fn add_attr(&mut self, ty: u16, data: &[u8]) {
         let nla_len = 4 + data.len(); // header (4 bytes) + data
-        self.buf
-            .extend_from_slice(&(nla_len as u16).to_ne_bytes());
+        self.buf.extend_from_slice(&(nla_len as u16).to_ne_bytes());
         self.buf.extend_from_slice(&ty.to_ne_bytes());
         self.buf.extend_from_slice(data);
         // Pad to 4-byte alignment
@@ -155,13 +154,11 @@ fn parse_attrs(data: &[u8]) -> Vec<(u16, &[u8])> {
     let mut out = Vec::new();
     let mut offset = 0usize;
     while offset + 4 <= data.len() {
-        let nla_len =
-            u16::from_ne_bytes([data[offset], data[offset + 1]]) as usize;
+        let nla_len = u16::from_ne_bytes([data[offset], data[offset + 1]]) as usize;
         if nla_len < 4 || offset + nla_len > data.len() {
             break;
         }
-        let nla_type =
-            u16::from_ne_bytes([data[offset + 2], data[offset + 3]]) & !NLA_F_NESTED;
+        let nla_type = u16::from_ne_bytes([data[offset + 2], data[offset + 3]]) & !NLA_F_NESTED;
         let payload = &data[offset + 4..offset + nla_len];
         out.push((nla_type, payload));
         // Advance by aligned length
@@ -428,10 +425,8 @@ pub fn wg_get_uapi(interface: &str) -> Result<String> {
         let data = &buf[..n];
         let mut offset = 0usize;
         while offset + 16 <= data.len() {
-            let msg_len =
-                u32::from_ne_bytes(data[offset..offset + 4].try_into().unwrap()) as usize;
-            let msg_type =
-                u16::from_ne_bytes(data[offset + 4..offset + 6].try_into().unwrap());
+            let msg_len = u32::from_ne_bytes(data[offset..offset + 4].try_into().unwrap()) as usize;
+            let msg_type = u16::from_ne_bytes(data[offset + 4..offset + 6].try_into().unwrap());
 
             if msg_len < 16 || offset + msg_len > data.len() {
                 break;

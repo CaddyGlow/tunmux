@@ -460,7 +460,13 @@ async fn cmd_connect(
             proxy_access_log,
         )?;
     } else if use_local_proxy {
-        connect_local_proxy(relay, &params, socks_port_arg, http_port_arg, proxy_access_log)?;
+        connect_local_proxy(
+            relay,
+            &params,
+            socks_port_arg,
+            http_port_arg,
+            proxy_access_log,
+        )?;
     } else {
         connect_direct(relay, &params, backend)?;
     }
@@ -569,7 +575,11 @@ fn connect_local_proxy(
     }
 
     let proxy_config = if let (Some(sp), Some(hp)) = (socks_port_arg, http_port_arg) {
-        proxy::ProxyConfig { socks_port: sp, http_port: hp, access_log: proxy_access_log }
+        proxy::ProxyConfig {
+            socks_port: sp,
+            http_port: hp,
+            access_log: proxy_access_log,
+        }
     } else {
         let mut auto = proxy::next_available_ports()?;
         if let Some(sp) = socks_port_arg {

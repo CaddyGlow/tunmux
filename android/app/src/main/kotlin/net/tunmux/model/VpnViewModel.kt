@@ -24,6 +24,7 @@ import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import net.tunmux.KeystoreCredentials
+import net.tunmux.AutoTunnelService
 import net.tunmux.RustBridge
 import net.tunmux.TunmuxVpnService
 import org.json.JSONArray
@@ -88,9 +89,7 @@ class VpnViewModel(app: Application) : AndroidViewModel(app) {
     val state: StateFlow<UiState> = _state
 
     private var statusJob: Job? = null
-    private var autoConnectCooldownJob: Job? = null
     private var networkMonitorJob: Job? = null
-    private var networkProfile: NetworkProfile = NetworkProfile.None
     private var currentWifiSsid: String = ""
     private val networkMonitor = AndroidNetworkMonitor(ctx)
 
@@ -102,6 +101,9 @@ class VpnViewModel(app: Application) : AndroidViewModel(app) {
         )
         ensureStatusPolling()
         startNetworkMonitoring()
+        if (config.auto.enabled) {
+            startAutoTunnelService(AutoTunnelService.ACTION_START)
+        }
         loadInstalledApps()
         refreshKnownWifiSsids()
 
@@ -142,7 +144,6 @@ class VpnViewModel(app: Application) : AndroidViewModel(app) {
         networkMonitor.stop()
         networkMonitorJob?.cancel()
         statusJob?.cancel()
-        autoConnectCooldownJob?.cancel()
         super.onCleared()
     }
 
@@ -395,7 +396,6 @@ class VpnViewModel(app: Application) : AndroidViewModel(app) {
         } catch (_: Throwable) {
             // Keep existing UI state if status polling fails momentarily.
         }
-        evaluateAutoTunnel("status-poll")
     }
 
     private fun buildWgLikeStatus(status: JSONObject): String {
@@ -831,14 +831,6 @@ class VpnViewModel(app: Application) : AndroidViewModel(app) {
                         }
                     }
                     .collectLatest { snapshot ->
-                    val changed =
-                        snapshot.profile != networkProfile ||
-                            snapshot.wifiSsid != currentWifiSsid ||
-                            snapshot.locationPermissionGranted !=
-                                _state.value.locationPermissionGranted ||
-                            snapshot.locationServicesEnabled != _state.value.locationServicesEnabled
-
-                    networkProfile = snapshot.profile
                     currentWifiSsid = snapshot.wifiSsid
                     _state.value =
                         _state.value.copy(
@@ -846,78 +838,30 @@ class VpnViewModel(app: Application) : AndroidViewModel(app) {
                             locationPermissionGranted = snapshot.locationPermissionGranted,
                             locationServicesEnabled = snapshot.locationServicesEnabled,
                         )
-
-                    if (changed) {
-                        evaluateAutoTunnel("network-changed:${snapshot.profile}:${snapshot.wifiSsid}")
-                    }
                     }
             }
-        evaluateAutoTunnel("network-monitor-start")
     }
 
     private fun evaluateAutoTunnel(reason: String) {
-        val auto = _state.value.autoConfig
-        if (!auto.enabled) return
-
-        val shouldTunnel = when (networkProfile) {
-            NetworkProfile.Wifi -> shouldTunnelOnWifi(auto, currentWifiSsid)
-            NetworkProfile.Mobile -> auto.onMobile
-            NetworkProfile.Ethernet -> auto.onEthernet
-            NetworkProfile.None -> false
-            NetworkProfile.Other -> false
-        }
-
-        val connectionState = _state.value.connectionState
-        if (!shouldTunnel) {
-            if ((networkProfile == NetworkProfile.None && auto.stopOnNoInternet) ||
-                networkProfile != NetworkProfile.None
-            ) {
-                if (connectionState == ConnectionState.Connected || connectionState == ConnectionState.Connecting) {
-                    Log.i(TAG, "auto-tunnel disconnect reason=$reason profile=$networkProfile")
-                    disconnect(ctx)
-                }
+        val action =
+            if (_state.value.autoConfig.enabled) {
+                AutoTunnelService.ACTION_REFRESH
+            } else {
+                AutoTunnelService.ACTION_STOP
             }
-            return
-        }
-
-        if (connectionState != ConnectionState.Disconnected || autoConnectCooldownJob != null) return
-
-        val runtime = AutoRuntimeStore.load(ctx)
-        val provider = _state.value.selectedProvider.ifBlank { runtime.provider }
-        if (provider.isBlank()) return
-
-        var candidateServers = _state.value.serverList
-        if (candidateServers.isEmpty()) {
-            fetchServersNow(provider)?.let { fetched ->
-                candidateServers = fetched
-                _state.value = _state.value.copy(serverList = fetched)
-            }
-        }
-
-        val targetServer = _state.value.activeServer.ifBlank {
-            runtime.server.ifBlank {
-                candidateServers.firstOrNull().orEmpty()
-            }
-        }
-        if (targetServer.isBlank()) return
-
-        if (_state.value.selectedProvider != provider) {
-            _state.value = _state.value.copy(selectedProvider = provider)
-        }
-
-        Log.i(TAG, "auto-tunnel connect reason=$reason profile=$networkProfile")
-        connect(ctx, targetServer)
-        autoConnectCooldownJob = viewModelScope.launch {
-            delay(4000)
-            autoConnectCooldownJob = null
-        }
+        Log.d(TAG, "auto-tunnel service sync reason=$reason action=$action")
+        startAutoTunnelService(action)
     }
 
-    private fun shouldTunnelOnWifi(auto: AutoTunnelConfig, ssid: String): Boolean {
-        if (!auto.onWifi) return false
-        if (auto.wifiSsids.isEmpty()) return true
-        val matched = ssid.isNotBlank() && auto.wifiSsids.any { it.equals(ssid, ignoreCase = true) }
-        return if (auto.disconnectOnMatchedWifi) !matched else matched
+    private fun startAutoTunnelService(action: String) {
+        val intent = Intent(ctx, AutoTunnelService::class.java).apply { this.action = action }
+        runCatching {
+            if (action == AutoTunnelService.ACTION_STOP) {
+                ctx.startService(intent)
+            } else {
+                ctx.startForegroundService(intent)
+            }
+        }.onFailure { Log.w(TAG, "auto-tunnel service action failed: $action", it) }
     }
 
     private fun loadInstalledApps() {

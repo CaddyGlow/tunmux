@@ -5,4 +5,8 @@
     <string name="vpn_channel_name">VPN Notification Channel</string>
     <string name="vpn_channel_description">A channel for VPN state notifications</string>
     <string name="tunnel_running">Tunnel running</string>
+    <string name="auto_tunnel_channel_id" translatable="false">Auto Tunnel Channel</string>
+    <string name="auto_tunnel_channel_name">Auto Tunnel Monitoring</string>
+    <string name="auto_tunnel_channel_description">Monitors network changes for auto tunnel</string>
+    <string name="auto_tunnel_running">Auto-tunnel monitor running</string>
 </resources>

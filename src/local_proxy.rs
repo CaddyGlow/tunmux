@@ -37,7 +37,10 @@ pub fn local_proxy_config_from_params(
 
     let private_key = decode_key(params.private_key, "private_key")?;
     let peer_public_key = decode_key(params.server_public_key, "server_public_key")?;
-    let preshared_key = params.preshared_key.map(|s| decode_key(s, "preshared_key")).transpose()?;
+    let preshared_key = params
+        .preshared_key
+        .map(|s| decode_key(s, "preshared_key"))
+        .transpose()?;
 
     let endpoint: SocketAddr = format!("{}:{}", params.server_ip, params.server_port)
         .parse()
@@ -110,7 +113,9 @@ pub fn spawn_daemon(
 
     // Wait for the intermediate process (it exits after the second fork).
     let stderr_handle = child.stderr.take();
-    let status = child.wait().context("failed to wait on local-proxy-daemon")?;
+    let status = child
+        .wait()
+        .context("failed to wait on local-proxy-daemon")?;
     if !status.success() {
         let detail = stderr_handle
             .and_then(|mut s| {

@@ -46,6 +46,9 @@ pub mod privileged_client;
 #[cfg(all(not(target_os = "android"), feature = "proxy", target_os = "linux"))]
 #[path = "proxy/mod.rs"]
 pub mod proxy;
-#[cfg(all(not(target_os = "android"), not(all(feature = "proxy", target_os = "linux"))))]
+#[cfg(all(
+    not(target_os = "android"),
+    not(all(feature = "proxy", target_os = "linux"))
+))]
 #[path = "proxy_stub.rs"]
 pub mod proxy;

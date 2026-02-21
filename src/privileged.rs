@@ -10,9 +10,9 @@ use std::time::{Duration, Instant};
 use nix::sys::signal::{kill, Signal};
 #[cfg(target_os = "linux")]
 use nix::sys::socket::{getsockopt, sockopt::PeerCredentials};
-use nix::unistd::{chown, Gid, Pid};
 #[cfg(not(target_os = "android"))]
 use nix::unistd::Group;
+use nix::unistd::{chown, Gid, Pid};
 use tracing::{debug, info, warn};
 
 use crate::config;
@@ -810,8 +810,8 @@ fn run_wg_quick_down(path: &std::path::Path) -> Result<()> {
 }
 
 fn run_wg_show(interface: &str) -> Result<String> {
-    let socket_path = std::path::PathBuf::from("/var/run/wireguard")
-        .join(format!("{interface}.sock"));
+    let socket_path =
+        std::path::PathBuf::from("/var/run/wireguard").join(format!("{interface}.sock"));
 
     if socket_path.exists() {
         run_wg_show_uapi(interface, &socket_path)
@@ -896,8 +896,8 @@ fn format_wg_show(raw: &str, interface: &str) -> Result<String> {
                 if let Ok(bytes) = wg_hex_to_32(value) {
                     let secret = StaticSecret::from(bytes);
                     let public = PublicKey::from(&secret);
-                    iface_pub_b64 = base64::engine::general_purpose::STANDARD
-                        .encode(public.as_bytes());
+                    iface_pub_b64 =
+                        base64::engine::general_purpose::STANDARD.encode(public.as_bytes());
                 }
             }
             "listen_port" => listen_port = value.parse().unwrap_or(0),

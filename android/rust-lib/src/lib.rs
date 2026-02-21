@@ -7,6 +7,7 @@ use jni::objects::{GlobalRef, JClass, JObject, JString};
 use jni::sys::{jboolean, JNI_FALSE, JNI_TRUE};
 use jni::{JNIEnv, JavaVM};
 use serde_json::{json, Value};
+use std::collections::HashMap;
 use std::io;
 use std::net::{IpAddr, SocketAddr};
 use std::os::fd::AsRawFd;
@@ -19,8 +20,10 @@ use tunmux::airvpn::models::{AirManifest, AirServer, AirWgKey, AirWgMode};
 use tunmux::airvpn::web::AirVpnWeb;
 use tunmux::api;
 use tunmux::crypto;
+use tunmux::ivpn::api as ivpn_api;
 use tunmux::models::server::LogicalServer;
 use tunmux::models::session::Session;
+use tunmux::mullvad::api as mullvad_api;
 use tunmux::wireguard::proxy_tunnel::{run_local_proxy, LocalProxyConfig};
 
 static TOKIO_RUNTIME: OnceLock<Runtime> = OnceLock::new();
@@ -29,6 +32,8 @@ static TUNNEL_STATE: Mutex<Option<TunnelHandle>> = Mutex::new(None);
 static APP_STATE: Mutex<Option<AppState>> = Mutex::new(None);
 static AIRVPN_STATE: Mutex<Option<AirVpnAndroidState>> = Mutex::new(None);
 static PROTON_STATE: Mutex<Option<ProtonAndroidState>> = Mutex::new(None);
+static MULLVAD_STATE: Mutex<Option<MullvadAndroidState>> = Mutex::new(None);
+static IVPN_STATE: Mutex<Option<IvpnAndroidState>> = Mutex::new(None);
 static LOCAL_PROXY_STATE: Mutex<Option<LocalProxyHandle>> = Mutex::new(None);
 
 struct LocalProxyHandle {
@@ -84,7 +89,6 @@ struct AirVpnAndroidState {
     selected_key_name: String,
 }
 
-#[derive(Clone)]
 struct ProtonAndroidState {
     username: String,
     session: Session,
@@ -92,11 +96,118 @@ struct ProtonAndroidState {
     servers: Vec<LogicalServer>,
 }
 
+#[derive(Clone)]
+struct MullvadAndroidState {
+    account_number: String,
+    device_id: String,
+    wg_private_key: String,
+    ipv4_address: String,
+    ipv6_address: Option<String>,
+    server_list_json: String,
+    manifest: MullvadManifest,
+}
+
+#[derive(Clone)]
+struct IvpnAndroidState {
+    account_id: String,
+    session_token: String,
+    wg_private_key: String,
+    wg_local_ip: String,
+    server_list_json: String,
+    manifest: IvpnManifest,
+}
+
 struct LoginCredentials {
     username: String,
     password: String,
     totp: Option<String>,
     device: Option<String>,
+}
+
+#[derive(Clone, serde::Deserialize)]
+struct MullvadManifest {
+    locations: HashMap<String, MullvadLocation>,
+    wireguard: MullvadWireguard,
+}
+
+#[derive(Clone, serde::Deserialize)]
+struct MullvadLocation {
+    #[allow(dead_code)]
+    country: String,
+    city: String,
+}
+
+#[derive(Clone, serde::Deserialize)]
+struct MullvadWireguard {
+    relays: Vec<MullvadRelay>,
+    port_ranges: Vec<(u16, u16)>,
+    ipv4_gateway: String,
+    #[serde(default)]
+    ipv6_gateway: String,
+}
+
+#[derive(Clone, serde::Deserialize)]
+struct MullvadRelay {
+    hostname: String,
+    location: String,
+    active: bool,
+    #[allow(dead_code)]
+    provider: String,
+    ipv4_addr_in: String,
+    public_key: String,
+}
+
+#[derive(Clone, serde::Deserialize)]
+struct IvpnManifest {
+    wireguard: Vec<IvpnWireGuardServer>,
+    config: IvpnConfigInfo,
+}
+
+#[derive(Clone, serde::Deserialize)]
+struct IvpnWireGuardServer {
+    gateway: String,
+    country_code: String,
+    #[allow(dead_code)]
+    country: String,
+    city: String,
+    hosts: Vec<IvpnWireGuardHost>,
+}
+
+#[derive(Clone, serde::Deserialize)]
+struct IvpnWireGuardHost {
+    hostname: String,
+    dns_name: String,
+    host: String,
+    public_key: String,
+    local_ip: String,
+    #[serde(default)]
+    load: f64,
+}
+
+#[derive(Clone, serde::Deserialize)]
+struct IvpnConfigInfo {
+    ports: IvpnPortsInfo,
+}
+
+#[derive(Clone, serde::Deserialize)]
+struct IvpnPortsInfo {
+    wireguard: Vec<IvpnPortInfo>,
+}
+
+#[derive(Clone, serde::Deserialize)]
+struct IvpnPortInfo {
+    #[serde(rename = "type")]
+    kind: String,
+    #[serde(default)]
+    port: Option<u16>,
+    #[serde(default)]
+    range: Option<IvpnPortRange>,
+}
+
+#[derive(Clone, serde::Deserialize)]
+struct IvpnPortRange {
+    min: u16,
+    max: u16,
 }
 
 #[derive(Clone)]
@@ -369,6 +480,49 @@ pub extern "system" fn Java_net_tunmux_TunmuxVpnService_nativeConnect(
                 }
             }
         }
+        "mullvad" => {
+            let state = MULLVAD_STATE.lock().unwrap();
+            match state.as_ref() {
+                Some(s) => {
+                    let cfg = build_mullvad_tun_config(s);
+                    let wg = match build_mullvad_runtime_config(s, &selected_server) {
+                        Ok(v) => v,
+                        Err(e) => {
+                            log::error!(
+                                "nativeConnect: failed to build Mullvad WireGuard config: {e}"
+                            );
+                            return JNI_FALSE;
+                        }
+                    };
+                    (cfg, wg, String::new())
+                }
+                None => {
+                    log::error!("nativeConnect: no Mullvad login state");
+                    return JNI_FALSE;
+                }
+            }
+        }
+        "ivpn" => {
+            let state = IVPN_STATE.lock().unwrap();
+            match state.as_ref() {
+                Some(s) => {
+                    let (cfg, wg) = match build_ivpn_runtime_config(s, &selected_server) {
+                        Ok(v) => v,
+                        Err(e) => {
+                            log::error!(
+                                "nativeConnect: failed to build IVPN WireGuard config: {e}"
+                            );
+                            return JNI_FALSE;
+                        }
+                    };
+                    (cfg, wg, String::new())
+                }
+                None => {
+                    log::error!("nativeConnect: no IVPN login state");
+                    return JNI_FALSE;
+                }
+            }
+        }
         _ => {
             log::warn!(
                 "nativeConnect: provider '{}' not implemented",
@@ -601,6 +755,371 @@ fn parse_login_credentials(credential: &str) -> Result<LoginCredentials, String>
         totp,
         device,
     })
+}
+
+fn parse_account_login_credential(credential: &str) -> Result<(String, Option<String>), String> {
+    let parsed: Value =
+        serde_json::from_str(credential).map_err(|e| format!("invalid credential JSON: {e}"))?;
+    let account_id = parsed
+        .get("username")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+        .ok_or_else(|| "missing username".to_string())?
+        .to_string();
+    let totp = parsed
+        .get("totp")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+        .map(ToOwned::to_owned);
+    Ok((account_id, totp))
+}
+
+fn ensure_cidr(addr: &str, default_mask: &str) -> String {
+    if addr.contains('/') {
+        addr.to_string()
+    } else {
+        format!("{}{}", addr, default_mask)
+    }
+}
+
+fn country_code_from_location(location: &str) -> String {
+    location.split('-').next().unwrap_or("").to_uppercase()
+}
+
+fn choose_mullvad_port(ranges: &[(u16, u16)]) -> u16 {
+    if ranges
+        .iter()
+        .any(|(start, end)| *start <= 51820 && 51820 <= *end)
+    {
+        return 51820;
+    }
+    if ranges
+        .iter()
+        .any(|(start, end)| *start <= 2049 && 2049 <= *end)
+    {
+        return 2049;
+    }
+    ranges.first().map(|(start, _)| *start).unwrap_or(51820)
+}
+
+fn format_mullvad_server_label(manifest: &MullvadManifest, relay: &MullvadRelay) -> String {
+    let cc = country_code_from_location(&relay.location);
+    let city = manifest
+        .locations
+        .get(&relay.location)
+        .map(|l| l.city.as_str())
+        .unwrap_or("unknown");
+    format!("{} [{}] {}", relay.hostname, cc, city)
+}
+
+fn build_mullvad_server_list_json(manifest: &MullvadManifest) -> String {
+    let mut labels: Vec<String> = manifest
+        .wireguard
+        .relays
+        .iter()
+        .filter(|r| r.active)
+        .map(|r| format_mullvad_server_label(manifest, r))
+        .collect();
+    labels.sort();
+    serde_json::to_string(&labels).unwrap_or_else(|_| "[]".to_string())
+}
+
+fn find_mullvad_relay<'a>(
+    state: &'a MullvadAndroidState,
+    selected_server_label: &str,
+) -> Option<&'a MullvadRelay> {
+    let trimmed = selected_server_label.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    if let Some(found) = state
+        .manifest
+        .wireguard
+        .relays
+        .iter()
+        .filter(|r| r.active)
+        .find(|r| format_mullvad_server_label(&state.manifest, r) == trimmed)
+    {
+        return Some(found);
+    }
+
+    let name_hint = trimmed.split(" [").next().unwrap_or("").trim();
+    if name_hint.is_empty() {
+        None
+    } else {
+        state
+            .manifest
+            .wireguard
+            .relays
+            .iter()
+            .filter(|r| r.active)
+            .find(|r| r.hostname.eq_ignore_ascii_case(name_hint))
+    }
+}
+
+fn build_mullvad_tun_config(state: &MullvadAndroidState) -> TunConfig {
+    let mut cfg = default_tun_config();
+    cfg.addresses = vec![ensure_cidr(&state.ipv4_address, "/32")];
+    if let Some(ipv6) = &state.ipv6_address {
+        if !ipv6.trim().is_empty() {
+            cfg.addresses.push(ensure_cidr(ipv6.trim(), "/128"));
+        }
+    }
+
+    cfg.routes = vec!["0.0.0.0/0".to_string()];
+    if state.ipv6_address.is_some() {
+        cfg.routes.push("::/0".to_string());
+    }
+
+    cfg.dns_servers.clear();
+    if !state.manifest.wireguard.ipv4_gateway.is_empty() {
+        cfg.dns_servers
+            .push(state.manifest.wireguard.ipv4_gateway.clone());
+    }
+    if !state.manifest.wireguard.ipv6_gateway.is_empty() {
+        cfg.dns_servers
+            .push(state.manifest.wireguard.ipv6_gateway.clone());
+    }
+    if cfg.dns_servers.is_empty() {
+        cfg.dns_servers = default_tun_config().dns_servers;
+    }
+    cfg
+}
+
+fn build_mullvad_runtime_config(
+    state: &MullvadAndroidState,
+    selected_server_label: &str,
+) -> Result<WireGuardRuntimeConfig, String> {
+    let selected = if selected_server_label.is_empty() {
+        None
+    } else {
+        find_mullvad_relay(state, selected_server_label)
+    };
+    let used_fallback = selected.is_none();
+    let mut active_relays: Vec<&MullvadRelay> = state
+        .manifest
+        .wireguard
+        .relays
+        .iter()
+        .filter(|r| r.active)
+        .collect();
+    active_relays.sort_by(|a, b| a.hostname.cmp(&b.hostname));
+    let relay = selected
+        .or_else(|| active_relays.first().copied())
+        .ok_or_else(|| "no Mullvad servers available".to_string())?;
+    if used_fallback && !selected_server_label.is_empty() {
+        log::warn!(
+            "nativeConnect: selected server '{}' not found, falling back to '{}'",
+            selected_server_label,
+            relay.hostname
+        );
+    }
+
+    let endpoint_ip: IpAddr = relay.ipv4_addr_in.parse().map_err(|e| {
+        format!(
+            "invalid Mullvad endpoint IP '{}': {}",
+            relay.ipv4_addr_in, e
+        )
+    })?;
+    let private_key = decode_key32("wg_private_key", &state.wg_private_key)?;
+    let peer_public_key = decode_key32("server_public_key", &relay.public_key)?;
+
+    Ok(WireGuardRuntimeConfig {
+        server_name: relay.hostname.clone(),
+        endpoint: SocketAddr::new(
+            endpoint_ip,
+            choose_mullvad_port(&state.manifest.wireguard.port_ranges),
+        ),
+        private_key,
+        peer_public_key,
+        preshared_key: None,
+        allowed_ips: vec!["0.0.0.0/0".to_string(), "::/0".to_string()],
+        keepalive_secs: None,
+    })
+}
+
+fn format_ivpn_server_label(server: &IvpnWireGuardServer, host: &IvpnWireGuardHost) -> String {
+    format!(
+        "{} [{}] {}",
+        host.hostname, server.country_code, server.city
+    )
+}
+
+fn choose_ivpn_port(ports: &[IvpnPortInfo]) -> u16 {
+    for preferred in [2049u16, 51820u16, 443u16, 53u16] {
+        if ports
+            .iter()
+            .any(|p| p.kind.eq_ignore_ascii_case("udp") && ivpn_port_matches(p, preferred))
+        {
+            return preferred;
+        }
+    }
+
+    if let Some(port) = ports
+        .iter()
+        .find(|p| p.kind.eq_ignore_ascii_case("udp") && p.port.unwrap_or(0) > 0)
+        .and_then(|p| p.port)
+    {
+        return port;
+    }
+
+    if let Some(min) = ports
+        .iter()
+        .find(|p| p.kind.eq_ignore_ascii_case("udp") && p.range.is_some())
+        .and_then(|p| p.range.as_ref().map(|r| r.min))
+    {
+        return min;
+    }
+
+    2049
+}
+
+fn ivpn_port_matches(port: &IvpnPortInfo, value: u16) -> bool {
+    if let Some(p) = port.port {
+        return p == value;
+    }
+    if let Some(range) = &port.range {
+        return range.min <= value && value <= range.max;
+    }
+    false
+}
+
+fn build_ivpn_server_list_json(manifest: &IvpnManifest) -> String {
+    let mut rows: Vec<(String, f64)> = Vec::new();
+    for server in &manifest.wireguard {
+        for host in &server.hosts {
+            rows.push((format_ivpn_server_label(server, host), host.load));
+        }
+    }
+    rows.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
+    let labels: Vec<String> = rows.into_iter().map(|(label, _)| label).collect();
+    serde_json::to_string(&labels).unwrap_or_else(|_| "[]".to_string())
+}
+
+fn find_ivpn_host<'a>(
+    state: &'a IvpnAndroidState,
+    selected_server_label: &str,
+) -> Option<(&'a IvpnWireGuardServer, &'a IvpnWireGuardHost)> {
+    let trimmed = selected_server_label.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    for server in &state.manifest.wireguard {
+        for host in &server.hosts {
+            if format_ivpn_server_label(server, host) == trimmed {
+                return Some((server, host));
+            }
+            if host.hostname.eq_ignore_ascii_case(trimmed)
+                || host.dns_name.eq_ignore_ascii_case(trimmed)
+            {
+                return Some((server, host));
+            }
+        }
+        if server.gateway.eq_ignore_ascii_case(trimmed) {
+            let best = server.hosts.iter().min_by(|a, b| {
+                a.load
+                    .partial_cmp(&b.load)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            });
+            if let Some(host) = best {
+                return Some((server, host));
+            }
+        }
+    }
+
+    let name_hint = trimmed.split(" [").next().unwrap_or("").trim();
+    if name_hint.is_empty() {
+        None
+    } else {
+        for server in &state.manifest.wireguard {
+            if let Some(host) = server.hosts.iter().find(|h| {
+                h.hostname.eq_ignore_ascii_case(name_hint)
+                    || h.dns_name.eq_ignore_ascii_case(name_hint)
+            }) {
+                return Some((server, host));
+            }
+        }
+        None
+    }
+}
+
+fn build_ivpn_runtime_config(
+    state: &IvpnAndroidState,
+    selected_server_label: &str,
+) -> Result<(TunConfig, WireGuardRuntimeConfig), String> {
+    let selected = if selected_server_label.is_empty() {
+        None
+    } else {
+        find_ivpn_host(state, selected_server_label)
+    };
+    let used_fallback = selected.is_none();
+
+    let mut rows: Vec<(&IvpnWireGuardServer, &IvpnWireGuardHost)> = Vec::new();
+    for server in &state.manifest.wireguard {
+        for host in &server.hosts {
+            rows.push((server, host));
+        }
+    }
+    rows.sort_by(|a, b| {
+        a.1.load
+            .partial_cmp(&b.1.load)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+
+    let (server, host) = selected
+        .or_else(|| rows.first().copied())
+        .ok_or_else(|| "no IVPN servers available".to_string())?;
+    if used_fallback && !selected_server_label.is_empty() {
+        log::warn!(
+            "nativeConnect: selected server '{}' not found, falling back to '{}'",
+            selected_server_label,
+            host.hostname
+        );
+    }
+
+    let local_ip_no_mask = state
+        .wg_local_ip
+        .split('/')
+        .next()
+        .unwrap_or(&state.wg_local_ip)
+        .to_string();
+    let dns_ip = host
+        .local_ip
+        .split('/')
+        .next()
+        .unwrap_or("10.0.0.1")
+        .to_string();
+    let tun_config = TunConfig {
+        addresses: vec![ensure_cidr(&local_ip_no_mask, "/32")],
+        routes: vec!["0.0.0.0/0".to_string(), "::/0".to_string()],
+        dns_servers: vec![dns_ip],
+        mtu: 1500,
+    };
+
+    let endpoint_ip: IpAddr = host
+        .host
+        .parse()
+        .map_err(|e| format!("invalid IVPN endpoint IP '{}': {}", host.host, e))?;
+    let private_key = decode_key32("wg_private_key", &state.wg_private_key)?;
+    let peer_public_key = decode_key32("server_public_key", &host.public_key)?;
+
+    let cfg = WireGuardRuntimeConfig {
+        server_name: format!("{} ({})", host.hostname, server.country_code),
+        endpoint: SocketAddr::new(
+            endpoint_ip,
+            choose_ivpn_port(&state.manifest.config.ports.wireguard),
+        ),
+        private_key,
+        peer_public_key,
+        preshared_key: None,
+        allowed_ips: vec!["0.0.0.0/0".to_string(), "::/0".to_string()],
+        keepalive_secs: None,
+    };
+    Ok((tun_config, cfg))
 }
 
 fn filter_proton_servers(max_tier: i32, mut servers: Vec<LogicalServer>) -> Vec<LogicalServer> {
@@ -1003,6 +1522,51 @@ async fn login_proton(login_credentials: &LoginCredentials) -> Result<ProtonAndr
     })
 }
 
+async fn login_mullvad(account_number: &str) -> Result<MullvadAndroidState, String> {
+    let data = mullvad_api::login(account_number)
+        .await
+        .map_err(|e| e.to_string())?;
+    let manifest_json = serde_json::to_value(&data.manifest).map_err(|e| e.to_string())?;
+    let manifest: MullvadManifest =
+        serde_json::from_value(manifest_json).map_err(|e| e.to_string())?;
+    let server_list_json = build_mullvad_server_list_json(&manifest);
+    if server_list_json == "[]" {
+        return Err("no Mullvad WireGuard servers available".to_string());
+    }
+
+    Ok(MullvadAndroidState {
+        account_number: data.account_number,
+        device_id: data.device_id,
+        wg_private_key: data.wg_private_key,
+        ipv4_address: data.ipv4_address,
+        ipv6_address: data.ipv6_address,
+        server_list_json,
+        manifest,
+    })
+}
+
+async fn login_ivpn(account_id: &str, totp: Option<String>) -> Result<IvpnAndroidState, String> {
+    let data = ivpn_api::login(account_id, totp.as_deref())
+        .await
+        .map_err(|e| e.to_string())?;
+    let manifest_json = serde_json::to_value(&data.manifest).map_err(|e| e.to_string())?;
+    let manifest: IvpnManifest =
+        serde_json::from_value(manifest_json).map_err(|e| e.to_string())?;
+    let server_list_json = build_ivpn_server_list_json(&manifest);
+    if server_list_json == "[]" {
+        return Err("no IVPN WireGuard servers available".to_string());
+    }
+
+    Ok(IvpnAndroidState {
+        account_id: data.account_id,
+        session_token: data.session_token,
+        wg_private_key: data.wg_private_key,
+        wg_local_ip: data.wg_local_ip,
+        server_list_json,
+        manifest,
+    })
+}
+
 fn start_android_wireguard(
     tun_fd: RawFd,
     cfg: &WireGuardRuntimeConfig,
@@ -1220,6 +1784,97 @@ pub extern "system" fn Java_net_tunmux_RustBridge_login<'local>(
                 .to_string()
             }
         },
+        "mullvad" => match parse_account_login_credential(&_credential) {
+            Ok((account_number, _totp)) => {
+                let login_result = get_runtime().block_on(login_mullvad(&account_number));
+                match login_result {
+                    Ok(login_data) => {
+                        let servers = login_data
+                            .manifest
+                            .wireguard
+                            .relays
+                            .iter()
+                            .filter(|r| r.active)
+                            .count();
+                        let account = login_data.account_number.clone();
+                        let mut state = MULLVAD_STATE.lock().unwrap();
+                        *state = Some(login_data);
+                        log::info!(
+                            "RustBridge.login mullvad success: account={} servers={}",
+                            account,
+                            servers
+                        );
+                        json!({
+                            "status": "ok",
+                            "provider": "mullvad",
+                            "account": account,
+                            "servers": servers
+                        })
+                        .to_string()
+                    }
+                    Err(e) => {
+                        log::error!("RustBridge.login mullvad failed: {}", e);
+                        json!({
+                            "status": "error",
+                            "error": e
+                        })
+                        .to_string()
+                    }
+                }
+            }
+            Err(msg) => {
+                log::warn!("RustBridge.login mullvad bad credentials payload: {}", msg);
+                json!({
+                    "status": "error",
+                    "error": msg
+                })
+                .to_string()
+            }
+        },
+        "ivpn" => match parse_account_login_credential(&_credential) {
+            Ok((account_id, totp)) => {
+                let login_result = get_runtime().block_on(login_ivpn(&account_id, totp));
+                match login_result {
+                    Ok(login_data) => {
+                        let mut servers = 0usize;
+                        for server in &login_data.manifest.wireguard {
+                            servers += server.hosts.len();
+                        }
+                        let account = login_data.account_id.clone();
+                        let mut state = IVPN_STATE.lock().unwrap();
+                        *state = Some(login_data);
+                        log::info!(
+                            "RustBridge.login ivpn success: account={} servers={}",
+                            account,
+                            servers
+                        );
+                        json!({
+                            "status": "ok",
+                            "provider": "ivpn",
+                            "account": account,
+                            "servers": servers
+                        })
+                        .to_string()
+                    }
+                    Err(e) => {
+                        log::error!("RustBridge.login ivpn failed: {}", e);
+                        json!({
+                            "status": "error",
+                            "error": e
+                        })
+                        .to_string()
+                    }
+                }
+            }
+            Err(msg) => {
+                log::warn!("RustBridge.login ivpn bad credentials payload: {}", msg);
+                json!({
+                    "status": "error",
+                    "error": msg
+                })
+                .to_string()
+            }
+        },
         _ => {
             log::warn!(
                 "RustBridge.login provider '{}' not implemented in JNI",
@@ -1255,6 +1910,23 @@ pub extern "system" fn Java_net_tunmux_RustBridge_logout(
     } else if provider_norm == "proton" {
         let mut state = PROTON_STATE.lock().unwrap();
         *state = None;
+    } else if provider_norm == "mullvad" {
+        let previous = {
+            let mut state = MULLVAD_STATE.lock().unwrap();
+            state.take()
+        };
+        if let Some(s) = previous {
+            let _ =
+                get_runtime().block_on(mullvad_api::delete_device(&s.account_number, &s.device_id));
+        }
+    } else if provider_norm == "ivpn" {
+        let previous = {
+            let mut state = IVPN_STATE.lock().unwrap();
+            state.take()
+        };
+        if let Some(s) = previous {
+            let _ = get_runtime().block_on(ivpn_api::delete_session(&s.session_token));
+        }
     }
 }
 
@@ -1289,6 +1961,26 @@ pub extern "system" fn Java_net_tunmux_RustBridge_fetchServers<'local>(
                 Some(s) => s.server_list_json.clone(),
                 None => {
                     log::warn!("RustBridge.fetchServers proton without active session");
+                    "[]".to_string()
+                }
+            }
+        }
+        "mullvad" => {
+            let state = MULLVAD_STATE.lock().unwrap();
+            match state.as_ref() {
+                Some(s) => s.server_list_json.clone(),
+                None => {
+                    log::warn!("RustBridge.fetchServers mullvad without active session");
+                    "[]".to_string()
+                }
+            }
+        }
+        "ivpn" => {
+            let state = IVPN_STATE.lock().unwrap();
+            match state.as_ref() {
+                Some(s) => s.server_list_json.clone(),
+                None => {
+                    log::warn!("RustBridge.fetchServers ivpn without active session");
                     "[]".to_string()
                 }
             }

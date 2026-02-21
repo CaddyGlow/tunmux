@@ -63,8 +63,10 @@ impl AirVpnClient {
                     let body = match resp.bytes().await {
                         Ok(body) => body,
                         Err(e) => {
-                            last_err =
-                                Some(AppError::AirVpnApi(format!("failed to read response: {}", e)));
+                            last_err = Some(AppError::AirVpnApi(format!(
+                                "failed to read response: {}",
+                                e
+                            )));
                             continue;
                         }
                     };
