@@ -40,6 +40,7 @@ pub struct MullvadRelay {
 #[derive(Debug, Clone)]
 pub struct MullvadLoginData {
     pub account_number: String,
+    pub access_token: String,
     pub device_id: String,
     pub wg_private_key: String,
     pub ipv4_address: String,
@@ -69,16 +70,31 @@ pub fn api_client() -> Result<Client> {
 
 pub async fn login(account_number: &str) -> Result<MullvadLoginData> {
     let client = api_client()?;
+    let access_token = fetch_access_token(&client, account_number).await?;
+    login_with_access_token(account_number, &access_token).await
+}
+
+pub async fn login_with_access_token(
+    account_number: &str,
+    access_token: &str,
+) -> Result<MullvadLoginData> {
+    let client = api_client()?;
     let keys = crypto::keys::VpnKeys::generate()?;
     let wg_public_key = keys.wg_public_key();
     let wg_private_key = keys.wg_private_key();
 
-    let access_token = fetch_access_token(&client, account_number).await?;
-    let device = create_device(&client, &access_token, &wg_public_key).await?;
+    let token = access_token.trim();
+    if token.is_empty() {
+        return Err(AppError::Other(
+            "Mullvad access token cannot be empty".to_string(),
+        ));
+    }
+    let device = create_device(&client, token, &wg_public_key).await?;
     let manifest = fetch_manifest(&client).await?;
 
     Ok(MullvadLoginData {
         account_number: account_number.to_string(),
+        access_token: token.to_string(),
         device_id: device.id,
         wg_private_key,
         ipv4_address: device.ipv4_address,

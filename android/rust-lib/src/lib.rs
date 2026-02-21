@@ -99,6 +99,7 @@ struct ProtonAndroidState {
 #[derive(Clone)]
 struct MullvadAndroidState {
     account_number: String,
+    access_token: String,
     device_id: String,
     wg_private_key: String,
     ipv4_address: String,
@@ -119,9 +120,14 @@ struct IvpnAndroidState {
 
 struct LoginCredentials {
     username: String,
-    password: String,
+    password: Option<String>,
     totp: Option<String>,
     device: Option<String>,
+    api_key: Option<String>,
+    api_uid: Option<String>,
+    refresh_token: Option<String>,
+    wg_private_key: Option<String>,
+    wg_local_ip: Option<String>,
 }
 
 #[derive(Clone, serde::Deserialize)]
@@ -731,9 +737,9 @@ fn parse_login_credentials(credential: &str) -> Result<LoginCredentials, String>
     let password = parsed
         .get("password")
         .and_then(Value::as_str)
+        .map(str::trim)
         .filter(|v| !v.is_empty())
-        .ok_or_else(|| "missing password".to_string())?
-        .to_string();
+        .map(ToOwned::to_owned);
 
     let device = parsed
         .get("device")
@@ -749,31 +755,56 @@ fn parse_login_credentials(credential: &str) -> Result<LoginCredentials, String>
         .filter(|v| !v.is_empty())
         .map(ToOwned::to_owned);
 
+    let api_key = parsed
+        .get("api_key")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+        .map(ToOwned::to_owned);
+
+    let api_uid = parsed
+        .get("api_uid")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+        .map(ToOwned::to_owned);
+
+    let refresh_token = parsed
+        .get("refresh_token")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+        .map(ToOwned::to_owned);
+
+    let wg_private_key = parsed
+        .get("wg_private_key")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+        .map(ToOwned::to_owned);
+
+    let wg_local_ip = parsed
+        .get("wg_local_ip")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+        .map(ToOwned::to_owned);
+
     Ok(LoginCredentials {
         username,
         password,
         totp,
         device,
+        api_key,
+        api_uid,
+        refresh_token,
+        wg_private_key,
+        wg_local_ip,
     })
 }
 
-fn parse_account_login_credential(credential: &str) -> Result<(String, Option<String>), String> {
-    let parsed: Value =
-        serde_json::from_str(credential).map_err(|e| format!("invalid credential JSON: {e}"))?;
-    let account_id = parsed
-        .get("username")
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|v| !v.is_empty())
-        .ok_or_else(|| "missing username".to_string())?
-        .to_string();
-    let totp = parsed
-        .get("totp")
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|v| !v.is_empty())
-        .map(ToOwned::to_owned);
-    Ok((account_id, totp))
+fn parse_account_login_credential(credential: &str) -> Result<LoginCredentials, String> {
+    parse_login_credentials(credential)
 }
 
 fn ensure_cidr(addr: &str, default_mask: &str) -> String {
@@ -1455,22 +1486,18 @@ fn build_proton_runtime_config(
     })
 }
 
-async fn login_proton(login_credentials: &LoginCredentials) -> Result<ProtonAndroidState, String> {
+async fn login_proton_with_password(
+    username: &str,
+    password: &str,
+    totp: Option<&str>,
+) -> Result<ProtonAndroidState, String> {
     let mut client = api::http::ProtonClient::new().map_err(|e| e.to_string())?;
-    let auth = api::auth::login(
-        &mut client,
-        &login_credentials.username,
-        &login_credentials.password,
-    )
-    .await
-    .map_err(|e| e.to_string())?;
+    let auth = api::auth::login(&mut client, username, password)
+        .await
+        .map_err(|e| e.to_string())?;
 
     if auth.two_factor.totp_required() {
-        let code = login_credentials
-            .totp
-            .as_deref()
-            .map(str::trim)
-            .unwrap_or("");
+        let code = totp.map(str::trim).unwrap_or("");
         if code.is_empty() {
             return Err("2FA code required for this Proton account".to_string());
         }
@@ -1515,17 +1542,85 @@ async fn login_proton(login_credentials: &LoginCredentials) -> Result<ProtonAndr
     let server_list_json = build_proton_server_list_json(&servers);
 
     Ok(ProtonAndroidState {
-        username: login_credentials.username.clone(),
+        username: username.to_string(),
         session,
         server_list_json,
         servers,
     })
 }
 
-async fn login_mullvad(account_number: &str) -> Result<MullvadAndroidState, String> {
-    let data = mullvad_api::login(account_number)
+async fn login_proton_with_api_key(
+    username: &str,
+    uid: &str,
+    access_token: &str,
+    refresh_token: Option<&str>,
+) -> Result<ProtonAndroidState, String> {
+    let client =
+        api::http::ProtonClient::authenticated(uid, access_token).map_err(|e| e.to_string())?;
+    let vpn_info = api::vpn_info::fetch_vpn_info(&client)
         .await
         .map_err(|e| e.to_string())?;
+    let keys = crypto::keys::VpnKeys::generate().map_err(|e| e.to_string())?;
+    let cert = api::certificate::fetch_certificate(&client, &keys.ed25519_pk_pem())
+        .await
+        .map_err(|e| e.to_string())?;
+    let session = Session {
+        uid: uid.to_string(),
+        access_token: access_token.to_string(),
+        refresh_token: refresh_token.unwrap_or("").to_string(),
+        vpn_username: vpn_info.vpn.name,
+        vpn_password: vpn_info.vpn.password,
+        plan_name: vpn_info.vpn.plan_name,
+        plan_title: vpn_info.vpn.plan_title,
+        max_tier: vpn_info.vpn.max_tier,
+        max_connections: vpn_info.vpn.max_connect,
+        ed25519_private_key: keys.ed25519_sk_base64(),
+        ed25519_public_key_pem: keys.ed25519_pk_pem(),
+        wg_private_key: keys.wg_private_key(),
+        wg_public_key: keys.wg_public_key(),
+        fingerprint: keys.fingerprint(),
+        certificate_pem: cert.certificate,
+    };
+
+    let servers_resp = api::servers::fetch_server_list(&client)
+        .await
+        .map_err(|e| e.to_string())?;
+    let servers = filter_proton_servers(session.max_tier, servers_resp.logical_servers);
+    if servers.is_empty() {
+        return Err("no Proton WireGuard servers available for this account".to_string());
+    }
+    let server_list_json = build_proton_server_list_json(&servers);
+
+    Ok(ProtonAndroidState {
+        username: username.to_string(),
+        session,
+        server_list_json,
+        servers,
+    })
+}
+
+async fn login_mullvad(
+    account_number: &str,
+    api_key: Option<&str>,
+) -> Result<MullvadAndroidState, String> {
+    let data = if let Some(token) = api_key.filter(|v| !v.trim().is_empty()) {
+        match mullvad_api::login_with_access_token(account_number, token).await {
+            Ok(v) => v,
+            Err(e) => {
+                log::warn!(
+                    "Mullvad api_key login failed; falling back to account auth: {}",
+                    e
+                );
+                mullvad_api::login(account_number)
+                    .await
+                    .map_err(|e| e.to_string())?
+            }
+        }
+    } else {
+        mullvad_api::login(account_number)
+            .await
+            .map_err(|e| e.to_string())?
+    };
     let manifest_json = serde_json::to_value(&data.manifest).map_err(|e| e.to_string())?;
     let manifest: MullvadManifest =
         serde_json::from_value(manifest_json).map_err(|e| e.to_string())?;
@@ -1536,6 +1631,7 @@ async fn login_mullvad(account_number: &str) -> Result<MullvadAndroidState, Stri
 
     Ok(MullvadAndroidState {
         account_number: data.account_number,
+        access_token: data.access_token,
         device_id: data.device_id,
         wg_private_key: data.wg_private_key,
         ipv4_address: data.ipv4_address,
@@ -1545,10 +1641,35 @@ async fn login_mullvad(account_number: &str) -> Result<MullvadAndroidState, Stri
     })
 }
 
-async fn login_ivpn(account_id: &str, totp: Option<String>) -> Result<IvpnAndroidState, String> {
-    let data = ivpn_api::login(account_id, totp.as_deref())
-        .await
-        .map_err(|e| e.to_string())?;
+async fn login_ivpn(
+    account_id: &str,
+    totp: Option<&str>,
+    api_key: Option<&str>,
+    wg_private_key: Option<&str>,
+    wg_local_ip: Option<&str>,
+) -> Result<IvpnAndroidState, String> {
+    let data = if let (Some(token), Some(private_key), Some(local_ip)) = (
+        api_key.filter(|v| !v.trim().is_empty()),
+        wg_private_key.filter(|v| !v.trim().is_empty()),
+        wg_local_ip.filter(|v| !v.trim().is_empty()),
+    ) {
+        match ivpn_api::restore_session(account_id, token, private_key, local_ip).await {
+            Ok(v) => v,
+            Err(e) => {
+                log::warn!(
+                    "IVPN api_key restore failed; falling back to account auth: {}",
+                    e
+                );
+                ivpn_api::login(account_id, totp)
+                    .await
+                    .map_err(|e| e.to_string())?
+            }
+        }
+    } else {
+        ivpn_api::login(account_id, totp)
+            .await
+            .map_err(|e| e.to_string())?
+    };
     let manifest_json = serde_json::to_value(&data.manifest).map_err(|e| e.to_string())?;
     let manifest: IvpnManifest =
         serde_json::from_value(manifest_json).map_err(|e| e.to_string())?;
@@ -1647,7 +1768,20 @@ pub extern "system" fn Java_net_tunmux_RustBridge_login<'local>(
         "airvpn" => match parse_login_credentials(&_credential) {
             Ok(login_credentials) => {
                 let username = login_credentials.username;
-                let password = login_credentials.password;
+                let password = match login_credentials.password {
+                    Some(v) => v,
+                    None => {
+                        return env
+                            .new_string(
+                                json!({
+                                    "status": "error",
+                                    "error": "missing password"
+                                })
+                                .to_string(),
+                            )
+                            .expect("failed to create JString");
+                    }
+                };
                 let requested_device = login_credentials.device;
                 let login_result = get_runtime().block_on(async {
                     let client = AirVpnClient::new()?;
@@ -1738,7 +1872,49 @@ pub extern "system" fn Java_net_tunmux_RustBridge_login<'local>(
         },
         "proton" => match parse_login_credentials(&_credential) {
             Ok(login_credentials) => {
-                let login_result = get_runtime().block_on(login_proton(&login_credentials));
+                let login_result = get_runtime().block_on(async {
+                    if let (Some(api_uid), Some(api_key)) = (
+                        login_credentials.api_uid.as_deref(),
+                        login_credentials.api_key.as_deref(),
+                    ) {
+                        match login_proton_with_api_key(
+                            &login_credentials.username,
+                            api_uid,
+                            api_key,
+                            login_credentials.refresh_token.as_deref(),
+                        )
+                        .await
+                        {
+                            Ok(v) => Ok(v),
+                            Err(e) => {
+                                log::warn!("Proton api_key login failed; falling back to password login: {}", e);
+                                let password = login_credentials.password.as_deref().unwrap_or("").trim();
+                                if password.is_empty() {
+                                    Err(e)
+                                } else {
+                                    login_proton_with_password(
+                                        &login_credentials.username,
+                                        password,
+                                        login_credentials.totp.as_deref(),
+                                    )
+                                    .await
+                                }
+                            }
+                        }
+                    } else {
+                        let password = login_credentials.password.as_deref().unwrap_or("").trim();
+                        if password.is_empty() {
+                            Err("missing password".to_string())
+                        } else {
+                            login_proton_with_password(
+                                &login_credentials.username,
+                                password,
+                                login_credentials.totp.as_deref(),
+                            )
+                            .await
+                        }
+                    }
+                });
                 match login_result {
                     Ok(login_data) => {
                         let servers = login_data.servers.len();
@@ -1746,6 +1922,9 @@ pub extern "system" fn Java_net_tunmux_RustBridge_login<'local>(
                         let plan_title = login_data.session.plan_title.clone();
                         let max_tier = login_data.session.max_tier;
                         let max_connections = login_data.session.max_connections;
+                        let api_key = login_data.session.access_token.clone();
+                        let api_uid = login_data.session.uid.clone();
+                        let refresh_token = login_data.session.refresh_token.clone();
                         let mut state = PROTON_STATE.lock().unwrap();
                         *state = Some(login_data);
                         log::info!(
@@ -1761,7 +1940,10 @@ pub extern "system" fn Java_net_tunmux_RustBridge_login<'local>(
                             "plan_title": plan_title,
                             "max_tier": max_tier,
                             "max_connections": max_connections,
-                            "servers": servers
+                            "servers": servers,
+                            "api_key": api_key,
+                            "api_uid": api_uid,
+                            "refresh_token": refresh_token
                         })
                         .to_string()
                     }
@@ -1785,8 +1967,12 @@ pub extern "system" fn Java_net_tunmux_RustBridge_login<'local>(
             }
         },
         "mullvad" => match parse_account_login_credential(&_credential) {
-            Ok((account_number, _totp)) => {
-                let login_result = get_runtime().block_on(login_mullvad(&account_number));
+            Ok(login_credentials) => {
+                let account_number = login_credentials.username;
+                let login_result = get_runtime().block_on(login_mullvad(
+                    &account_number,
+                    login_credentials.api_key.as_deref(),
+                ));
                 match login_result {
                     Ok(login_data) => {
                         let servers = login_data
@@ -1797,6 +1983,7 @@ pub extern "system" fn Java_net_tunmux_RustBridge_login<'local>(
                             .filter(|r| r.active)
                             .count();
                         let account = login_data.account_number.clone();
+                        let api_key = login_data.access_token.clone();
                         let mut state = MULLVAD_STATE.lock().unwrap();
                         *state = Some(login_data);
                         log::info!(
@@ -1808,7 +1995,8 @@ pub extern "system" fn Java_net_tunmux_RustBridge_login<'local>(
                             "status": "ok",
                             "provider": "mullvad",
                             "account": account,
-                            "servers": servers
+                            "servers": servers,
+                            "api_key": api_key
                         })
                         .to_string()
                     }
@@ -1832,8 +2020,15 @@ pub extern "system" fn Java_net_tunmux_RustBridge_login<'local>(
             }
         },
         "ivpn" => match parse_account_login_credential(&_credential) {
-            Ok((account_id, totp)) => {
-                let login_result = get_runtime().block_on(login_ivpn(&account_id, totp));
+            Ok(login_credentials) => {
+                let account_id = login_credentials.username;
+                let login_result = get_runtime().block_on(login_ivpn(
+                    &account_id,
+                    login_credentials.totp.as_deref(),
+                    login_credentials.api_key.as_deref(),
+                    login_credentials.wg_private_key.as_deref(),
+                    login_credentials.wg_local_ip.as_deref(),
+                ));
                 match login_result {
                     Ok(login_data) => {
                         let mut servers = 0usize;
@@ -1841,6 +2036,9 @@ pub extern "system" fn Java_net_tunmux_RustBridge_login<'local>(
                             servers += server.hosts.len();
                         }
                         let account = login_data.account_id.clone();
+                        let api_key = login_data.session_token.clone();
+                        let wg_private_key = login_data.wg_private_key.clone();
+                        let wg_local_ip = login_data.wg_local_ip.clone();
                         let mut state = IVPN_STATE.lock().unwrap();
                         *state = Some(login_data);
                         log::info!(
@@ -1852,7 +2050,10 @@ pub extern "system" fn Java_net_tunmux_RustBridge_login<'local>(
                             "status": "ok",
                             "provider": "ivpn",
                             "account": account,
-                            "servers": servers
+                            "servers": servers,
+                            "api_key": api_key,
+                            "wg_private_key": wg_private_key,
+                            "wg_local_ip": wg_local_ip
                         })
                         .to_string()
                     }

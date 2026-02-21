@@ -119,6 +119,15 @@ struct IvpnBasicResponse {
     message: String,
 }
 
+#[derive(Debug, serde::Deserialize)]
+struct IvpnSessionStatusResponse {
+    status: i64,
+    #[serde(default)]
+    message: String,
+    #[serde(default)]
+    service_status: Option<IvpnServiceStatus>,
+}
+
 pub fn api_client() -> Result<Client> {
     Ok(Client::builder()
         .user_agent("tunmux")
@@ -170,6 +179,50 @@ pub async fn login(account_id: &str, totp: Option<&str>) -> Result<IvpnLoginData
     })
 }
 
+pub async fn restore_session(
+    account_id: &str,
+    session_token: &str,
+    wg_private_key: &str,
+    wg_local_ip: &str,
+) -> Result<IvpnLoginData> {
+    let account = account_id.trim();
+    if account.is_empty() {
+        return Err(AppError::Other("missing username".to_string()));
+    }
+    let token = session_token.trim();
+    if token.is_empty() {
+        return Err(AppError::Other("IVPN session token is empty".to_string()));
+    }
+    let private_key = wg_private_key.trim();
+    if private_key.is_empty() {
+        return Err(AppError::Other("IVPN WireGuard private key is empty".to_string()));
+    }
+    let local_ip = wg_local_ip.trim();
+    if local_ip.is_empty() {
+        return Err(AppError::Other("IVPN WireGuard local IP is empty".to_string()));
+    }
+
+    let client = api_client()?;
+    let status = session_status(&client, token).await?;
+    ensure_api_success(status.status, &status.message, "IVPN session/status")?;
+    if let Some(service) = status.service_status {
+        if !service.is_active {
+            return Err(AppError::Other(
+                "IVPN session token is not active".to_string(),
+            ));
+        }
+    }
+    let manifest = fetch_manifest(&client).await?;
+
+    Ok(IvpnLoginData {
+        account_id: account.to_string(),
+        session_token: token.to_string(),
+        wg_private_key: private_key.to_string(),
+        wg_local_ip: local_ip.to_string(),
+        manifest,
+    })
+}
+
 pub async fn delete_session(session_token: &str) -> Result<()> {
     let client = api_client()?;
     let url = format!("{}/v4/session/delete", API_BASE);
@@ -204,6 +257,16 @@ async fn session_new(
     let url = format!("{}/v4/session/new", API_BASE);
     let resp = client.post(url).json(&body).send().await?;
     parse_api_json(resp, "IVPN session/new").await
+}
+
+async fn session_status(client: &Client, session_token: &str) -> Result<IvpnSessionStatusResponse> {
+    let url = format!("{}/v4/session/status", API_BASE);
+    let resp = client
+        .post(url)
+        .json(&serde_json::json!({ "session_token": session_token }))
+        .send()
+        .await?;
+    parse_api_json(resp, "IVPN session/status").await
 }
 
 async fn fetch_manifest(client: &Client) -> Result<IvpnManifest> {

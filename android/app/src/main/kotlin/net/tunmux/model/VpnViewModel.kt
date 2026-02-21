@@ -130,6 +130,8 @@ class VpnViewModel(app: Application) : AndroidViewModel(app) {
                     val result = RustBridge.login(provider, loginCredential)
                     val json = JSONObject(result)
                     if (json.optString("status") == "ok") {
+                        val refreshedStoredCredential = mergeStoredCredential(savedCredential, json)
+                        KeystoreCredentials.save(ctx, provider, refreshedStoredCredential)
                         val servers = fetchServersNow(provider) ?: return@launch
                         _state.value = _state.value.copy(
                             screen = Screen.Dashboard,
@@ -218,11 +220,6 @@ class VpnViewModel(app: Application) : AndroidViewModel(app) {
             }
         }.toString()
 
-        val credentialToStore = JSONObject().apply {
-            put("username", username)
-            put("password", password)
-        }.toString()
-
         viewModelScope.launch(Dispatchers.IO) {
             try {
                 val result = RustBridge.login(provider, credential)
@@ -230,7 +227,14 @@ class VpnViewModel(app: Application) : AndroidViewModel(app) {
                 val status = json.optString("status", "error")
                 if (status == "ok") {
                     AutoRuntimeStore.saveProvider(ctx, provider)
-                    KeystoreCredentials.save(ctx, provider, credentialToStore)
+                    val storedCredential = mergeStoredCredential(
+                        baseCredentialJson = JSONObject().apply {
+                            put("username", username)
+                            put("password", password)
+                        }.toString(),
+                        loginResponse = json,
+                    )
+                    KeystoreCredentials.save(ctx, provider, storedCredential)
                     val servers = fetchServersNow(provider) ?: return@launch
                     _state.value = _state.value.copy(
                         screen = Screen.Dashboard,
@@ -1066,6 +1070,22 @@ class VpnViewModel(app: Application) : AndroidViewModel(app) {
                 _state.value = _state.value.copy(errorMessage = e.message ?: "unexpected error")
             }
         }
+    }
+
+    private fun mergeStoredCredential(baseCredentialJson: String, loginResponse: JSONObject): String {
+        val base = try {
+            JSONObject(baseCredentialJson)
+        } catch (_: Exception) {
+            JSONObject()
+        }
+        listOf("api_key", "api_uid", "refresh_token", "wg_private_key", "wg_local_ip")
+            .forEach { key ->
+                val value = loginResponse.optString(key, "").trim()
+                if (value.isNotEmpty()) {
+                    base.put(key, value)
+                }
+            }
+        return base.toString()
     }
 
     private fun extractUsername(credentialJson: String): String =
