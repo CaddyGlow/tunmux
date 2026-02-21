@@ -5,12 +5,15 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, LazyLock, RwLock as StdRwLock};
 use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, Context};
+use bytes::{Bytes, BytesMut};
 use boringtun::noise::{Tunn, TunnResult};
 use boringtun::x25519::{PublicKey, StaticSecret};
+use crossbeam_queue::ArrayQueue;
 use serde::{Deserialize, Serialize};
 use smoltcp::iface::{Config, Interface, SocketSet};
 use smoltcp::phy::{DeviceCapabilities, Medium, RxToken, TxToken};
@@ -18,7 +21,7 @@ use smoltcp::socket::tcp::{Socket as TcpSocket, SocketBuffer as TcpSocketBuffer}
 use smoltcp::wire::{IpAddress, IpEndpoint, IpListenEndpoint};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{mpsc, oneshot, Notify};
 use tracing::{debug, info, warn};
 
 const UDP_BUF: usize = 65536;
@@ -31,6 +34,10 @@ const ACTIVE_CONN_POLL_MAX: Duration = Duration::from_millis(1);
 const CLIENT_CHANNEL_CAP: usize = 1024;
 const REMOTE_PENDING_MAX_BYTES: usize = 2 * 1024 * 1024;
 const CLIENT_PENDING_MAX_BYTES: usize = 2 * 1024 * 1024;
+const UDP_RECV_BURST_MAX: usize = 64;
+const UDP_SEND_BURST_MAX: usize = 64;
+const ACTIVE_CONN_BATCH_MAX: usize = 256;
+const ACTIVE_CONN_FULL_SCAN_INTERVAL: Duration = Duration::from_millis(25);
 const DNS_CACHE_TTL: Duration = Duration::from_secs(15);
 
 type DnsCache = HashMap<String, (Instant, Vec<SocketAddr>)>;
@@ -64,9 +71,99 @@ pub struct LocalProxyConfig {
 struct ConnRequest {
     target_ip: IpAddress,
     target_port: u16,
-    to_client_tx: mpsc::Sender<Vec<u8>>,
-    from_client_rx: mpsc::Receiver<Vec<u8>>,
+    to_client_tx: Arc<ByteQueue>,
+    from_client_rx: Arc<ByteQueue>,
     connected_tx: oneshot::Sender<Result<(), String>>,
+}
+
+enum QueuePushError {
+    Full(Bytes),
+    Closed,
+}
+
+struct ByteQueue {
+    queue: ArrayQueue<Bytes>,
+    has_data_notify: Notify,
+    has_space_notify: Notify,
+    loop_notify: Arc<Notify>,
+    closed: AtomicBool,
+}
+
+impl ByteQueue {
+    fn new(capacity: usize, loop_notify: Arc<Notify>) -> Self {
+        Self {
+            queue: ArrayQueue::new(capacity),
+            has_data_notify: Notify::new(),
+            has_space_notify: Notify::new(),
+            loop_notify,
+            closed: AtomicBool::new(false),
+        }
+    }
+
+    fn close(&self) {
+        self.closed.store(true, Ordering::Release);
+        self.has_data_notify.notify_waiters();
+        self.has_space_notify.notify_waiters();
+        self.loop_notify.notify_waiters();
+    }
+
+    fn is_closed(&self) -> bool {
+        self.closed.load(Ordering::Acquire)
+    }
+
+    fn is_empty(&self) -> bool {
+        self.queue.is_empty()
+    }
+
+    fn try_push(&self, chunk: Bytes) -> Result<(), QueuePushError> {
+        if self.is_closed() {
+            return Err(QueuePushError::Closed);
+        }
+        match self.queue.push(chunk) {
+            Ok(()) => {
+                self.has_data_notify.notify_one();
+                self.loop_notify.notify_one();
+                Ok(())
+            }
+            Err(chunk) => Err(QueuePushError::Full(chunk)),
+        }
+    }
+
+    async fn push(&self, mut chunk: Bytes) -> Result<(), ()> {
+        loop {
+            match self.try_push(chunk) {
+                Ok(()) => return Ok(()),
+                Err(QueuePushError::Closed) => return Err(()),
+                Err(QueuePushError::Full(returned)) => {
+                    chunk = returned;
+                    if self.is_closed() {
+                        return Err(());
+                    }
+                    self.has_space_notify.notified().await;
+                }
+            }
+        }
+    }
+
+    fn try_pop(&self) -> Option<Bytes> {
+        let out = self.queue.pop();
+        if out.is_some() {
+            self.has_space_notify.notify_one();
+        }
+        out
+    }
+
+    async fn pop(&self) -> Option<Bytes> {
+        loop {
+            if let Some(out) = self.try_pop() {
+                return Some(out);
+            }
+            if self.is_closed() {
+                return None;
+            }
+            self.has_data_notify.notified().await;
+        }
+    }
 }
 
 // ── Virtual phy device for smoltcp ───────────────────────────────────────────
@@ -139,14 +236,15 @@ impl smoltcp::phy::Device for VirtualDevice {
 
 struct ConnEntry {
     handle: smoltcp::iface::SocketHandle,
-    to_client_tx: mpsc::Sender<Vec<u8>>,
-    from_client_rx: mpsc::Receiver<Vec<u8>>,
+    to_client_tx: Arc<ByteQueue>,
+    from_client_rx: Arc<ByteQueue>,
     /// Present until the virtual TCP handshake completes.
     connected_tx: Option<oneshot::Sender<Result<(), String>>>,
-    pending_to_remote: VecDeque<Vec<u8>>,
-    pending_to_client: VecDeque<Vec<u8>>,
+    pending_to_remote: VecDeque<Bytes>,
+    pending_to_client: VecDeque<Bytes>,
     pending_remote_bytes: usize,
     pending_client_bytes: usize,
+    active: bool,
 }
 
 // ── Public entry point ────────────────────────────────────────────────────────
@@ -211,16 +309,19 @@ pub async fn run_local_proxy(cfg: LocalProxyConfig) -> anyhow::Result<()> {
     );
 
     let (conn_req_tx, mut conn_req_rx) = mpsc::channel::<ConnRequest>(CLIENT_CHANNEL_CAP);
+    let loop_notify = Arc::new(Notify::new());
 
     let tx = conn_req_tx.clone();
+    let notify = loop_notify.clone();
     tokio::spawn(async move {
         loop {
             match socks_listener.accept().await {
                 Ok((stream, peer)) => {
                     debug!(peer = ?peer, "socks5_accepted");
                     let tx = tx.clone();
+                    let notify = notify.clone();
                     tokio::spawn(async move {
-                        if let Err(e) = socks5_serve(stream, tx).await {
+                        if let Err(e) = socks5_serve(stream, tx, notify).await {
                             debug!(error = ?e.to_string(), "socks5_error");
                         }
                     });
@@ -236,14 +337,16 @@ pub async fn run_local_proxy(cfg: LocalProxyConfig) -> anyhow::Result<()> {
     });
 
     let tx = conn_req_tx.clone();
+    let notify = loop_notify.clone();
     tokio::spawn(async move {
         loop {
             match http_listener.accept().await {
                 Ok((stream, peer)) => {
                     debug!(peer = ?peer, "http_accepted");
                     let tx = tx.clone();
+                    let notify = notify.clone();
                     tokio::spawn(async move {
-                        if let Err(e) = http_connect_serve(stream, tx).await {
+                        if let Err(e) = http_connect_serve(stream, tx, notify).await {
                             debug!(error = ?e.to_string(), "http_error");
                         }
                     });
@@ -263,6 +366,9 @@ pub async fn run_local_proxy(cfg: LocalProxyConfig) -> anyhow::Result<()> {
     let mut enc_buf = vec![0u8; UDP_BUF + 32];
     let mut conns: Vec<ConnEntry> = Vec::new();
     let mut next_port: u16 = LOCAL_PORT_START;
+    let mut wg_pending_tx: VecDeque<Vec<u8>> = VecDeque::new();
+    let mut active_conns: VecDeque<usize> = VecDeque::new();
+    let mut last_full_scan = Instant::now();
     let mut wg_timer_deadline = Instant::now();
 
     loop {
@@ -270,9 +376,7 @@ pub async fn run_local_proxy(cfg: LocalProxyConfig) -> anyhow::Result<()> {
         let now = smoltcp_now();
 
         if now_std >= wg_timer_deadline {
-            if let TunnResult::WriteToNetwork(out) = tunn.update_timers(&mut enc_buf) {
-                let _ = udp.try_send(out);
-            }
+            queue_tunn_network_write(tunn.update_timers(&mut enc_buf), &mut wg_pending_tx);
             wg_timer_deadline = now_std + WG_TIMER_TICK_MAX;
         }
 
@@ -284,10 +388,11 @@ pub async fn run_local_proxy(cfg: LocalProxyConfig) -> anyhow::Result<()> {
                 &mut iface,
                 &mut sockets,
                 &mut conns,
+                &mut active_conns,
             );
         }
 
-        loop {
+        for _ in 0..UDP_RECV_BURST_MAX {
             match udp.try_recv(&mut udp_buf) {
                 Ok(n) => match tunn.decapsulate(None, &udp_buf[..n], &mut decap_buf) {
                     TunnResult::WriteToTunnelV4(plain, _)
@@ -295,7 +400,7 @@ pub async fn run_local_proxy(cfg: LocalProxyConfig) -> anyhow::Result<()> {
                         device.inbound.push_back(Vec::from(plain));
                     }
                     TunnResult::WriteToNetwork(out) => {
-                        let _ = udp.try_send(out);
+                        wg_pending_tx.push_back(out.to_vec());
                     }
                     _ => {}
                 },
@@ -306,17 +411,38 @@ pub async fn run_local_proxy(cfg: LocalProxyConfig) -> anyhow::Result<()> {
                 }
             }
         }
+        flush_udp_writes(udp.as_ref(), &mut wg_pending_tx);
 
         let _ = iface.poll(now, &mut device, &mut sockets);
 
         while let Some(plain) = device.outbound.pop_front() {
-            if let TunnResult::WriteToNetwork(out) = tunn.encapsulate(&plain, &mut enc_buf) {
-                let _ = udp.try_send(out);
+            queue_tunn_network_write(tunn.encapsulate(&plain, &mut enc_buf), &mut wg_pending_tx);
+        }
+        flush_udp_writes(udp.as_ref(), &mut wg_pending_tx);
+
+        if active_conns.is_empty()
+            || now_std.saturating_duration_since(last_full_scan) >= ACTIVE_CONN_FULL_SCAN_INTERVAL
+        {
+            for i in 0..conns.len() {
+                mark_conn_active(&mut conns, &mut active_conns, i);
             }
+            last_full_scan = now_std;
         }
 
         let mut remove: Vec<usize> = Vec::new();
-        for (i, entry) in conns.iter_mut().enumerate() {
+        let process_budget = active_conns.len().min(ACTIVE_CONN_BATCH_MAX);
+        for _ in 0..process_budget {
+            let Some(i) = active_conns.pop_front() else {
+                break;
+            };
+            if i >= conns.len() {
+                continue;
+            }
+            conns[i].active = false;
+
+            let mut requeue = false;
+            let mut remove_current = false;
+            let entry = &mut conns[i];
             let sock = sockets.get_mut::<TcpSocket>(entry.handle);
 
             if let Some(tx) = entry.connected_tx.take() {
@@ -324,44 +450,44 @@ pub async fn run_local_proxy(cfg: LocalProxyConfig) -> anyhow::Result<()> {
                     let _ = tx.send(Ok(()));
                 } else if sock.state() == smoltcp::socket::tcp::State::Closed {
                     let _ = tx.send(Err("connection refused".into()));
-                    remove.push(i);
-                    continue;
+                    remove_current = true;
                 } else {
                     entry.connected_tx = Some(tx);
                 }
             }
 
-            if sock.can_recv() && entry.pending_client_bytes < CLIENT_PENDING_MAX_BYTES {
+            if !remove_current && sock.can_recv() && entry.pending_client_bytes < CLIENT_PENDING_MAX_BYTES
+            {
                 let mut recv_buf = [0u8; STREAM_BUF];
                 if let Ok(n) = sock.recv_slice(&mut recv_buf) {
                     if n > 0 {
-                        let chunk = recv_buf[..n].to_vec();
+                        let chunk = Bytes::copy_from_slice(&recv_buf[..n]);
                         entry.pending_client_bytes += chunk.len();
                         entry.pending_to_client.push_back(chunk);
                     }
                 }
             }
 
-            while entry.pending_remote_bytes < REMOTE_PENDING_MAX_BYTES {
-                match entry.from_client_rx.try_recv() {
-                    Ok(data) => {
-                        entry.pending_remote_bytes += data.len();
-                        entry.pending_to_remote.push_back(data);
-                    }
-                    Err(mpsc::error::TryRecvError::Empty) => break,
-                    Err(mpsc::error::TryRecvError::Disconnected) => {
-                        sock.close();
-                        remove.push(i);
-                        break;
-                    }
-                }
+            while !remove_current && entry.pending_remote_bytes < REMOTE_PENDING_MAX_BYTES {
+                let Some(data) = entry.from_client_rx.try_pop() else {
+                    break;
+                };
+                entry.pending_remote_bytes += data.len();
+                entry.pending_to_remote.push_back(data);
+            }
+            if !remove_current
+                && entry.from_client_rx.is_closed()
+                && entry.pending_to_remote.is_empty()
+            {
+                sock.close();
+                remove_current = true;
             }
 
-            while sock.can_send() {
+            while !remove_current && sock.can_send() {
                 let Some(front) = entry.pending_to_remote.front_mut() else {
                     break;
                 };
-                match sock.send_slice(front) {
+                match sock.send_slice(front.as_ref()) {
                     Ok(sent) => {
                         if sent == front.len() {
                             let sent_len = front.len();
@@ -369,7 +495,8 @@ pub async fn run_local_proxy(cfg: LocalProxyConfig) -> anyhow::Result<()> {
                             entry.pending_remote_bytes =
                                 entry.pending_remote_bytes.saturating_sub(sent_len);
                         } else {
-                            front.drain(..sent);
+                            let remaining = front.slice(sent..);
+                            *front = remaining;
                             entry.pending_remote_bytes =
                                 entry.pending_remote_bytes.saturating_sub(sent);
                             break;
@@ -379,27 +506,50 @@ pub async fn run_local_proxy(cfg: LocalProxyConfig) -> anyhow::Result<()> {
                 }
             }
 
-            while let Some(front) = entry.pending_to_client.pop_front() {
+            while !remove_current {
+                let Some(front) = entry.pending_to_client.pop_front() else {
+                    break;
+                };
                 let front_len = front.len();
-                match entry.to_client_tx.try_send(front) {
+                match entry.to_client_tx.try_push(front) {
                     Ok(()) => {
                         entry.pending_client_bytes =
                             entry.pending_client_bytes.saturating_sub(front_len);
                     }
-                    Err(mpsc::error::TrySendError::Full(front)) => {
+                    Err(QueuePushError::Full(front)) => {
                         entry.pending_to_client.push_front(front);
                         break;
                     }
-                    Err(mpsc::error::TrySendError::Closed(_)) => {
+                    Err(QueuePushError::Closed) => {
                         sock.close();
-                        remove.push(i);
+                        remove_current = true;
                         break;
                     }
                 }
             }
 
-            if !sock.is_open() {
+            if !remove_current && entry.to_client_tx.is_closed() {
+                sock.close();
+                remove_current = true;
+            }
+
+            if remove_current || !sock.is_open() {
                 remove.push(i);
+                continue;
+            }
+
+            if entry.connected_tx.is_some()
+                || !entry.pending_to_remote.is_empty()
+                || !entry.pending_to_client.is_empty()
+                || !entry.from_client_rx.is_empty()
+                || sock.can_recv()
+                || sock.can_send()
+            {
+                requeue = true;
+            }
+
+            if requeue {
+                mark_conn_active(&mut conns, &mut active_conns, i);
             }
         }
 
@@ -408,14 +558,26 @@ pub async fn run_local_proxy(cfg: LocalProxyConfig) -> anyhow::Result<()> {
         for &i in remove.iter().rev() {
             if i < conns.len() {
                 let e = conns.remove(i);
+                e.to_client_tx.close();
+                e.from_client_rx.close();
                 sockets.remove(e.handle);
+            }
+        }
+        if !remove.is_empty() {
+            active_conns.clear();
+            for entry in &mut conns {
+                entry.active = false;
             }
         }
 
         let has_pending_work = !device.inbound.is_empty()
             || !device.outbound.is_empty()
+            || !wg_pending_tx.is_empty()
+            || !active_conns.is_empty()
             || conns.iter().any(|entry| {
-                !entry.pending_to_remote.is_empty() || !entry.pending_to_client.is_empty()
+                !entry.pending_to_remote.is_empty()
+                    || !entry.pending_to_client.is_empty()
+                    || !entry.from_client_rx.is_empty()
             });
         if has_pending_work {
             tokio::task::yield_now().await;
@@ -448,12 +610,46 @@ pub async fn run_local_proxy(cfg: LocalProxyConfig) -> anyhow::Result<()> {
                         &mut iface,
                         &mut sockets,
                         &mut conns,
+                        &mut active_conns,
                     );
                 }
             }
+            _ = loop_notify.notified() => {}
             _ = tokio::time::sleep(wait_for) => {}
         }
     }
+}
+
+fn queue_tunn_network_write(result: TunnResult<'_>, wg_pending_tx: &mut VecDeque<Vec<u8>>) {
+    if let TunnResult::WriteToNetwork(out) = result {
+        wg_pending_tx.push_back(out.to_vec());
+    }
+}
+
+fn flush_udp_writes(udp: &UdpSocket, wg_pending_tx: &mut VecDeque<Vec<u8>>) {
+    for _ in 0..UDP_SEND_BURST_MAX {
+        let Some(front) = wg_pending_tx.front() else {
+            break;
+        };
+        match udp.try_send(front) {
+            Ok(_) => {
+                let _ = wg_pending_tx.pop_front();
+            }
+            Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
+            Err(e) => {
+                warn!(error = ?e.to_string(), "udp_send_error");
+                let _ = wg_pending_tx.pop_front();
+            }
+        }
+    }
+}
+
+fn mark_conn_active(conns: &mut [ConnEntry], active_conns: &mut VecDeque<usize>, idx: usize) {
+    if idx >= conns.len() || conns[idx].active {
+        return;
+    }
+    conns[idx].active = true;
+    active_conns.push_back(idx);
 }
 
 fn add_virtual_connection(
@@ -463,6 +659,7 @@ fn add_virtual_connection(
     iface: &mut Interface,
     sockets: &mut SocketSet<'_>,
     conns: &mut Vec<ConnEntry>,
+    active_conns: &mut VecDeque<usize>,
 ) {
     let local_port = *next_port;
     *next_port = if *next_port >= LOCAL_PORT_END {
@@ -492,7 +689,10 @@ fn add_virtual_connection(
                 pending_to_client: VecDeque::new(),
                 pending_remote_bytes: 0,
                 pending_client_bytes: 0,
+                active: false,
             });
+            let new_idx = conns.len() - 1;
+            mark_conn_active(conns, active_conns, new_idx);
         }
         Err(e) => {
             let _ = req.connected_tx.send(Err(format!("connect: {}", e)));
@@ -505,6 +705,7 @@ fn add_virtual_connection(
 async fn socks5_serve(
     mut stream: TcpStream,
     conn_req_tx: mpsc::Sender<ConnRequest>,
+    loop_notify: Arc<Notify>,
 ) -> anyhow::Result<()> {
     let mut buf = [0u8; 2];
     stream.read_exact(&mut buf).await?;
@@ -525,16 +726,16 @@ async fn socks5_serve(
 
     let (target_ip, target_port) = read_socks5_addr(&mut stream, hdr[3]).await?;
 
-    let (to_client_tx, mut to_client_rx) = mpsc::channel::<Vec<u8>>(CLIENT_CHANNEL_CAP);
-    let (from_client_tx, from_client_rx) = mpsc::channel::<Vec<u8>>(CLIENT_CHANNEL_CAP);
+    let to_client_tx = Arc::new(ByteQueue::new(CLIENT_CHANNEL_CAP, loop_notify.clone()));
+    let from_client_rx = Arc::new(ByteQueue::new(CLIENT_CHANNEL_CAP, loop_notify));
     let (connected_tx, connected_rx) = oneshot::channel();
 
     conn_req_tx
         .send(ConnRequest {
             target_ip,
             target_port,
-            to_client_tx,
-            from_client_rx,
+            to_client_tx: to_client_tx.clone(),
+            from_client_rx: from_client_rx.clone(),
             connected_tx,
         })
         .await
@@ -555,7 +756,7 @@ async fn socks5_serve(
         Err(_) => anyhow::bail!("proxy tunnel dropped response"),
     }
 
-    bridge(&mut stream, from_client_tx, &mut to_client_rx).await;
+    bridge(&mut stream, from_client_rx, to_client_tx).await;
     Ok(())
 }
 
@@ -596,6 +797,7 @@ async fn read_socks5_addr(stream: &mut TcpStream, atyp: u8) -> anyhow::Result<(I
 async fn http_connect_serve(
     mut stream: TcpStream,
     conn_req_tx: mpsc::Sender<ConnRequest>,
+    loop_notify: Arc<Notify>,
 ) -> anyhow::Result<()> {
     let request_line = read_crlf_line(&mut stream).await?;
     let mut headers: Vec<String> = Vec::new();
@@ -620,16 +822,16 @@ async fn http_connect_serve(
         let port: u16 = port_str.parse()?;
         let sa = resolve_ipv4_preferred(host, port).await?;
 
-        let (to_client_tx, mut to_client_rx) = mpsc::channel::<Vec<u8>>(CLIENT_CHANNEL_CAP);
-        let (from_client_tx, from_client_rx) = mpsc::channel::<Vec<u8>>(CLIENT_CHANNEL_CAP);
+        let to_client_tx = Arc::new(ByteQueue::new(CLIENT_CHANNEL_CAP, loop_notify.clone()));
+        let from_client_rx = Arc::new(ByteQueue::new(CLIENT_CHANNEL_CAP, loop_notify.clone()));
         let (connected_tx, connected_rx) = oneshot::channel();
 
         conn_req_tx
             .send(ConnRequest {
                 target_ip: ip_to_smoltcp(sa.ip()),
                 target_port: sa.port(),
-                to_client_tx,
-                from_client_rx,
+                to_client_tx: to_client_tx.clone(),
+                from_client_rx: from_client_rx.clone(),
                 connected_tx,
             })
             .await
@@ -650,7 +852,7 @@ async fn http_connect_serve(
             Err(_) => anyhow::bail!("proxy tunnel dropped response"),
         }
 
-        bridge(&mut stream, from_client_tx, &mut to_client_rx).await;
+        bridge(&mut stream, from_client_rx, to_client_tx).await;
     } else {
         // Plain HTTP: GET http://host/path HTTP/1.x
         let url = parts.get(1).copied().unwrap_or("/");
@@ -675,16 +877,16 @@ async fn http_connect_serve(
 
         let sa = resolve_ipv4_preferred(&host, port).await?;
 
-        let (to_client_tx, mut to_client_rx) = mpsc::channel::<Vec<u8>>(CLIENT_CHANNEL_CAP);
-        let (from_client_tx, from_client_rx) = mpsc::channel::<Vec<u8>>(CLIENT_CHANNEL_CAP);
+        let to_client_tx = Arc::new(ByteQueue::new(CLIENT_CHANNEL_CAP, loop_notify.clone()));
+        let from_client_rx = Arc::new(ByteQueue::new(CLIENT_CHANNEL_CAP, loop_notify.clone()));
         let (connected_tx, connected_rx) = oneshot::channel();
 
         conn_req_tx
             .send(ConnRequest {
                 target_ip: ip_to_smoltcp(sa.ip()),
                 target_port: sa.port(),
-                to_client_tx,
-                from_client_rx,
+                to_client_tx: to_client_tx.clone(),
+                from_client_rx: from_client_rx.clone(),
                 connected_tx,
             })
             .await
@@ -708,12 +910,12 @@ async fn http_connect_serve(
         }
         req.push_str("\r\n");
 
-        from_client_tx
-            .send(req.into_bytes())
+        from_client_rx
+            .push(Bytes::from(req.into_bytes()))
             .await
             .map_err(|_| anyhow!("virtual channel closed"))?;
 
-        bridge(&mut stream, from_client_tx, &mut to_client_rx).await;
+        bridge(&mut stream, from_client_rx, to_client_tx).await;
     }
 
     Ok(())
@@ -750,28 +952,29 @@ async fn read_crlf_line(stream: &mut TcpStream) -> anyhow::Result<String> {
 
 async fn bridge(
     stream: &mut TcpStream,
-    from_client_tx: mpsc::Sender<Vec<u8>>,
-    to_client_rx: &mut mpsc::Receiver<Vec<u8>>,
+    from_client_tx: Arc<ByteQueue>,
+    to_client_rx: Arc<ByteQueue>,
 ) {
     let (mut reader, mut writer) = stream.split();
-    let mut buf = vec![0u8; 16384];
+    let mut read_buf = BytesMut::with_capacity(STREAM_BUF);
     loop {
         tokio::select! {
-            result = reader.read(&mut buf) => {
+            result = reader.read_buf(&mut read_buf) => {
                 match result {
                     Ok(0) | Err(_) => break,
-                    Ok(n) => {
-                        if from_client_tx.send(buf[..n].to_vec()).await.is_err() {
+                    Ok(_) => {
+                        let chunk = read_buf.split().freeze();
+                        if from_client_tx.push(chunk).await.is_err() {
                             break;
                         }
                     }
                 }
             }
-            data = to_client_rx.recv() => {
+            data = to_client_rx.pop() => {
                 match data {
                     None => break,
                     Some(d) => {
-                        if writer.write_all(&d).await.is_err() {
+                        if writer.write_all(d.as_ref()).await.is_err() {
                             break;
                         }
                     }
@@ -779,6 +982,8 @@ async fn bridge(
             }
         }
     }
+    from_client_tx.close();
+    to_client_rx.close();
 }
 
 /// Resolve `host` to a `SocketAddr`, preferring IPv4.
