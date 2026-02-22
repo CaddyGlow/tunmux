@@ -12,6 +12,8 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          submodules: recursive
 
       - name: Install Java
         uses: actions/setup-java@v4
@@ -32,7 +34,8 @@ jobs:
 
       - name: Set up Gradle cache
         uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.9'
 
       - name: Assemble Android debug app
-        working-directory: android
-        run: ./gradlew --no-daemon :app:assembleDebug
+        run: gradle --no-daemon -p android :app:assembleDebug
