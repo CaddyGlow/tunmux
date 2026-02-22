@@ -116,6 +116,10 @@ impl ByteQueue {
         self.queue.is_empty()
     }
 
+    fn is_full(&self) -> bool {
+        self.queue.is_full()
+    }
+
     fn try_push(&self, chunk: Bytes) -> Result<(), QueuePushError> {
         if self.is_closed() {
             return Err(QueuePushError::Closed);
@@ -150,6 +154,7 @@ impl ByteQueue {
         let out = self.queue.pop();
         if out.is_some() {
             self.has_space_notify.notify_one();
+            self.loop_notify.notify_one();
         }
         out
     }
@@ -246,6 +251,15 @@ struct ConnEntry {
     pending_remote_bytes: usize,
     pending_client_bytes: usize,
     active: bool,
+}
+
+fn conn_has_runnable_work(entry: &ConnEntry, sock: &TcpSocket<'_>) -> bool {
+    entry.connected_tx.is_some()
+        || (!entry.from_client_rx.is_empty()
+            && entry.pending_remote_bytes < REMOTE_PENDING_MAX_BYTES)
+        || (!entry.pending_to_remote.is_empty() && sock.can_send())
+        || (!entry.pending_to_client.is_empty() && !entry.to_client_tx.is_full())
+        || (sock.can_recv() && entry.pending_client_bytes < CLIENT_PENDING_MAX_BYTES)
 }
 
 struct DataplanePerf {
@@ -609,6 +623,7 @@ pub async fn run_local_proxy(cfg: LocalProxyConfig) -> anyhow::Result<()> {
         if active_conns.len() < ACTIVE_CONN_TOPUP_TARGET {
             top_up_active_conns(
                 &mut conns,
+                &sockets,
                 &mut active_conns,
                 &mut scan_cursor,
                 ACTIVE_CONN_SWEEP_BATCH_MAX,
@@ -727,12 +742,7 @@ pub async fn run_local_proxy(cfg: LocalProxyConfig) -> anyhow::Result<()> {
                 continue;
             }
 
-            if entry.connected_tx.is_some()
-                || !entry.pending_to_remote.is_empty()
-                || !entry.pending_to_client.is_empty()
-                || !entry.from_client_rx.is_empty()
-                || sock.can_recv()
-            {
+            if conn_has_runnable_work(entry, sock) {
                 requeue = true;
             }
 
@@ -764,6 +774,7 @@ pub async fn run_local_proxy(cfg: LocalProxyConfig) -> anyhow::Result<()> {
 
         let has_pending_work = !device.inbound.is_empty()
             || !device.outbound.is_empty()
+            || !active_conns.is_empty()
             || conns.iter().any(|entry| entry.connected_tx.is_some());
         perf.observe_loop(active_conns.len(), wg_pending_tx.len());
         perf.maybe_log_and_reset(conns.len());
@@ -876,6 +887,7 @@ fn mark_conn_active(conns: &mut [ConnEntry], active_conns: &mut VecDeque<usize>,
 
 fn top_up_active_conns(
     conns: &mut [ConnEntry],
+    sockets: &SocketSet<'_>,
     active_conns: &mut VecDeque<usize>,
     scan_cursor: &mut usize,
     sweep_batch_max: usize,
@@ -896,7 +908,9 @@ fn top_up_active_conns(
         if *scan_cursor >= conns.len() {
             *scan_cursor = 0;
         }
-        mark_conn_active(conns, active_conns, idx);
+        if conn_has_runnable_work(&conns[idx], sockets.get::<TcpSocket>(conns[idx].handle)) {
+            mark_conn_active(conns, active_conns, idx);
+        }
         scanned += 1;
     }
 }
