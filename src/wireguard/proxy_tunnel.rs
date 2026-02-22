@@ -476,6 +476,9 @@ pub async fn run_local_proxy(cfg: LocalProxyConfig) -> anyhow::Result<()> {
     );
     info!(
         tcp_socket_buf = TCP_SOCKET_BUF,
+        stream_buf = STREAM_BUF,
+        remote_pending_max_bytes = REMOTE_PENDING_MAX_BYTES,
+        client_pending_max_bytes = CLIENT_PENDING_MAX_BYTES,
         udp_recv_burst_max = UDP_RECV_BURST_MAX,
         udp_send_burst_max = UDP_SEND_BURST_MAX,
         "local_proxy_tuning_enabled"
@@ -495,6 +498,9 @@ pub async fn run_local_proxy(cfg: LocalProxyConfig) -> anyhow::Result<()> {
             match socks_listener.accept().await {
                 Ok((stream, peer)) => {
                     debug!(peer = ?peer, "socks5_accepted");
+                    if let Err(e) = stream.set_nodelay(true) {
+                        debug!(peer = ?peer, error = ?e.to_string(), "socks5_set_nodelay_failed");
+                    }
                     let tx = tx.clone();
                     let notify = notify.clone();
                     tokio::spawn(async move {
@@ -520,6 +526,9 @@ pub async fn run_local_proxy(cfg: LocalProxyConfig) -> anyhow::Result<()> {
             match http_listener.accept().await {
                 Ok((stream, peer)) => {
                     debug!(peer = ?peer, "http_accepted");
+                    if let Err(e) = stream.set_nodelay(true) {
+                        debug!(peer = ?peer, error = ?e.to_string(), "http_set_nodelay_failed");
+                    }
                     let tx = tx.clone();
                     let notify = notify.clone();
                     tokio::spawn(async move {
@@ -662,13 +671,16 @@ pub async fn run_local_proxy(cfg: LocalProxyConfig) -> anyhow::Result<()> {
                 && sock.can_recv()
                 && entry.pending_client_bytes < CLIENT_PENDING_MAX_BYTES
             {
-                let mut recv_buf = [0u8; STREAM_BUF];
-                if let Ok(n) = sock.recv_slice(&mut recv_buf) {
-                    if n > 0 {
-                        let chunk = Bytes::copy_from_slice(&recv_buf[..n]);
-                        entry.pending_client_bytes += chunk.len();
-                        entry.pending_to_client.push_back(chunk);
+                if let Ok(Some(chunk)) = sock.recv(|recv_buf| {
+                    let n = recv_buf.len().min(STREAM_BUF);
+                    if n == 0 {
+                        (0, None)
+                    } else {
+                        (n, Some(Bytes::copy_from_slice(&recv_buf[..n])))
                     }
+                }) {
+                    entry.pending_client_bytes += chunk.len();
+                    entry.pending_to_client.push_back(chunk);
                 }
             }
 
@@ -935,6 +947,8 @@ fn add_virtual_connection(
         TcpSocketBuffer::new(vec![0u8; TCP_SOCKET_BUF]),
         TcpSocketBuffer::new(vec![0u8; TCP_SOCKET_BUF]),
     );
+    sock.set_nagle_enabled(false);
+    sock.set_ack_delay(None);
     let remote = IpEndpoint::new(req.target_ip, req.target_port);
     let local = IpListenEndpoint {
         addr: Some(virtual_ip),
