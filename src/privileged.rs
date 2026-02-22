@@ -853,9 +853,17 @@ fn run_wg_show_uapi(interface: &str, socket_path: &std::path::Path) -> Result<St
     format_wg_show(&raw, interface)
 }
 
+#[cfg(target_os = "linux")]
 fn run_wg_show_kernel(interface: &str) -> Result<String> {
     let uapi_text = crate::wireguard::netlink::wg_get_uapi(interface)?;
     format_wg_show(&uapi_text, interface)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn run_wg_show_kernel(_interface: &str) -> Result<String> {
+    Err(AppError::WireGuard(
+        "kernel wireguard backend is only supported on linux".to_string(),
+    ))
 }
 
 fn format_wg_show(raw: &str, interface: &str) -> Result<String> {
@@ -1061,6 +1069,7 @@ fn run_gotatun_down(interface: &str) -> Result<()> {
     Ok(())
 }
 
+#[cfg(target_os = "linux")]
 fn wg_set(
     interface: &str,
     private_key: &str,
@@ -1077,8 +1086,29 @@ fn wg_set(
     )
 }
 
+#[cfg(not(target_os = "linux"))]
+fn wg_set(
+    _interface: &str,
+    _private_key: &str,
+    _peer_public_key: &str,
+    _endpoint: &str,
+    _allowed_ips: &str,
+) -> Result<()> {
+    Err(AppError::WireGuard(
+        "kernel wireguard backend is only supported on linux".to_string(),
+    ))
+}
+
+#[cfg(target_os = "linux")]
 fn set_preshared_key(interface: &str, peer_public_key: &str, psk: &str) -> Result<()> {
     crate::wireguard::netlink::wg_set_psk(interface, peer_public_key, psk)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn set_preshared_key(_interface: &str, _peer_public_key: &str, _psk: &str) -> Result<()> {
+    Err(AppError::WireGuard(
+        "kernel wireguard backend is only supported on linux".to_string(),
+    ))
 }
 
 fn spawn_proxy_daemon(
