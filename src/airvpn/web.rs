@@ -944,6 +944,7 @@ impl AirVpnWebApi {
         })
     }
 
+    #[allow(dead_code)]
     #[must_use]
     pub fn api_key(&self) -> &str {
         &self.api_key
