@@ -30,7 +30,6 @@ const STREAM_BUF: usize = 65536;
 const LOCAL_PORT_START: u16 = 40000;
 const LOCAL_PORT_END: u16 = 65000;
 const WG_TIMER_TICK_MAX: Duration = Duration::from_millis(100);
-const ACTIVE_CONN_POLL_MAX: Duration = Duration::from_micros(100);
 const CLIENT_CHANNEL_CAP: usize = 1024;
 const REMOTE_PENDING_MAX_BYTES: usize = 2 * 1024 * 1024;
 const CLIENT_PENDING_MAX_BYTES: usize = 2 * 1024 * 1024;
@@ -265,6 +264,20 @@ struct DataplanePerf {
     conn_requeues: u64,
     active_q_peak: usize,
     udp_pending_peak: usize,
+    idle_wakes: u64,
+    idle_wait_ns: u64,
+    idle_wake_udp: u64,
+    idle_wake_conn_req: u64,
+    idle_wake_loop_notify: u64,
+    idle_wake_timeout: u64,
+}
+
+#[derive(Clone, Copy)]
+enum IdleWakeReason {
+    Udp,
+    ConnReq,
+    LoopNotify,
+    Timeout,
 }
 
 impl DataplanePerf {
@@ -285,6 +298,12 @@ impl DataplanePerf {
             conn_requeues: 0,
             active_q_peak: 0,
             udp_pending_peak: 0,
+            idle_wakes: 0,
+            idle_wait_ns: 0,
+            idle_wake_udp: 0,
+            idle_wake_conn_req: 0,
+            idle_wake_loop_notify: 0,
+            idle_wake_timeout: 0,
         }
     }
 
@@ -302,6 +321,12 @@ impl DataplanePerf {
             return;
         }
         let elapsed = self.last_log.elapsed();
+        let elapsed_s = elapsed.as_secs_f64();
+        let idle_wake_hz = if elapsed_s > 0.0 {
+            self.idle_wakes as f64 / elapsed_s
+        } else {
+            0.0
+        };
         info!(
             interval_ms = elapsed.as_millis() as u64,
             conns = conns,
@@ -318,6 +343,13 @@ impl DataplanePerf {
             conn_requeues = self.conn_requeues,
             active_q_peak = self.active_q_peak,
             udp_pending_peak = self.udp_pending_peak,
+            idle_wakes = self.idle_wakes,
+            idle_wake_hz = idle_wake_hz,
+            idle_wait_ms = self.idle_wait_ns as f64 / 1_000_000.0,
+            idle_wake_udp = self.idle_wake_udp,
+            idle_wake_conn_req = self.idle_wake_conn_req,
+            idle_wake_loop_notify = self.idle_wake_loop_notify,
+            idle_wake_timeout = self.idle_wake_timeout,
             "local_proxy_perf"
         );
 
@@ -335,6 +367,36 @@ impl DataplanePerf {
         self.conn_requeues = 0;
         self.active_q_peak = 0;
         self.udp_pending_peak = 0;
+        self.idle_wakes = 0;
+        self.idle_wait_ns = 0;
+        self.idle_wake_udp = 0;
+        self.idle_wake_conn_req = 0;
+        self.idle_wake_loop_notify = 0;
+        self.idle_wake_timeout = 0;
+    }
+
+    fn observe_idle_wake(&mut self, wait_time: Duration, reason: IdleWakeReason) {
+        if !self.enabled {
+            return;
+        }
+        self.idle_wakes = self.idle_wakes.saturating_add(1);
+        self.idle_wait_ns = self
+            .idle_wait_ns
+            .saturating_add(wait_time.as_nanos() as u64);
+        match reason {
+            IdleWakeReason::Udp => {
+                self.idle_wake_udp = self.idle_wake_udp.saturating_add(1);
+            }
+            IdleWakeReason::ConnReq => {
+                self.idle_wake_conn_req = self.idle_wake_conn_req.saturating_add(1);
+            }
+            IdleWakeReason::LoopNotify => {
+                self.idle_wake_loop_notify = self.idle_wake_loop_notify.saturating_add(1);
+            }
+            IdleWakeReason::Timeout => {
+                self.idle_wake_timeout = self.idle_wake_timeout.saturating_add(1);
+            }
+        }
     }
 }
 
@@ -400,7 +462,6 @@ pub async fn run_local_proxy(cfg: LocalProxyConfig) -> anyhow::Result<()> {
     );
     info!(
         tcp_socket_buf = TCP_SOCKET_BUF,
-        active_conn_poll_us = ACTIVE_CONN_POLL_MAX.as_micros() as u64,
         udp_recv_burst_max = UDP_RECV_BURST_MAX,
         udp_send_burst_max = UDP_SEND_BURST_MAX,
         "local_proxy_tuning_enabled"
@@ -671,7 +732,6 @@ pub async fn run_local_proxy(cfg: LocalProxyConfig) -> anyhow::Result<()> {
                 || !entry.pending_to_client.is_empty()
                 || !entry.from_client_rx.is_empty()
                 || sock.can_recv()
-                || sock.can_send()
             {
                 requeue = true;
             }
@@ -704,13 +764,7 @@ pub async fn run_local_proxy(cfg: LocalProxyConfig) -> anyhow::Result<()> {
 
         let has_pending_work = !device.inbound.is_empty()
             || !device.outbound.is_empty()
-            || !wg_pending_tx.is_empty()
-            || !active_conns.is_empty()
-            || conns.iter().any(|entry| {
-                !entry.pending_to_remote.is_empty()
-                    || !entry.pending_to_client.is_empty()
-                    || !entry.from_client_rx.is_empty()
-            });
+            || conns.iter().any(|entry| entry.connected_tx.is_some());
         perf.observe_loop(active_conns.len(), wg_pending_tx.len());
         perf.maybe_log_and_reset(conns.len());
         if has_pending_work {
@@ -723,18 +777,13 @@ pub async fn run_local_proxy(cfg: LocalProxyConfig) -> anyhow::Result<()> {
             .map(|d| Duration::from_micros(d.total_micros()))
             .unwrap_or(WG_TIMER_TICK_MAX);
 
-        let activity_cap = if conns.is_empty() {
-            WG_TIMER_TICK_MAX
-        } else {
-            ACTIVE_CONN_POLL_MAX
-        };
-        let delay = delay.min(activity_cap);
-
         let timer_wait = wg_timer_deadline.saturating_duration_since(Instant::now());
         let wait_for = delay.min(timer_wait);
 
-        tokio::select! {
-            _ = udp.readable() => {}
+        let wait_started = Instant::now();
+        let wake_reason = tokio::select! {
+            _ = udp.readable() => IdleWakeReason::Udp,
+            _ = udp.writable(), if !wg_pending_tx.is_empty() => IdleWakeReason::Udp,
             maybe_req = conn_req_rx.recv() => {
                 if let Some(req) = maybe_req {
                     add_virtual_connection(
@@ -747,10 +796,12 @@ pub async fn run_local_proxy(cfg: LocalProxyConfig) -> anyhow::Result<()> {
                         &mut active_conns,
                     );
                 }
+                IdleWakeReason::ConnReq
             }
-            _ = loop_notify.notified() => {}
-            _ = tokio::time::sleep(wait_for) => {}
-        }
+            _ = loop_notify.notified() => IdleWakeReason::LoopNotify,
+            _ = tokio::time::sleep(wait_for) => IdleWakeReason::Timeout,
+        };
+        perf.observe_idle_wake(wait_started.elapsed(), wake_reason);
     }
 }
 
