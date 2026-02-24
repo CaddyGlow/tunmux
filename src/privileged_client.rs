@@ -266,6 +266,22 @@ impl PrivilegedClient {
         })
     }
 
+    pub fn host_resolved_set_dns(&self, interface: &str, dns_servers: &[&str]) -> Result<()> {
+        self.send_unit(PrivilegedRequest::HostResolvedSetDns {
+            interface: interface.to_string(),
+            dns_servers: dns_servers
+                .iter()
+                .map(|value| (*value).to_string())
+                .collect(),
+        })
+    }
+
+    pub fn host_resolved_revert_dns(&self, interface: &str) -> Result<()> {
+        self.send_unit(PrivilegedRequest::HostResolvedRevertDns {
+            interface: interface.to_string(),
+        })
+    }
+
     pub fn wireguard_set(
         &self,
         interface: &str,
@@ -1190,6 +1206,8 @@ fn request_kind(request: &PrivilegedRequest) -> &'static str {
         PrivilegedRequest::HostIpLinkSetUp { .. } => "HostIpLinkSetUp",
         PrivilegedRequest::HostIpRouteAdd { .. } => "HostIpRouteAdd",
         PrivilegedRequest::HostIpRouteDel { .. } => "HostIpRouteDel",
+        PrivilegedRequest::HostResolvedSetDns { .. } => "HostResolvedSetDns",
+        PrivilegedRequest::HostResolvedRevertDns { .. } => "HostResolvedRevertDns",
         PrivilegedRequest::WireguardSet { .. } => "WireguardSet",
         PrivilegedRequest::WireguardSetPsk { .. } => "WireguardSetPsk",
         PrivilegedRequest::WgQuickRun { .. } => "WgQuickRun",

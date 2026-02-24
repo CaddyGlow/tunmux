@@ -109,7 +109,7 @@ Top-level commands:
 tunmux status
 tunmux connect <provider> [provider connect flags]
 tunmux disconnect [instance] [--provider <provider>] [--all]
-tunmux hook run <connectivity|external-ip>
+tunmux hook run <connectivity|external-ip|dns-detection>
 tunmux hook debug [instance] [--provider <provider>] [--event ifup|ifdown]
 tunmux proton <...>
 tunmux airvpn <...>
@@ -356,11 +356,19 @@ Hook behavior:
 - Built-ins are opt-in via hook entries:
   - `builtin:connectivity`: ping IPv4 (`1.1.1.1`) and IPv6 (`2606:4700:4700::1111`)
   - `builtin:external-ip`: fetch external IP via `https://ipinfo.io` and `https://v6.ipinfo.io`
+  - `builtin:dns-detection`: query `https://<random>-<n>.ipleak.net/dnsdetection/`
+    with a 40-char random host label and incrementing probe number (`-1` to `-10`),
+    then run reverse DNS lookup for each recovered resolver IP
 - Hook commands run with env vars such as `TUNMUX_HOOK_EVENT`, `TUNMUX_PROVIDER`,
   `TUNMUX_INSTANCE`, `TUNMUX_BACKEND`, `TUNMUX_INTERFACE`, `TUNMUX_SERVER`,
   `TUNMUX_ENDPOINT`, plus optional proxy fields (`TUNMUX_NAMESPACE`, `TUNMUX_SOCKS_PORT`,
   `TUNMUX_HTTP_PORT`, `TUNMUX_PROXY_PID`).
-- Manual builtin checks: `tunmux hook run connectivity` or `tunmux hook run external-ip`.
+- When proxy ports are present, hook commands also receive standard proxy vars:
+  `HTTP_PROXY`/`HTTPS_PROXY` and `ALL_PROXY` (plus lowercase variants).
+- Builtin HTTP checks (`external-ip`, `dns-detection`, and proxy-mode `connectivity`) use
+  the active connection proxy automatically when available.
+- Manual builtin checks: `tunmux hook run connectivity`, `tunmux hook run external-ip`,
+  or `tunmux hook run dns-detection`.
 - Debug helper: `tunmux hook debug <instance>` prints the exact env payload used for hooks
   (`--event ifup|ifdown`, default `ifup`).
 

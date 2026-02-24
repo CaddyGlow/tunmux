@@ -182,7 +182,21 @@ fn cmd_hook_run(builtin: HookBuiltinArg) -> anyhow::Result<()> {
     let entry = match builtin {
         HookBuiltinArg::Connectivity => "builtin:connectivity",
         HookBuiltinArg::ExternalIp => "builtin:external-ip",
+        HookBuiltinArg::DnsDetection => "builtin:dns-detection",
     };
+
+    let connections = ConnectionState::load_all()?;
+    if connections.len() == 1 {
+        return shared::hooks::run_builtin_for_state(entry, &connections[0]);
+    }
+
+    if connections.len() > 1 {
+        tracing::warn!(
+            active_connections = connections.len(),
+            "hook_run_multiple_connections_no_proxy_context"
+        );
+    }
+
     shared::hooks::run_builtin(entry)
 }
 

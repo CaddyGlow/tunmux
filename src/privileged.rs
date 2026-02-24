@@ -360,6 +360,8 @@ fn describe_request(request: &PrivilegedRequest) -> &'static str {
         PrivilegedRequest::HostIpLinkSetUp { .. } => "HostIpLinkSetUp",
         PrivilegedRequest::HostIpRouteAdd { .. } => "HostIpRouteAdd",
         PrivilegedRequest::HostIpRouteDel { .. } => "HostIpRouteDel",
+        PrivilegedRequest::HostResolvedSetDns { .. } => "HostResolvedSetDns",
+        PrivilegedRequest::HostResolvedRevertDns { .. } => "HostResolvedRevertDns",
         PrivilegedRequest::WireguardSet { .. } => "WireguardSet",
         PrivilegedRequest::WireguardSetPsk { .. } => "WireguardSetPsk",
         PrivilegedRequest::WgQuickRun { .. } => "WgQuickRun",
@@ -469,6 +471,15 @@ fn dispatch(request: PrivilegedRequest, control_state: &mut ControlState) -> Pri
             via,
             dev,
         } => execute_route("del", destination.as_str(), via.as_deref(), dev.as_str()),
+
+        PrivilegedRequest::HostResolvedSetDns {
+            interface,
+            dns_servers,
+        } => execute_unit(run_resolved_set_dns(interface.as_str(), &dns_servers)),
+
+        PrivilegedRequest::HostResolvedRevertDns { interface } => {
+            execute_unit(run_resolved_revert_dns(interface.as_str()))
+        }
 
         PrivilegedRequest::WireguardSet {
             interface,
@@ -762,6 +773,19 @@ fn run(args: &[&str]) -> Result<()> {
         )));
     }
     Ok(())
+}
+
+fn run_resolved_set_dns(interface: &str, dns_servers: &[String]) -> Result<()> {
+    let mut dns_command = vec!["resolvectl", "dns", interface];
+    dns_command.extend(dns_servers.iter().map(String::as_str));
+    run(&dns_command)?;
+    run(&["resolvectl", "domain", interface, "~."])?;
+    run(&["resolvectl", "default-route", interface, "yes"])?;
+    Ok(())
+}
+
+fn run_resolved_revert_dns(interface: &str) -> Result<()> {
+    run(&["resolvectl", "revert", interface])
 }
 
 fn run_wg_quick_up(

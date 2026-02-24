@@ -237,6 +237,7 @@ pub fn up_in_netns(
 pub fn down(state: &ConnectionState) -> Result<()> {
     let iface = &state.interface_name;
     let client = PrivilegedClient::new();
+    let manage_resolv_conf = should_manage_global_resolv_conf();
 
     info!(
         interface = iface,
@@ -244,6 +245,17 @@ pub fn down(state: &ConnectionState) -> Result<()> {
         server = state.server_display_name,
         "kernel_tunnel_teardown_start"
     );
+
+    if !manage_resolv_conf {
+        log_kernel_teardown_command(iface, &format!("resolvectl revert {}", iface));
+        if let Err(error) = client.host_resolved_revert_dns(iface) {
+            warn!(
+                interface = iface,
+                error = %error,
+                "kernel_resolved_revert_failed"
+            );
+        }
+    }
 
     log_kernel_teardown_command(iface, &format!("ip link delete dev {}", iface));
     let _ = client.interface_delete(iface);
@@ -265,7 +277,7 @@ pub fn down(state: &ConnectionState) -> Result<()> {
     }
 
     if let Some(ref original) = state.original_resolv_conf {
-        if should_manage_global_resolv_conf() {
+        if manage_resolv_conf {
             log_kernel_teardown_command(iface, "write /etc/resolv.conf");
             client.write_file("/etc/resolv.conf", original.as_bytes(), 0o644)?;
         }
@@ -412,9 +424,24 @@ fn bring_up(
             "kernel_resolv_conf_updated"
         );
     } else {
+        let dns_list = params.dns_servers.join(" ");
+        log_kernel_setup_command(
+            interface_name,
+            &format!("resolvectl dns {} {}", interface_name, dns_list),
+        );
+        log_kernel_setup_command(
+            interface_name,
+            &format!("resolvectl domain {} ~.", interface_name),
+        );
+        log_kernel_setup_command(
+            interface_name,
+            &format!("resolvectl default-route {} yes", interface_name),
+        );
+        client.host_resolved_set_dns(interface_name, params.dns_servers)?;
         info!(
             interface = interface_name,
-            "kernel_resolv_conf_skipped_systemd_resolved_managed"
+            dns_servers = params.dns_servers.len(),
+            "kernel_resolved_link_dns_updated"
         );
     }
 

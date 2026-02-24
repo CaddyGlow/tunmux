@@ -67,6 +67,13 @@ pub enum PrivilegedRequest {
         via: Option<String>,
         dev: String,
     },
+    HostResolvedSetDns {
+        interface: String,
+        dns_servers: Vec<String>,
+    },
+    HostResolvedRevertDns {
+        interface: String,
+    },
 
     WireguardSet {
         interface: String,
@@ -190,6 +197,20 @@ impl PrivilegedRequest {
                 }
                 Ok(())
             }
+            Self::HostResolvedSetDns {
+                interface,
+                dns_servers,
+            } => {
+                validate_interface_name(interface)?;
+                if dns_servers.is_empty() {
+                    return Err("dns_servers cannot be empty".into());
+                }
+                for dns in dns_servers {
+                    validate_ipv4_like(dns)?;
+                }
+                Ok(())
+            }
+            Self::HostResolvedRevertDns { interface } => validate_interface_name(interface),
             Self::WireguardSet {
                 interface,
                 private_key,
@@ -546,7 +567,9 @@ fn validate_no_parent_component(path: &str) -> Result<(), String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{validate_host_endpoint, validate_interface_name, validate_provider};
+    use super::{
+        validate_host_endpoint, validate_interface_name, validate_provider, PrivilegedRequest,
+    };
 
     #[test]
     fn direct_provider_interfaces_are_allowed() {
@@ -579,5 +602,20 @@ mod tests {
     #[test]
     fn bracketed_ipv6_endpoint_is_allowed() {
         assert!(validate_host_endpoint("[2001:db8::1]:51820").is_ok());
+    }
+
+    #[test]
+    fn resolved_dns_request_validates_ip_entries() {
+        let ok = PrivilegedRequest::HostResolvedSetDns {
+            interface: "proton0".to_string(),
+            dns_servers: vec!["10.2.0.1".to_string(), "2606:4700:4700::1111".to_string()],
+        };
+        assert!(ok.validate().is_ok());
+
+        let bad = PrivilegedRequest::HostResolvedSetDns {
+            interface: "proton0".to_string(),
+            dns_servers: vec!["not-an-ip".to_string()],
+        };
+        assert!(bad.validate().is_err());
     }
 }

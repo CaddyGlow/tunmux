@@ -172,6 +172,7 @@ pub enum HookEventArg {
 pub enum HookBuiltinArg {
     Connectivity,
     ExternalIp,
+    DnsDetection,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
@@ -1044,6 +1045,16 @@ mod tests {
             TopCommand::Hook {
                 command: HookCommand::Run { builtin },
             } => assert_eq!(builtin, HookBuiltinArg::ExternalIp),
+            _ => panic!("expected hook run command"),
+        }
+
+        let cli = Cli::try_parse_from(["tunmux", "hook", "run", "dns-detection"])
+            .expect("parse hook run dns-detection builtin");
+
+        match cli.command {
+            TopCommand::Hook {
+                command: HookCommand::Run { builtin },
+            } => assert_eq!(builtin, HookBuiltinArg::DnsDetection),
             _ => panic!("expected hook run command"),
         }
     }
