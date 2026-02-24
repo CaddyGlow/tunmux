@@ -1,3 +1,6 @@
+use std::cmp::Ordering;
+use std::time::Duration;
+
 use crate::cli::ProtonCommand;
 use crate::config::{self, AppConfig, Provider};
 use crate::error;
@@ -5,6 +8,8 @@ use crate::local_proxy;
 use crate::netns;
 use crate::proxy;
 use crate::shared::crypto;
+use crate::shared::hooks;
+use crate::shared::latency;
 use crate::wireguard;
 
 use super::{api, models};
@@ -23,33 +28,30 @@ pub async fn dispatch(command: ProtonCommand, config: &AppConfig) -> anyhow::Res
         ProtonCommand::Login { username } => cmd_login(&username, config).await,
         ProtonCommand::Logout => cmd_logout(config).await,
         ProtonCommand::Info => cmd_info(config),
-        ProtonCommand::Servers { country, free } => cmd_servers(country, free, config).await,
-        ProtonCommand::Connect {
-            server,
+        ProtonCommand::Servers {
             country,
-            p2p,
-            backend,
-            proxy,
-            local_proxy,
-            socks_port,
-            http_port,
-            proxy_access_log,
-        } => {
+            free,
+            tag,
+            sort,
+        } => cmd_servers(country, free, tag, sort, config).await,
+        ProtonCommand::Connect(args) => {
             cmd_connect(
-                server,
-                country,
-                p2p,
-                backend,
-                proxy,
-                local_proxy,
-                socks_port,
-                http_port,
-                proxy_access_log,
+                args.server,
+                args.country,
+                args.p2p,
+                args.sort,
+                args.backend,
+                args.proxy,
+                args.local_proxy,
+                args.disable_ipv6,
+                args.socks_port,
+                args.http_port,
+                args.proxy_access_log,
                 config,
             )
             .await
         }
-        ProtonCommand::Disconnect { instance, all } => cmd_disconnect(instance, all),
+        ProtonCommand::Disconnect { instance, all } => cmd_disconnect(instance, all, config),
     }
 }
 
@@ -106,7 +108,7 @@ async fn cmd_logout(config: &AppConfig) -> anyhow::Result<()> {
         || wireguard::userspace::is_interface_active(INTERFACE_NAME)
     {
         println!("Disconnecting active VPN connection...");
-        disconnect_instance_direct()?;
+        disconnect_instance_direct(config)?;
     }
 
     config::delete_session(PROVIDER, config)?;
@@ -137,6 +139,8 @@ fn cmd_info(config: &AppConfig) -> anyhow::Result<()> {
 async fn cmd_servers(
     country: Option<String>,
     free: bool,
+    tags: Vec<String>,
+    sort: String,
     config: &AppConfig,
 ) -> anyhow::Result<()> {
     let session: models::session::Session = config::load_session(PROVIDER, config)?;
@@ -156,12 +160,76 @@ async fn cmd_servers(
         servers.retain(|s| s.tier == 0);
     }
 
-    // Sort by score (lower = better)
-    servers.sort_by(|a, b| {
-        a.score
-            .partial_cmp(&b.score)
-            .unwrap_or(std::cmp::Ordering::Equal)
-    });
+    let requested_tags = parse_proton_feature_tags(&tags)?;
+    if !requested_tags.is_empty() {
+        servers.retain(|s| requested_tags.iter().all(|feature| s.has_feature(*feature)));
+    }
+
+    let sort_by_latency = sort == "latency";
+
+    if sort_by_latency {
+        let targets: Vec<(String, u16)> = servers
+            .iter()
+            .map(|server| {
+                let host = server
+                    .best_physical()
+                    .map(|physical| physical.entry_ip.clone())
+                    .unwrap_or_else(|| server.domain.clone());
+                (host, 51820)
+            })
+            .collect();
+        let latencies =
+            latency::probe_endpoints_tcp(&targets, Duration::from_millis(800), 24).await;
+
+        let mut rows: Vec<(models::server::LogicalServer, Option<Duration>)> =
+            servers.into_iter().zip(latencies).collect();
+        rows.sort_by(|a, b| {
+            latency_order(&a.1, &b.1)
+                .then_with(|| a.0.score.partial_cmp(&b.0.score).unwrap_or(Ordering::Equal))
+                .then_with(|| a.0.name.cmp(&b.0.name))
+        });
+
+        if rows.is_empty() {
+            println!("No servers match the given filters.");
+            return Ok(());
+        }
+
+        println!(
+            "{:<16} {:>2}  {:>5}  {:>5}  {:>4}  {:>8}  Features",
+            "Name", "CC", "Load", "Score", "Tier", "Latency"
+        );
+        println!("{}", "-".repeat(74));
+
+        for (server, latency) in &rows {
+            let features = server.feature_tags();
+            println!(
+                "{:<16} {:>2}  {:>3}%  {:>5.1}  {:>4}  {:>8}  {}",
+                server.name,
+                server.exit_country,
+                server.load,
+                server.score,
+                server.tier_enum(),
+                format_latency(*latency),
+                if features.is_empty() { "-" } else { &features }
+            );
+        }
+
+        println!("\n{} servers listed", rows.len());
+        return Ok(());
+    }
+
+    match sort.as_str() {
+        "score" => {
+            servers.sort_by(|a, b| a.score.partial_cmp(&b.score).unwrap_or(Ordering::Equal));
+        }
+        "load" => {
+            servers.sort_by(|a, b| a.load.cmp(&b.load).then_with(|| a.name.cmp(&b.name)));
+        }
+        "name" => {
+            servers.sort_by(|a, b| a.name.cmp(&b.name));
+        }
+        _ => unreachable!(),
+    }
 
     if servers.is_empty() {
         println!("No servers match the given filters.");
@@ -184,14 +252,59 @@ async fn cmd_servers(
     Ok(())
 }
 
+fn parse_proton_feature_tags(
+    tags: &[String],
+) -> anyhow::Result<Vec<models::server::ServerFeature>> {
+    let mut parsed = Vec::new();
+    for tag in tags {
+        let normalized = tag.trim().to_ascii_lowercase();
+        if normalized.is_empty() {
+            continue;
+        }
+        let feature = match normalized.as_str() {
+            "secure-core" | "securecore" | "sc" => models::server::ServerFeature::SecureCore,
+            "tor" => models::server::ServerFeature::Tor,
+            "p2p" => models::server::ServerFeature::P2P,
+            "stream" | "streaming" => models::server::ServerFeature::Streaming,
+            "ipv6" => models::server::ServerFeature::Ipv6,
+            _ => anyhow::bail!(
+                "unknown Proton tag {:?}. Supported tags: secure-core, tor, p2p, streaming, ipv6",
+                tag
+            ),
+        };
+        if !parsed.contains(&feature) {
+            parsed.push(feature);
+        }
+    }
+    Ok(parsed)
+}
+
+fn latency_order(a: &Option<Duration>, b: &Option<Duration>) -> Ordering {
+    match (a, b) {
+        (Some(a), Some(b)) => a.cmp(b),
+        (Some(_), None) => Ordering::Less,
+        (None, Some(_)) => Ordering::Greater,
+        (None, None) => Ordering::Equal,
+    }
+}
+
+fn format_latency(latency: Option<Duration>) -> String {
+    match latency {
+        Some(value) => format!("{}ms", value.as_millis()),
+        None => "-".to_string(),
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn cmd_connect(
     server_name: Option<String>,
     country: Option<String>,
     p2p: bool,
+    sort: String,
     backend_arg: Option<String>,
     use_proxy: bool,
     use_local_proxy: bool,
+    disable_ipv6: bool,
     socks_port_arg: Option<u16>,
     http_port_arg: Option<u16>,
     proxy_access_log_arg: bool,
@@ -219,6 +332,14 @@ async fn cmd_connect(
     } else {
         wireguard::backend::WgBackend::from_str_arg(backend_str)?
     };
+
+    if disable_ipv6
+        && (use_proxy || use_local_proxy || backend != wireguard::backend::WgBackend::Kernel)
+    {
+        anyhow::bail!(
+            "--disable-ipv6 is supported only for direct kernel mode (no --proxy/--local-proxy)"
+        );
+    }
 
     // Apply config defaults -- CLI flags override config
     let effective_country = country.or_else(|| config.proton.default_country.clone());
@@ -248,13 +369,46 @@ async fn cmd_connect(
         if p2p {
             servers.retain(|s| s.has_feature(models::server::ServerFeature::P2P));
         }
-        // Sort by score and pick best
-        servers.sort_by(|a, b| {
-            a.score
-                .partial_cmp(&b.score)
-                .unwrap_or(std::cmp::Ordering::Equal)
-        });
-        servers.first().ok_or(error::AppError::NoServerFound)?
+
+        if sort == "latency" {
+            let targets: Vec<(String, u16)> = servers
+                .iter()
+                .map(|server| {
+                    let host = server
+                        .best_physical()
+                        .map(|physical| physical.entry_ip.clone())
+                        .unwrap_or_else(|| server.domain.clone());
+                    (host, 51820)
+                })
+                .collect();
+            let latencies =
+                latency::probe_endpoints_tcp(&targets, Duration::from_millis(800), 24).await;
+            let mut rows: Vec<(&models::server::LogicalServer, Option<Duration>)> =
+                servers.iter().zip(latencies).collect();
+            rows.sort_by(|a, b| {
+                latency_order(&a.1, &b.1)
+                    .then_with(|| a.0.score.partial_cmp(&b.0.score).unwrap_or(Ordering::Equal))
+                    .then_with(|| a.0.name.cmp(&b.0.name))
+            });
+            rows.first()
+                .map(|(server, _)| *server)
+                .ok_or(error::AppError::NoServerFound)?
+        } else {
+            match sort.as_str() {
+                "score" => {
+                    servers
+                        .sort_by(|a, b| a.score.partial_cmp(&b.score).unwrap_or(Ordering::Equal));
+                }
+                "load" => {
+                    servers.sort_by(|a, b| a.load.cmp(&b.load).then_with(|| a.name.cmp(&b.name)));
+                }
+                "name" => {
+                    servers.sort_by(|a, b| a.name.cmp(&b.name));
+                }
+                _ => unreachable!(),
+            }
+            servers.first().ok_or(error::AppError::NoServerFound)?
+        }
     };
 
     let physical = server
@@ -288,6 +442,7 @@ async fn cmd_connect(
             socks_port_arg,
             http_port_arg,
             proxy_access_log,
+            config,
         )?;
     } else if use_local_proxy {
         connect_local_proxy(
@@ -296,9 +451,10 @@ async fn cmd_connect(
             socks_port_arg,
             http_port_arg,
             proxy_access_log,
+            config,
         )?;
     } else {
-        connect_direct(server, &params, backend, config)?;
+        connect_direct(server, &params, backend, disable_ipv6, config)?;
     }
 
     Ok(())
@@ -310,6 +466,7 @@ fn connect_proxy(
     socks_port_arg: Option<u16>,
     http_port_arg: Option<u16>,
     proxy_access_log: bool,
+    config: &AppConfig,
 ) -> anyhow::Result<()> {
     let instance = proxy::instance_name(&server.name);
 
@@ -386,6 +543,7 @@ fn connect_proxy(
         keepalive_secs: None,
     };
     state.save()?;
+    hooks::run_ifup(config, PROVIDER, &state);
 
     println!(
         "Connected {} ({}) -- SOCKS5 127.0.0.1:{}, HTTP 127.0.0.1:{}",
@@ -400,6 +558,7 @@ fn connect_local_proxy(
     socks_port_arg: Option<u16>,
     http_port_arg: Option<u16>,
     proxy_access_log: bool,
+    config: &AppConfig,
 ) -> anyhow::Result<()> {
     let instance = proxy::instance_name(server_name);
 
@@ -461,6 +620,7 @@ fn connect_local_proxy(
         keepalive_secs: cfg.keepalive,
     };
     state.save()?;
+    hooks::run_ifup(config, PROVIDER, &state);
 
     println!(
         "Connected {} ({}) -- SOCKS5 127.0.0.1:{}, HTTP 127.0.0.1:{}",
@@ -473,7 +633,8 @@ fn connect_direct(
     server: &models::server::LogicalServer,
     params: &wireguard::config::WgConfigParams<'_>,
     backend: wireguard::backend::WgBackend,
-    _config: &AppConfig,
+    disable_ipv6: bool,
+    config: &AppConfig,
 ) -> anyhow::Result<()> {
     use wireguard::connection::DIRECT_INSTANCE;
 
@@ -484,7 +645,7 @@ fn connect_direct(
     if wireguard::wg_quick::is_interface_active(INTERFACE_NAME)
         || wireguard::userspace::is_interface_active(INTERFACE_NAME)
     {
-        anyhow::bail!("Already connected. Run `tunmux proton disconnect` first.");
+        anyhow::bail!("Already connected. Run `tunmux disconnect --provider proton` first.");
     }
 
     println!("Connecting to {} ({})...", server.name, params.server_ip);
@@ -542,11 +703,21 @@ fn connect_direct(
             state.save()?;
         }
         wireguard::backend::WgBackend::Kernel => {
-            wireguard::kernel::up(params, INTERFACE_NAME, PROVIDER.dir_name(), &server.name)?;
+            wireguard::kernel::up(
+                params,
+                INTERFACE_NAME,
+                PROVIDER.dir_name(),
+                &server.name,
+                disable_ipv6,
+            )?;
         }
         wireguard::backend::WgBackend::LocalProxy => {
             anyhow::bail!("use --local-proxy flag to start userspace WireGuard proxy mode");
         }
+    }
+
+    if let Some(state) = wireguard::connection::ConnectionState::load(DIRECT_INSTANCE)? {
+        hooks::run_ifup(config, PROVIDER, &state);
     }
 
     println!(
@@ -556,7 +727,7 @@ fn connect_direct(
     Ok(())
 }
 
-fn cmd_disconnect(instance: Option<String>, all: bool) -> anyhow::Result<()> {
+fn cmd_disconnect(instance: Option<String>, all: bool, config: &AppConfig) -> anyhow::Result<()> {
     let provider_name = PROVIDER.dir_name();
 
     if all {
@@ -570,7 +741,7 @@ fn cmd_disconnect(instance: Option<String>, all: bool) -> anyhow::Result<()> {
             return Ok(());
         }
         for conn in mine {
-            disconnect_one(&conn)?;
+            disconnect_one(&conn, config)?;
             println!("Disconnected {}", conn.instance_name);
         }
         return Ok(());
@@ -586,7 +757,7 @@ fn cmd_disconnect(instance: Option<String>, all: bool) -> anyhow::Result<()> {
                 conn.provider
             );
         }
-        disconnect_one(&conn)?;
+        disconnect_one(&conn, config)?;
         println!("Disconnected {}", name);
         return Ok(());
     }
@@ -604,7 +775,7 @@ fn cmd_disconnect(instance: Option<String>, all: bool) -> anyhow::Result<()> {
         }
         1 => {
             let conn = &mine[0];
-            disconnect_one(conn)?;
+            disconnect_one(conn, config)?;
             println!("Disconnected {}", conn.instance_name);
         }
         _ => {
@@ -619,18 +790,23 @@ fn cmd_disconnect(instance: Option<String>, all: bool) -> anyhow::Result<()> {
                     conn.instance_name, conn.server_display_name, ports
                 );
             }
-            println!("\nUsage: tunmux proton disconnect <instance>");
-            println!("       tunmux proton disconnect --all");
+            println!("\nUsage: tunmux disconnect <instance>");
+            println!("       tunmux disconnect --provider proton --all");
         }
     }
 
     Ok(())
 }
 
-fn disconnect_one(state: &wireguard::connection::ConnectionState) -> anyhow::Result<()> {
+fn disconnect_one(
+    state: &wireguard::connection::ConnectionState,
+    config: &AppConfig,
+) -> anyhow::Result<()> {
     // Local-proxy mode: user-owned daemon, simple signal-based teardown.
     if state.backend == wireguard::backend::WgBackend::LocalProxy {
-        return local_proxy::disconnect(state, &state.instance_name);
+        local_proxy::disconnect(state, &state.instance_name)?;
+        hooks::run_ifdown(config, PROVIDER, state);
+        return Ok(());
     }
 
     // Stop proxy daemon if running
@@ -673,14 +849,15 @@ fn disconnect_one(state: &wireguard::connection::ConnectionState) -> anyhow::Res
         }
     }
 
+    hooks::run_ifdown(config, PROVIDER, state);
     Ok(())
 }
 
 /// Legacy helper for logout -- disconnects any direct connection.
-fn disconnect_instance_direct() -> anyhow::Result<()> {
+fn disconnect_instance_direct(config: &AppConfig) -> anyhow::Result<()> {
     use wireguard::connection::DIRECT_INSTANCE;
     if let Some(state) = wireguard::connection::ConnectionState::load(DIRECT_INSTANCE)? {
-        disconnect_one(&state)?;
+        disconnect_one(&state, config)?;
     }
     Ok(())
 }
@@ -713,4 +890,48 @@ fn load_manifest() -> anyhow::Result<Vec<models::server::LogicalServer>> {
     })?;
     let manifest: ProtonManifest = serde_json::from_slice(&data)?;
     Ok(manifest.logical_servers)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_parse_proton_feature_tags_supported_aliases() {
+        let tags = vec![
+            "secure-core".to_string(),
+            "sc".to_string(),
+            "stream".to_string(),
+            "p2p".to_string(),
+        ];
+
+        let parsed = parse_proton_feature_tags(&tags).expect("parse tags");
+        assert!(parsed.contains(&models::server::ServerFeature::SecureCore));
+        assert!(parsed.contains(&models::server::ServerFeature::Streaming));
+        assert!(parsed.contains(&models::server::ServerFeature::P2P));
+        assert_eq!(
+            parsed
+                .iter()
+                .filter(|&&f| f == models::server::ServerFeature::SecureCore)
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn test_parse_proton_feature_tags_rejects_unknown_tag() {
+        let err = parse_proton_feature_tags(&["unknown".to_string()]).expect_err("unknown tag");
+        assert!(err.to_string().contains("unknown Proton tag"));
+    }
+
+    #[test]
+    fn test_latency_order_prefers_measured_values() {
+        let fast = Some(Duration::from_millis(20));
+        let slow = Some(Duration::from_millis(50));
+        let missing = None;
+
+        assert_eq!(latency_order(&fast, &slow), Ordering::Less);
+        assert_eq!(latency_order(&fast, &missing), Ordering::Less);
+        assert_eq!(latency_order(&missing, &slow), Ordering::Greater);
+    }
 }

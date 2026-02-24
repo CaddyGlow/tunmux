@@ -23,6 +23,7 @@ mod proxy;
 mod proxy;
 mod shared;
 mod userspace_helper;
+mod wgconf;
 mod wireguard;
 
 use base64::Engine as _;
@@ -30,7 +31,9 @@ use base64::Engine as _;
 use clap::Parser;
 use tracing::error;
 
-use cli::{Cli, TopCommand};
+use cli::{
+    Cli, ConnectProviderCommand, HookBuiltinArg, HookCommand, HookEventArg, ProviderArg, TopCommand,
+};
 use wireguard::connection::ConnectionState;
 
 fn main() {
@@ -146,6 +149,14 @@ async fn run(command: TopCommand, config: config::AppConfig) -> anyhow::Result<(
         TopCommand::Airvpn { command } => airvpn::handlers::dispatch(command, &config).await,
         TopCommand::Mullvad { command } => mullvad::handlers::dispatch(command, &config).await,
         TopCommand::Ivpn { command } => ivpn::handlers::dispatch(command, &config).await,
+        TopCommand::Wgconf { command } => wgconf::handlers::dispatch(command, &config).await,
+        TopCommand::Connect { provider } => run_connect(provider, &config).await,
+        TopCommand::Disconnect {
+            instance,
+            provider,
+            all,
+        } => run_disconnect(instance, provider, all, &config).await,
+        TopCommand::Hook { command } => run_hook_command(command),
         TopCommand::Status
         | TopCommand::Wg
         | TopCommand::ProxyDaemon { .. }
@@ -153,6 +164,296 @@ async fn run(command: TopCommand, config: config::AppConfig) -> anyhow::Result<(
         | TopCommand::Privileged { .. } => {
             unreachable!()
         }
+    }
+}
+
+fn run_hook_command(command: HookCommand) -> anyhow::Result<()> {
+    match command {
+        HookCommand::Run { builtin } => cmd_hook_run(builtin),
+        HookCommand::Debug {
+            instance,
+            provider,
+            event,
+        } => cmd_hook_debug(instance, provider, event),
+    }
+}
+
+fn cmd_hook_run(builtin: HookBuiltinArg) -> anyhow::Result<()> {
+    let entry = match builtin {
+        HookBuiltinArg::Connectivity => "builtin:connectivity",
+        HookBuiltinArg::ExternalIp => "builtin:external-ip",
+    };
+    shared::hooks::run_builtin(entry)
+}
+
+fn cmd_hook_debug(
+    instance: Option<String>,
+    provider: Option<ProviderArg>,
+    event: HookEventArg,
+) -> anyhow::Result<()> {
+    let state = resolve_connection_for_hook_debug(instance, provider)?;
+    let provider_cfg = config_provider_from_dir_name(&state.provider).ok_or_else(|| {
+        anyhow::anyhow!(
+            "unsupported provider in connection state: {}",
+            state.provider
+        )
+    })?;
+
+    let env = match event {
+        HookEventArg::Ifup => shared::hooks::debug_ifup_env(provider_cfg, &state),
+        HookEventArg::Ifdown => shared::hooks::debug_ifdown_env(provider_cfg, &state),
+    };
+
+    println!(
+        "Hook env payload [{}] for {} ({})",
+        hook_event_label(event),
+        state.instance_name,
+        state.provider
+    );
+    for (key, value) in env {
+        println!("{}={}", key, value);
+    }
+
+    Ok(())
+}
+
+fn resolve_connection_for_hook_debug(
+    instance: Option<String>,
+    provider: Option<ProviderArg>,
+) -> anyhow::Result<ConnectionState> {
+    if let Some(instance_name) = instance {
+        let conn = ConnectionState::load(&instance_name)?
+            .ok_or_else(|| anyhow::anyhow!("no connection with instance {:?}", instance_name))?;
+
+        if let Some(requested) = provider {
+            if conn.provider != provider_label(requested) {
+                anyhow::bail!(
+                    "instance {:?} belongs to provider {:?}, not {:?}",
+                    instance_name,
+                    conn.provider,
+                    provider_label(requested)
+                );
+            }
+        }
+
+        return Ok(conn);
+    }
+
+    let mut connections = ConnectionState::load_all()?;
+    if let Some(requested) = provider {
+        let requested_label = provider_label(requested);
+        connections.retain(|conn| conn.provider == requested_label);
+    }
+
+    match connections.len() {
+        0 => anyhow::bail!("no active connections{}", provider_hint(provider)),
+        1 => Ok(connections.remove(0)),
+        _ => {
+            println!("Multiple active connections. Specify instance for hook debug:\n");
+            for conn in &connections {
+                println!(
+                    "  {:<12} {:<9} {}",
+                    conn.instance_name, conn.provider, conn.server_display_name
+                );
+            }
+            println!("\nUsage: tunmux hook debug <instance>");
+            println!("       tunmux hook debug --provider <provider>");
+            anyhow::bail!("hook debug requires an unambiguous active connection")
+        }
+    }
+}
+
+fn hook_event_label(event: HookEventArg) -> &'static str {
+    match event {
+        HookEventArg::Ifup => "ifup",
+        HookEventArg::Ifdown => "ifdown",
+    }
+}
+
+fn provider_hint(provider: Option<ProviderArg>) -> &'static str {
+    if provider.is_some() {
+        " for selected provider"
+    } else {
+        ""
+    }
+}
+
+async fn run_connect(
+    provider: ConnectProviderCommand,
+    config: &config::AppConfig,
+) -> anyhow::Result<()> {
+    match provider {
+        ConnectProviderCommand::Proton(args) => {
+            proton::handlers::dispatch(cli::ProtonCommand::Connect(args), config).await
+        }
+        ConnectProviderCommand::Airvpn(args) => {
+            airvpn::handlers::dispatch(cli::AirVpnCommand::Connect(args), config).await
+        }
+        ConnectProviderCommand::Mullvad(args) => {
+            mullvad::handlers::dispatch(cli::MullvadCommand::Connect(args), config).await
+        }
+        ConnectProviderCommand::Ivpn(args) => {
+            ivpn::handlers::dispatch(cli::IvpnCommand::Connect(args), config).await
+        }
+        ConnectProviderCommand::Wgconf(args) => {
+            wgconf::handlers::dispatch(cli::WgconfCommand::Connect(args), config).await
+        }
+    }
+}
+
+async fn run_disconnect(
+    instance: Option<String>,
+    provider: Option<ProviderArg>,
+    all: bool,
+    config: &config::AppConfig,
+) -> anyhow::Result<()> {
+    if all {
+        if let Some(provider) = provider {
+            return dispatch_provider_disconnect(provider, None, true, config).await;
+        }
+
+        let connections = ConnectionState::load_all()?;
+        if connections.is_empty() {
+            println!("Not connected.");
+            return Ok(());
+        }
+
+        for conn in connections {
+            let resolved = provider_from_dir_name(&conn.provider).ok_or_else(|| {
+                anyhow::anyhow!(
+                    "unsupported provider in connection state: {}",
+                    conn.provider
+                )
+            })?;
+            dispatch_provider_disconnect(resolved, Some(conn.instance_name), false, config).await?;
+        }
+
+        return Ok(());
+    }
+
+    if let Some(instance_name) = instance {
+        let conn = ConnectionState::load(&instance_name)?
+            .ok_or_else(|| anyhow::anyhow!("no connection with instance {:?}", instance_name))?;
+        let resolved = provider_from_dir_name(&conn.provider).ok_or_else(|| {
+            anyhow::anyhow!(
+                "unsupported provider in connection state: {}",
+                conn.provider
+            )
+        })?;
+
+        if let Some(requested) = provider {
+            if requested != resolved {
+                anyhow::bail!(
+                    "instance {:?} belongs to provider {:?}, not {:?}",
+                    instance_name,
+                    provider_label(resolved),
+                    provider_label(requested)
+                );
+            }
+        }
+
+        return dispatch_provider_disconnect(resolved, Some(instance_name), false, config).await;
+    }
+
+    if let Some(provider) = provider {
+        return dispatch_provider_disconnect(provider, None, false, config).await;
+    }
+
+    let connections = ConnectionState::load_all()?;
+    match connections.len() {
+        0 => {
+            println!("Not connected.");
+        }
+        1 => {
+            let conn = &connections[0];
+            let resolved = provider_from_dir_name(&conn.provider).ok_or_else(|| {
+                anyhow::anyhow!(
+                    "unsupported provider in connection state: {}",
+                    conn.provider
+                )
+            })?;
+            dispatch_provider_disconnect(resolved, Some(conn.instance_name.clone()), false, config)
+                .await?;
+        }
+        _ => {
+            println!("Multiple active connections. Specify which to disconnect:\n");
+            for conn in &connections {
+                let ports = match (conn.socks_port, conn.http_port) {
+                    (Some(s), Some(h)) => format!("SOCKS5 :{}, HTTP :{}", s, h),
+                    _ => "-".to_string(),
+                };
+                println!(
+                    "  {:<12} {:<9} {:<24} {}",
+                    conn.instance_name, conn.provider, conn.server_display_name, ports
+                );
+            }
+            println!("\nUsage: tunmux disconnect <instance>");
+            println!("       tunmux disconnect --provider <provider> --all");
+            println!("       tunmux disconnect --all");
+        }
+    }
+
+    Ok(())
+}
+
+async fn dispatch_provider_disconnect(
+    provider: ProviderArg,
+    instance: Option<String>,
+    all: bool,
+    config: &config::AppConfig,
+) -> anyhow::Result<()> {
+    match provider {
+        ProviderArg::Proton => {
+            proton::handlers::dispatch(cli::ProtonCommand::Disconnect { instance, all }, config)
+                .await
+        }
+        ProviderArg::Airvpn => {
+            airvpn::handlers::dispatch(cli::AirVpnCommand::Disconnect { instance, all }, config)
+                .await
+        }
+        ProviderArg::Mullvad => {
+            mullvad::handlers::dispatch(cli::MullvadCommand::Disconnect { instance, all }, config)
+                .await
+        }
+        ProviderArg::Ivpn => {
+            ivpn::handlers::dispatch(cli::IvpnCommand::Disconnect { instance, all }, config).await
+        }
+        ProviderArg::Wgconf => {
+            wgconf::handlers::dispatch(cli::WgconfCommand::Disconnect { instance, all }, config)
+                .await
+        }
+    }
+}
+
+fn provider_from_dir_name(name: &str) -> Option<ProviderArg> {
+    match name {
+        "proton" => Some(ProviderArg::Proton),
+        "airvpn" => Some(ProviderArg::Airvpn),
+        "mullvad" => Some(ProviderArg::Mullvad),
+        "ivpn" => Some(ProviderArg::Ivpn),
+        "wgconf" => Some(ProviderArg::Wgconf),
+        _ => None,
+    }
+}
+
+fn provider_label(provider: ProviderArg) -> &'static str {
+    match provider {
+        ProviderArg::Proton => "proton",
+        ProviderArg::Airvpn => "airvpn",
+        ProviderArg::Mullvad => "mullvad",
+        ProviderArg::Ivpn => "ivpn",
+        ProviderArg::Wgconf => "wgconf",
+    }
+}
+
+fn config_provider_from_dir_name(name: &str) -> Option<config::Provider> {
+    match name {
+        "proton" => Some(config::Provider::Proton),
+        "airvpn" => Some(config::Provider::AirVpn),
+        "mullvad" => Some(config::Provider::Mullvad),
+        "ivpn" => Some(config::Provider::Ivpn),
+        "wgconf" => Some(config::Provider::Wgconf),
+        _ => None,
     }
 }
 
@@ -370,5 +671,17 @@ fn print_local_proxy_info(conn: &wireguard::connection::ConnectionState) {
     println!("  transfer: (userspace — not available)");
     if let Some(ka) = conn.keepalive_secs {
         println!("  persistent keepalive: every {} seconds", ka);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{provider_from_dir_name, provider_label};
+    use crate::cli::ProviderArg;
+
+    #[test]
+    fn provider_mapping_includes_wgconf() {
+        assert_eq!(provider_from_dir_name("wgconf"), Some(ProviderArg::Wgconf));
+        assert_eq!(provider_label(ProviderArg::Wgconf), "wgconf");
     }
 }

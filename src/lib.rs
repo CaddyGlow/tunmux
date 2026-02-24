@@ -16,6 +16,7 @@ pub mod airvpn;
 pub mod ivpn;
 pub mod mullvad;
 pub mod proton;
+pub mod wgconf;
 
 // WireGuard config and connection state (portable);
 // backend implementations (kernel, wg_quick, userspace) are cfg-gated inside wireguard/mod.rs

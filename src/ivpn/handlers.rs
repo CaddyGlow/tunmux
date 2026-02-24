@@ -11,6 +11,8 @@ use crate::local_proxy;
 use crate::netns;
 use crate::proxy;
 use crate::shared::crypto;
+use crate::shared::hooks;
+use crate::shared::latency;
 use crate::wireguard;
 
 const PROVIDER: Provider = Provider::Ivpn;
@@ -242,31 +244,24 @@ pub async fn dispatch(command: IvpnCommand, config: &AppConfig) -> anyhow::Resul
         },
         IvpnCommand::Logout => cmd_logout(config).await,
         IvpnCommand::Info => cmd_info(config).await,
-        IvpnCommand::Servers { country } => cmd_servers(country).await,
-        IvpnCommand::Connect {
-            server,
-            country,
-            backend,
-            proxy,
-            local_proxy,
-            socks_port,
-            http_port,
-            proxy_access_log,
-        } => {
+        IvpnCommand::Servers { country, tag, sort } => cmd_servers(country, tag, sort).await,
+        IvpnCommand::Connect(args) => {
             cmd_connect(
-                server,
-                country,
-                backend,
-                proxy,
-                local_proxy,
-                socks_port,
-                http_port,
-                proxy_access_log,
+                args.server,
+                args.country,
+                args.sort,
+                args.backend,
+                args.proxy,
+                args.local_proxy,
+                args.disable_ipv6,
+                args.socks_port,
+                args.http_port,
+                args.proxy_access_log,
                 config,
             )
             .await
         }
-        IvpnCommand::Disconnect { instance, all } => cmd_disconnect(instance, all),
+        IvpnCommand::Disconnect { instance, all } => cmd_disconnect(instance, all, config),
     }
 }
 
@@ -381,7 +376,7 @@ async fn cmd_login(account_id: &str, config: &AppConfig) -> anyhow::Result<()> {
 }
 
 async fn cmd_logout(config: &AppConfig) -> anyhow::Result<()> {
-    let _ = cmd_disconnect(None, true);
+    let _ = cmd_disconnect(None, true, config);
 
     if let Ok(session) = config::load_session::<IvpnSession>(PROVIDER, config) {
         let client = api_client()?;
@@ -439,7 +434,11 @@ async fn cmd_info(config: &AppConfig) -> anyhow::Result<()> {
     Ok(())
 }
 
-async fn cmd_servers(country: Option<String>) -> anyhow::Result<()> {
+async fn cmd_servers(
+    country: Option<String>,
+    tags: Vec<String>,
+    sort: String,
+) -> anyhow::Result<()> {
     let client = api_client()?;
     let manifest = load_manifest_cached_or_fetch(&client).await?;
 
@@ -455,11 +454,73 @@ async fn cmd_servers(country: Option<String>) -> anyhow::Result<()> {
         rows.retain(|(s, _)| s.country_code.eq_ignore_ascii_case(&cc_upper));
     }
 
-    rows.sort_by(|a, b| {
-        a.1.load
-            .partial_cmp(&b.1.load)
-            .unwrap_or(std::cmp::Ordering::Equal)
-    });
+    let normalized_tags = normalize_tags(&tags);
+    if !normalized_tags.is_empty() {
+        rows.retain(|(server, host)| ivpn_matches_tags(server, host, &normalized_tags));
+    }
+
+    let sort_by_latency = sort == "latency";
+
+    if sort_by_latency {
+        let probe_port = choose_ivpn_port(&manifest.config.ports.wireguard);
+        let targets: Vec<(String, u16)> = rows
+            .iter()
+            .map(|(_, host)| (host.host.clone(), probe_port))
+            .collect();
+        let latencies =
+            latency::probe_endpoints_tcp(&targets, Duration::from_millis(800), 24).await;
+
+        let mut latency_rows: Vec<((&IvpnWireGuardServer, &IvpnWireGuardHost), Option<Duration>)> =
+            rows.into_iter().zip(latencies).collect();
+        latency_rows.sort_by(|a, b| {
+            latency_order(&a.1, &b.1)
+                .then_with(|| {
+                    a.0 .1
+                        .load
+                        .partial_cmp(&b.0 .1.load)
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                })
+                .then_with(|| a.0 .1.hostname.cmp(&b.0 .1.hostname))
+        });
+
+        if latency_rows.is_empty() {
+            println!("No servers match the given filters.");
+            return Ok(());
+        }
+
+        println!(
+            "{:<24} {:>2}  {:<18} {:>6}  {:>8}  Host",
+            "Gateway", "CC", "City", "Load", "Latency"
+        );
+        println!("{}", "-".repeat(102));
+        for ((server, host), latency) in latency_rows {
+            println!(
+                "{:<24} {:>2}  {:<18} {:>5.1}%  {:>8}  {}",
+                server.gateway,
+                server.country_code,
+                server.city,
+                host.load,
+                format_latency(latency),
+                host.hostname
+            );
+        }
+        return Ok(());
+    }
+
+    match sort.as_str() {
+        "load" => {
+            rows.sort_by(|a, b| {
+                a.1.load
+                    .partial_cmp(&b.1.load)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+                    .then_with(|| a.1.hostname.cmp(&b.1.hostname))
+            });
+        }
+        "name" => {
+            rows.sort_by(|a, b| a.1.hostname.cmp(&b.1.hostname));
+        }
+        _ => unreachable!(),
+    }
 
     if rows.is_empty() {
         println!("No servers match the given filters.");
@@ -480,13 +541,60 @@ async fn cmd_servers(country: Option<String>) -> anyhow::Result<()> {
     Ok(())
 }
 
+fn latency_order(a: &Option<Duration>, b: &Option<Duration>) -> std::cmp::Ordering {
+    match (a, b) {
+        (Some(a), Some(b)) => a.cmp(b),
+        (Some(_), None) => std::cmp::Ordering::Less,
+        (None, Some(_)) => std::cmp::Ordering::Greater,
+        (None, None) => std::cmp::Ordering::Equal,
+    }
+}
+
+fn format_latency(latency: Option<Duration>) -> String {
+    match latency {
+        Some(value) => format!("{}ms", value.as_millis()),
+        None => "-".to_string(),
+    }
+}
+
+fn normalize_tags(tags: &[String]) -> Vec<String> {
+    tags.iter()
+        .map(|tag| tag.trim().to_ascii_lowercase())
+        .filter(|tag| !tag.is_empty())
+        .collect()
+}
+
+fn ivpn_matches_tags(
+    server: &IvpnWireGuardServer,
+    host: &IvpnWireGuardHost,
+    tags: &[String],
+) -> bool {
+    let gateway = server.gateway.to_ascii_lowercase();
+    let country_code = server.country_code.to_ascii_lowercase();
+    let country = server.country.to_ascii_lowercase();
+    let city = server.city.to_ascii_lowercase();
+    let hostname = host.hostname.to_ascii_lowercase();
+    let dns_name = host.dns_name.to_ascii_lowercase();
+
+    tags.iter().all(|tag| {
+        gateway.contains(tag)
+            || country_code.contains(tag)
+            || country.contains(tag)
+            || city.contains(tag)
+            || hostname.contains(tag)
+            || dns_name.contains(tag)
+    })
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn cmd_connect(
     server_name: Option<String>,
     country: Option<String>,
+    sort: String,
     backend_arg: Option<String>,
     use_proxy: bool,
     use_local_proxy: bool,
+    disable_ipv6: bool,
     socks_port_arg: Option<u16>,
     http_port_arg: Option<u16>,
     proxy_access_log_arg: bool,
@@ -512,17 +620,66 @@ async fn cmd_connect(
         wireguard::backend::WgBackend::from_str_arg(backend_str)?
     };
 
+    if disable_ipv6
+        && (use_proxy || use_local_proxy || backend != wireguard::backend::WgBackend::Kernel)
+    {
+        anyhow::bail!(
+            "--disable-ipv6 is supported only for direct kernel mode (no --proxy/--local-proxy)"
+        );
+    }
+
     let effective_country = country.or_else(|| config.ivpn.default_country.clone());
     let proxy_access_log = proxy_access_log_arg || config.general.proxy_access_log;
 
     let session: IvpnSession = config::load_session(PROVIDER, config)?;
     let client = api_client()?;
     let manifest = load_manifest_cached_or_fetch(&client).await?;
-    let (server, host) = select_host(
-        &manifest,
-        server_name.as_deref(),
-        effective_country.as_deref(),
-    )?;
+    let (server, host) = if server_name.is_some() || sort != "latency" {
+        select_host(
+            &manifest,
+            server_name.as_deref(),
+            effective_country.as_deref(),
+            &sort,
+        )?
+    } else {
+        let mut rows: Vec<(&IvpnWireGuardServer, &IvpnWireGuardHost)> = Vec::new();
+        for server in &manifest.wireguard {
+            if let Some(ref cc) = effective_country {
+                if !server.country_code.eq_ignore_ascii_case(cc) {
+                    continue;
+                }
+            }
+            for host in &server.hosts {
+                rows.push((server, host));
+            }
+        }
+
+        let probe_port = choose_ivpn_port(&manifest.config.ports.wireguard);
+        let targets: Vec<(String, u16)> = rows
+            .iter()
+            .map(|(_, host)| (host.host.clone(), probe_port))
+            .collect();
+        let latencies =
+            latency::probe_endpoints_tcp(&targets, Duration::from_millis(800), 24).await;
+
+        let mut latency_rows: Vec<((&IvpnWireGuardServer, &IvpnWireGuardHost), Option<Duration>)> =
+            rows.into_iter().zip(latencies).collect();
+        latency_rows.sort_by(|a, b| {
+            latency_order(&a.1, &b.1)
+                .then_with(|| {
+                    a.0 .1
+                        .load
+                        .partial_cmp(&b.0 .1.load)
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                })
+                .then_with(|| a.0 .1.hostname.cmp(&b.0 .1.hostname))
+        });
+
+        latency_rows
+            .first()
+            .map(|(row, _)| *row)
+            .ok_or(error::AppError::NoServerFound)?
+    };
 
     let server_port = choose_ivpn_port(&manifest.config.ports.wireguard);
     let local_ip_no_mask = session
@@ -561,6 +718,7 @@ async fn cmd_connect(
             socks_port_arg,
             http_port_arg,
             proxy_access_log,
+            config,
         )?;
     } else if use_local_proxy {
         connect_local_proxy(
@@ -569,9 +727,10 @@ async fn cmd_connect(
             socks_port_arg,
             http_port_arg,
             proxy_access_log,
+            config,
         )?;
     } else {
-        connect_direct(server, host, &params, backend)?;
+        connect_direct(server, host, &params, backend, disable_ipv6, config)?;
     }
 
     Ok(())
@@ -584,6 +743,7 @@ fn connect_proxy(
     socks_port_arg: Option<u16>,
     http_port_arg: Option<u16>,
     proxy_access_log: bool,
+    config: &AppConfig,
 ) -> anyhow::Result<()> {
     let instance = proxy::instance_name(&host.hostname);
 
@@ -653,6 +813,7 @@ fn connect_proxy(
         keepalive_secs: None,
     };
     state.save()?;
+    hooks::run_ifup(config, PROVIDER, &state);
 
     println!(
         "Connected {} ({} / {}) -- SOCKS5 127.0.0.1:{}, HTTP 127.0.0.1:{}",
@@ -671,6 +832,7 @@ fn connect_local_proxy(
     socks_port_arg: Option<u16>,
     http_port_arg: Option<u16>,
     proxy_access_log: bool,
+    config: &AppConfig,
 ) -> anyhow::Result<()> {
     let instance = proxy::instance_name(&host.hostname);
 
@@ -732,6 +894,7 @@ fn connect_local_proxy(
         keepalive_secs: cfg.keepalive,
     };
     state.save()?;
+    hooks::run_ifup(config, PROVIDER, &state);
 
     println!(
         "Connected {} ({}) -- SOCKS5 127.0.0.1:{}, HTTP 127.0.0.1:{}",
@@ -745,6 +908,8 @@ fn connect_direct(
     host: &IvpnWireGuardHost,
     params: &wireguard::config::WgConfigParams<'_>,
     backend: wireguard::backend::WgBackend,
+    disable_ipv6: bool,
+    config: &AppConfig,
 ) -> anyhow::Result<()> {
     use wireguard::connection::DIRECT_INSTANCE;
 
@@ -754,7 +919,7 @@ fn connect_direct(
     if wireguard::wg_quick::is_interface_active(INTERFACE_NAME)
         || wireguard::userspace::is_interface_active(INTERFACE_NAME)
     {
-        anyhow::bail!("Already connected. Run `tunmux ivpn disconnect` first.");
+        anyhow::bail!("Already connected. Run `tunmux disconnect --provider ivpn` first.");
     }
 
     println!("Connecting to {} ({})...", host.hostname, params.server_ip);
@@ -812,11 +977,21 @@ fn connect_direct(
             state.save()?;
         }
         wireguard::backend::WgBackend::Kernel => {
-            wireguard::kernel::up(params, INTERFACE_NAME, PROVIDER.dir_name(), &host.hostname)?;
+            wireguard::kernel::up(
+                params,
+                INTERFACE_NAME,
+                PROVIDER.dir_name(),
+                &host.hostname,
+                disable_ipv6,
+            )?;
         }
         wireguard::backend::WgBackend::LocalProxy => {
             anyhow::bail!("use --local-proxy flag to start userspace WireGuard proxy mode");
         }
+    }
+
+    if let Some(state) = wireguard::connection::ConnectionState::load(DIRECT_INSTANCE)? {
+        hooks::run_ifup(config, PROVIDER, &state);
     }
 
     println!(
@@ -826,7 +1001,7 @@ fn connect_direct(
     Ok(())
 }
 
-fn cmd_disconnect(instance: Option<String>, all: bool) -> anyhow::Result<()> {
+fn cmd_disconnect(instance: Option<String>, all: bool, config: &AppConfig) -> anyhow::Result<()> {
     let provider_name = PROVIDER.dir_name();
 
     if all {
@@ -840,7 +1015,7 @@ fn cmd_disconnect(instance: Option<String>, all: bool) -> anyhow::Result<()> {
             return Ok(());
         }
         for conn in mine {
-            disconnect_one(&conn)?;
+            disconnect_one(&conn, config)?;
             println!("Disconnected {}", conn.instance_name);
         }
         return Ok(());
@@ -856,7 +1031,7 @@ fn cmd_disconnect(instance: Option<String>, all: bool) -> anyhow::Result<()> {
                 conn.provider
             );
         }
-        disconnect_one(&conn)?;
+        disconnect_one(&conn, config)?;
         println!("Disconnected {}", name);
         return Ok(());
     }
@@ -873,7 +1048,7 @@ fn cmd_disconnect(instance: Option<String>, all: bool) -> anyhow::Result<()> {
         }
         1 => {
             let conn = &mine[0];
-            disconnect_one(conn)?;
+            disconnect_one(conn, config)?;
             println!("Disconnected {}", conn.instance_name);
         }
         _ => {
@@ -888,17 +1063,22 @@ fn cmd_disconnect(instance: Option<String>, all: bool) -> anyhow::Result<()> {
                     conn.instance_name, conn.server_display_name, ports
                 );
             }
-            println!("\nUsage: tunmux ivpn disconnect <instance>");
-            println!("       tunmux ivpn disconnect --all");
+            println!("\nUsage: tunmux disconnect <instance>");
+            println!("       tunmux disconnect --provider ivpn --all");
         }
     }
 
     Ok(())
 }
 
-fn disconnect_one(state: &wireguard::connection::ConnectionState) -> anyhow::Result<()> {
+fn disconnect_one(
+    state: &wireguard::connection::ConnectionState,
+    config: &AppConfig,
+) -> anyhow::Result<()> {
     if state.backend == wireguard::backend::WgBackend::LocalProxy {
-        return local_proxy::disconnect(state, &state.instance_name);
+        local_proxy::disconnect(state, &state.instance_name)?;
+        hooks::run_ifdown(config, PROVIDER, state);
+        return Ok(());
     }
 
     if let Some(pid) = state.proxy_pid {
@@ -934,6 +1114,7 @@ fn disconnect_one(state: &wireguard::connection::ConnectionState) -> anyhow::Res
         }
     }
 
+    hooks::run_ifdown(config, PROVIDER, state);
     Ok(())
 }
 
@@ -963,6 +1144,7 @@ fn select_host<'a>(
     manifest: &'a IvpnManifest,
     server_name: Option<&str>,
     country: Option<&str>,
+    sort: &str,
 ) -> anyhow::Result<(&'a IvpnWireGuardServer, &'a IvpnWireGuardHost)> {
     if let Some(name) = server_name {
         for server in &manifest.wireguard {
@@ -999,11 +1181,19 @@ fn select_host<'a>(
         }
     }
 
-    rows.sort_by(|a, b| {
-        a.1.load
-            .partial_cmp(&b.1.load)
-            .unwrap_or(std::cmp::Ordering::Equal)
-    });
+    match sort {
+        "name" => {
+            rows.sort_by(|a, b| a.1.hostname.cmp(&b.1.hostname));
+        }
+        _ => {
+            rows.sort_by(|a, b| {
+                a.1.load
+                    .partial_cmp(&b.1.load)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+                    .then_with(|| a.1.hostname.cmp(&b.1.hostname))
+            });
+        }
+    }
     rows.first()
         .copied()
         .ok_or_else(|| error::AppError::NoServerFound.into())
@@ -1655,7 +1845,7 @@ mod tests {
     #[test]
     fn test_select_host_by_gateway_chooses_lowest_load() {
         let manifest = sample_manifest();
-        let (server, host) = select_host(&manifest, Some("fr1.gw.ivpn.net"), None).unwrap();
+        let (server, host) = select_host(&manifest, Some("fr1.gw.ivpn.net"), None, "load").unwrap();
         assert_eq!(server.country_code, "FR");
         assert_eq!(host.hostname, "fr1-wg2");
     }
@@ -1663,7 +1853,7 @@ mod tests {
     #[test]
     fn test_select_host_by_hostname() {
         let manifest = sample_manifest();
-        let (server, host) = select_host(&manifest, Some("us1-wg1"), None).unwrap();
+        let (server, host) = select_host(&manifest, Some("us1-wg1"), None, "load").unwrap();
         assert_eq!(server.gateway, "us1.gw.ivpn.net");
         assert_eq!(host.dns_name, "us1-wg1.ivpn.net");
     }
@@ -1671,14 +1861,14 @@ mod tests {
     #[test]
     fn test_select_host_country_filter() {
         let manifest = sample_manifest();
-        let (_, host) = select_host(&manifest, None, Some("FR")).unwrap();
+        let (_, host) = select_host(&manifest, None, Some("FR"), "load").unwrap();
         assert_eq!(host.hostname, "fr1-wg2");
     }
 
     #[test]
     fn test_select_host_missing_returns_error() {
         let manifest = sample_manifest();
-        let err = select_host(&manifest, Some("does-not-exist"), None).unwrap_err();
+        let err = select_host(&manifest, Some("does-not-exist"), None, "load").unwrap_err();
         assert!(err.to_string().contains("No suitable server found"));
     }
 

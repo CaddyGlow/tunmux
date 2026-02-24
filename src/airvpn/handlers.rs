@@ -1,9 +1,14 @@
+use std::cmp::Ordering;
+use std::time::Duration;
+
 use crate::cli::{AirVpnCommand, ApiKeyAction, DeviceAction, PortAction};
 use crate::config::{self, AppConfig, Provider};
 use crate::error;
 use crate::local_proxy;
 use crate::netns;
 use crate::proxy;
+use crate::shared::hooks;
+use crate::shared::latency;
 use crate::wireguard;
 
 use super::api::AirVpnClient;
@@ -19,33 +24,25 @@ pub async fn dispatch(command: AirVpnCommand, config: &AppConfig) -> anyhow::Res
         AirVpnCommand::Login { username } => cmd_login(&username, config).await,
         AirVpnCommand::Logout => cmd_logout(config).await,
         AirVpnCommand::Info => cmd_info(config),
-        AirVpnCommand::Servers { country } => cmd_servers(country),
-        AirVpnCommand::Connect {
-            server,
-            country,
-            key,
-            backend,
-            proxy,
-            local_proxy,
-            socks_port,
-            http_port,
-            proxy_access_log,
-        } => {
+        AirVpnCommand::Servers { country, tag, sort } => cmd_servers(country, tag, sort).await,
+        AirVpnCommand::Connect(args) => {
             cmd_connect(
-                server,
-                country,
-                key,
-                backend,
-                proxy,
-                local_proxy,
-                socks_port,
-                http_port,
-                proxy_access_log,
+                args.server,
+                args.country,
+                args.key,
+                args.sort,
+                args.backend,
+                args.proxy,
+                args.local_proxy,
+                args.disable_ipv6,
+                args.socks_port,
+                args.http_port,
+                args.proxy_access_log,
                 config,
             )
             .await
         }
-        AirVpnCommand::Disconnect { instance, all } => cmd_disconnect(instance, all),
+        AirVpnCommand::Disconnect { instance, all } => cmd_disconnect(instance, all, config),
         AirVpnCommand::Sessions => cmd_sessions(config).await,
         AirVpnCommand::Ports { action } => cmd_ports(action, config).await,
         AirVpnCommand::Devices { action } => cmd_devices(action, config).await,
@@ -100,7 +97,7 @@ async fn cmd_logout(config: &AppConfig) -> anyhow::Result<()> {
         || wireguard::userspace::is_interface_active(INTERFACE_NAME)
     {
         println!("Disconnecting active VPN connection...");
-        disconnect_instance_direct()?;
+        disconnect_instance_direct(config)?;
     }
 
     config::delete_session(PROVIDER, config)?;
@@ -128,7 +125,11 @@ fn cmd_info(config: &AppConfig) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn cmd_servers(country: Option<String>) -> anyhow::Result<()> {
+async fn cmd_servers(
+    country: Option<String>,
+    tags: Vec<String>,
+    sort: String,
+) -> anyhow::Result<()> {
     let manifest = load_manifest()?;
     let mut servers = manifest.servers;
 
@@ -138,8 +139,96 @@ fn cmd_servers(country: Option<String>) -> anyhow::Result<()> {
         servers.retain(|s| s.country_code.eq_ignore_ascii_case(&cc_upper));
     }
 
-    // Sort by name
-    servers.sort_by(|a, b| a.name.cmp(&b.name));
+    let normalized_tags = normalize_tags(&tags);
+    if !normalized_tags.is_empty() {
+        servers.retain(|s| airvpn_server_matches_tags(s, &normalized_tags));
+    }
+
+    let sort_by_latency = sort == "latency";
+
+    if sort_by_latency {
+        let wg_mode = manifest
+            .wg_modes
+            .first()
+            .ok_or_else(|| error::AppError::Other("no WireGuard modes in manifest".into()))?;
+        let entry_idx = wg_mode.entry_index as usize;
+
+        let mut targets: Vec<(String, u16)> = Vec::new();
+        let mut target_indexes: Vec<usize> = Vec::new();
+        for (idx, server) in servers.iter().enumerate() {
+            if let Some(ip) = server
+                .ips_entry
+                .get(entry_idx)
+                .or_else(|| server.ips_entry.first())
+            {
+                targets.push((ip.clone(), wg_mode.port));
+                target_indexes.push(idx);
+            }
+        }
+
+        let measured = latency::probe_endpoints_tcp(&targets, Duration::from_millis(800), 24).await;
+        let mut latencies = vec![None; servers.len()];
+        for (probe_idx, latency) in measured.into_iter().enumerate() {
+            if let Some(server_idx) = target_indexes.get(probe_idx) {
+                latencies[*server_idx] = latency;
+            }
+        }
+
+        let mut rows: Vec<(super::models::AirServer, Option<Duration>)> =
+            servers.into_iter().zip(latencies).collect();
+        rows.sort_by(|a, b| {
+            latency_order(&a.1, &b.1)
+                .then_with(|| {
+                    airvpn_load_ratio(&a.0)
+                        .partial_cmp(&airvpn_load_ratio(&b.0))
+                        .unwrap_or(Ordering::Equal)
+                })
+                .then_with(|| a.0.name.cmp(&b.0.name))
+        });
+
+        if rows.is_empty() {
+            println!("No servers match the given filters.");
+            return Ok(());
+        }
+
+        println!(
+            "{:<20} {:>2}  {:>12}  {:>6}  {:>6}  {:>8}  Location",
+            "Name", "CC", "Bandwidth", "Users", "Max", "Latency"
+        );
+        println!("{}", "-".repeat(84));
+
+        for (server, latency) in &rows {
+            let bw_mbps = server.bandwidth / 1_000_000;
+            println!(
+                "{:<20} {:>2}  {:>9} Mb  {:>4}/{:<4}  {:>8}  {}",
+                server.name,
+                server.country_code,
+                bw_mbps,
+                server.users,
+                server.users_max,
+                format_latency(*latency),
+                server.location,
+            );
+        }
+
+        println!("\n{} servers listed", rows.len());
+        return Ok(());
+    }
+
+    match sort.as_str() {
+        "name" => {
+            servers.sort_by(|a, b| a.name.cmp(&b.name));
+        }
+        "load" => {
+            servers.sort_by(|a, b| {
+                airvpn_load_ratio(a)
+                    .partial_cmp(&airvpn_load_ratio(b))
+                    .unwrap_or(Ordering::Equal)
+                    .then_with(|| a.name.cmp(&b.name))
+            });
+        }
+        _ => unreachable!(),
+    }
 
     if servers.is_empty() {
         println!("No servers match the given filters.");
@@ -166,14 +255,40 @@ fn cmd_servers(country: Option<String>) -> anyhow::Result<()> {
     Ok(())
 }
 
+fn airvpn_load_ratio(server: &super::models::AirServer) -> f64 {
+    if server.users_max > 0 {
+        server.users as f64 / server.users_max as f64
+    } else {
+        1.0
+    }
+}
+
+fn latency_order(a: &Option<Duration>, b: &Option<Duration>) -> Ordering {
+    match (a, b) {
+        (Some(a), Some(b)) => a.cmp(b),
+        (Some(_), None) => Ordering::Less,
+        (None, Some(_)) => Ordering::Greater,
+        (None, None) => Ordering::Equal,
+    }
+}
+
+fn format_latency(latency: Option<Duration>) -> String {
+    match latency {
+        Some(value) => format!("{}ms", value.as_millis()),
+        None => "-".to_string(),
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn cmd_connect(
     server_name: Option<String>,
     country: Option<String>,
     key_name: Option<String>,
+    sort: String,
     backend_arg: Option<String>,
     use_proxy: bool,
     use_local_proxy: bool,
+    disable_ipv6: bool,
     socks_port_arg: Option<u16>,
     http_port_arg: Option<u16>,
     proxy_access_log_arg: bool,
@@ -198,6 +313,14 @@ async fn cmd_connect(
     } else {
         wireguard::backend::WgBackend::from_str_arg(backend_str)?
     };
+
+    if disable_ipv6
+        && (use_proxy || use_local_proxy || backend != wireguard::backend::WgBackend::Kernel)
+    {
+        anyhow::bail!(
+            "--disable-ipv6 is supported only for direct kernel mode (no --proxy/--local-proxy)"
+        );
+    }
 
     // Apply config defaults -- CLI flags override config
     let effective_country = country.or_else(|| config.airvpn.default_country.clone());
@@ -250,27 +373,65 @@ async fn cmd_connect(
             candidates.retain(|s| s.country_code.eq_ignore_ascii_case(&cc_upper));
         }
 
-        // Sort by load (users/users_max ratio, lower is better)
-        candidates.sort_by(|a, b| {
-            let load_a = if a.users_max > 0 {
-                a.users as f64 / a.users_max as f64
-            } else {
-                1.0
-            };
-            let load_b = if b.users_max > 0 {
-                b.users as f64 / b.users_max as f64
-            } else {
-                1.0
-            };
-            load_a
-                .partial_cmp(&load_b)
-                .unwrap_or(std::cmp::Ordering::Equal)
-        });
+        if sort == "latency" {
+            let entry_idx = wg_mode.entry_index as usize;
+            let mut targets: Vec<(String, u16)> = Vec::new();
+            let mut idx_map: Vec<usize> = Vec::new();
+            for (idx, candidate) in candidates.iter().enumerate() {
+                if let Some(ip) = candidate
+                    .ips_entry
+                    .get(entry_idx)
+                    .or_else(|| candidate.ips_entry.first())
+                {
+                    targets.push((ip.clone(), wg_mode.port));
+                    idx_map.push(idx);
+                }
+            }
 
-        candidates
-            .first()
-            .ok_or(error::AppError::NoServerFound)?
-            .clone()
+            let measured =
+                latency::probe_endpoints_tcp(&targets, Duration::from_millis(800), 24).await;
+            let mut latencies = vec![None; candidates.len()];
+            for (probe_idx, latency) in measured.into_iter().enumerate() {
+                if let Some(candidate_idx) = idx_map.get(probe_idx) {
+                    latencies[*candidate_idx] = latency;
+                }
+            }
+
+            let mut rows: Vec<(super::models::AirServer, Option<Duration>)> =
+                candidates.into_iter().zip(latencies).collect();
+            rows.sort_by(|a, b| {
+                latency_order(&a.1, &b.1)
+                    .then_with(|| {
+                        airvpn_load_ratio(&a.0)
+                            .partial_cmp(&airvpn_load_ratio(&b.0))
+                            .unwrap_or(Ordering::Equal)
+                    })
+                    .then_with(|| a.0.name.cmp(&b.0.name))
+            });
+            rows.first()
+                .map(|(server, _)| server.clone())
+                .ok_or(error::AppError::NoServerFound)?
+        } else {
+            match sort.as_str() {
+                "name" => {
+                    candidates.sort_by(|a, b| a.name.cmp(&b.name));
+                }
+                "load" => {
+                    candidates.sort_by(|a, b| {
+                        airvpn_load_ratio(a)
+                            .partial_cmp(&airvpn_load_ratio(b))
+                            .unwrap_or(Ordering::Equal)
+                            .then_with(|| a.name.cmp(&b.name))
+                    });
+                }
+                _ => unreachable!(),
+            }
+
+            candidates
+                .first()
+                .ok_or(error::AppError::NoServerFound)?
+                .clone()
+        }
     };
 
     // Pick the entry IP based on the mode's entry_index
@@ -330,6 +491,7 @@ async fn cmd_connect(
             socks_port_arg,
             http_port_arg,
             proxy_access_log,
+            config,
         )?;
     } else if use_local_proxy {
         connect_local_proxy(
@@ -338,6 +500,7 @@ async fn cmd_connect(
             socks_port_arg,
             http_port_arg,
             proxy_access_log,
+            config,
         )?;
     } else {
         connect_direct(
@@ -347,10 +510,36 @@ async fn cmd_connect(
             wg_mode.port,
             &params,
             backend,
+            disable_ipv6,
         )?;
+        if let Some(state) =
+            wireguard::connection::ConnectionState::load(wireguard::connection::DIRECT_INSTANCE)?
+        {
+            hooks::run_ifup(config, PROVIDER, &state);
+        }
     }
 
     Ok(())
+}
+
+fn normalize_tags(tags: &[String]) -> Vec<String> {
+    tags.iter()
+        .map(|tag| tag.trim().to_ascii_lowercase())
+        .filter(|tag| !tag.is_empty())
+        .collect()
+}
+
+fn airvpn_server_matches_tags(server: &super::models::AirServer, tags: &[String]) -> bool {
+    tags.iter().all(|tag| {
+        if tag == "ipv6" {
+            return server.ips_entry.iter().any(|ip| ip.contains(':'));
+        }
+
+        server.name.to_ascii_lowercase().contains(tag)
+            || server.country_code.to_ascii_lowercase().contains(tag)
+            || server.location.to_ascii_lowercase().contains(tag)
+            || server.group.to_ascii_lowercase().contains(tag)
+    })
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -363,6 +552,7 @@ fn connect_proxy(
     socks_port_arg: Option<u16>,
     http_port_arg: Option<u16>,
     proxy_access_log: bool,
+    config: &AppConfig,
 ) -> anyhow::Result<()> {
     let instance = proxy::instance_name(server_name);
 
@@ -432,6 +622,7 @@ fn connect_proxy(
         keepalive_secs: None,
     };
     state.save()?;
+    hooks::run_ifup(config, PROVIDER, &state);
 
     println!(
         "Connected {} ({}) [{}] -- SOCKS5 127.0.0.1:{}, HTTP 127.0.0.1:{}",
@@ -446,6 +637,7 @@ fn connect_local_proxy(
     socks_port_arg: Option<u16>,
     http_port_arg: Option<u16>,
     proxy_access_log: bool,
+    config: &AppConfig,
 ) -> anyhow::Result<()> {
     let instance = proxy::instance_name(server_name);
 
@@ -507,6 +699,7 @@ fn connect_local_proxy(
         keepalive_secs: cfg.keepalive,
     };
     state.save()?;
+    hooks::run_ifup(config, PROVIDER, &state);
 
     println!(
         "Connected {} ({}) -- SOCKS5 127.0.0.1:{}, HTTP 127.0.0.1:{}",
@@ -522,6 +715,7 @@ fn connect_direct(
     server_port: u16,
     params: &wireguard::config::WgConfigParams<'_>,
     backend: wireguard::backend::WgBackend,
+    disable_ipv6: bool,
 ) -> anyhow::Result<()> {
     use wireguard::connection::DIRECT_INSTANCE;
 
@@ -531,7 +725,7 @@ fn connect_direct(
     if wireguard::wg_quick::is_interface_active(INTERFACE_NAME)
         || wireguard::userspace::is_interface_active(INTERFACE_NAME)
     {
-        anyhow::bail!("Already connected. Run `tunmux airvpn disconnect` first.");
+        anyhow::bail!("Already connected. Run `tunmux disconnect --provider airvpn` first.");
     }
 
     println!("Connecting to {} ({})...", server_name, server_ip);
@@ -589,7 +783,13 @@ fn connect_direct(
             state.save()?;
         }
         wireguard::backend::WgBackend::Kernel => {
-            wireguard::kernel::up(params, INTERFACE_NAME, PROVIDER.dir_name(), server_name)?;
+            wireguard::kernel::up(
+                params,
+                INTERFACE_NAME,
+                PROVIDER.dir_name(),
+                server_name,
+                disable_ipv6,
+            )?;
         }
         wireguard::backend::WgBackend::LocalProxy => {
             anyhow::bail!("use --local-proxy flag to start userspace WireGuard proxy mode");
@@ -603,7 +803,7 @@ fn connect_direct(
     Ok(())
 }
 
-fn cmd_disconnect(instance: Option<String>, all: bool) -> anyhow::Result<()> {
+fn cmd_disconnect(instance: Option<String>, all: bool, config: &AppConfig) -> anyhow::Result<()> {
     let provider_name = PROVIDER.dir_name();
 
     if all {
@@ -617,7 +817,7 @@ fn cmd_disconnect(instance: Option<String>, all: bool) -> anyhow::Result<()> {
             return Ok(());
         }
         for conn in mine {
-            disconnect_one(&conn)?;
+            disconnect_one(&conn, config)?;
             println!("Disconnected {}", conn.instance_name);
         }
         return Ok(());
@@ -633,7 +833,7 @@ fn cmd_disconnect(instance: Option<String>, all: bool) -> anyhow::Result<()> {
                 conn.provider
             );
         }
-        disconnect_one(&conn)?;
+        disconnect_one(&conn, config)?;
         println!("Disconnected {}", name);
         return Ok(());
     }
@@ -651,7 +851,7 @@ fn cmd_disconnect(instance: Option<String>, all: bool) -> anyhow::Result<()> {
         }
         1 => {
             let conn = &mine[0];
-            disconnect_one(conn)?;
+            disconnect_one(conn, config)?;
             println!("Disconnected {}", conn.instance_name);
         }
         _ => {
@@ -666,17 +866,22 @@ fn cmd_disconnect(instance: Option<String>, all: bool) -> anyhow::Result<()> {
                     conn.instance_name, conn.server_display_name, ports
                 );
             }
-            println!("\nUsage: tunmux airvpn disconnect <instance>");
-            println!("       tunmux airvpn disconnect --all");
+            println!("\nUsage: tunmux disconnect <instance>");
+            println!("       tunmux disconnect --provider airvpn --all");
         }
     }
 
     Ok(())
 }
 
-fn disconnect_one(state: &wireguard::connection::ConnectionState) -> anyhow::Result<()> {
+fn disconnect_one(
+    state: &wireguard::connection::ConnectionState,
+    config: &AppConfig,
+) -> anyhow::Result<()> {
     if state.backend == wireguard::backend::WgBackend::LocalProxy {
-        return local_proxy::disconnect(state, &state.instance_name);
+        local_proxy::disconnect(state, &state.instance_name)?;
+        hooks::run_ifdown(config, PROVIDER, state);
+        return Ok(());
     }
 
     // Stop proxy daemon if running
@@ -720,13 +925,14 @@ fn disconnect_one(state: &wireguard::connection::ConnectionState) -> anyhow::Res
         }
     }
 
+    hooks::run_ifdown(config, PROVIDER, state);
     Ok(())
 }
 
-fn disconnect_instance_direct() -> anyhow::Result<()> {
+fn disconnect_instance_direct(config: &AppConfig) -> anyhow::Result<()> {
     use wireguard::connection::DIRECT_INSTANCE;
     if let Some(state) = wireguard::connection::ConnectionState::load(DIRECT_INSTANCE)? {
-        disconnect_one(&state)?;
+        disconnect_one(&state, config)?;
     }
     Ok(())
 }

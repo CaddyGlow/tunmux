@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::io::Write;
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::Context;
 use reqwest::{Client, StatusCode};
@@ -13,6 +14,8 @@ use crate::local_proxy;
 use crate::netns;
 use crate::proxy;
 use crate::shared::crypto;
+use crate::shared::hooks;
+use crate::shared::latency;
 use crate::wireguard;
 
 const PROVIDER: Provider = Provider::Mullvad;
@@ -141,31 +144,24 @@ pub async fn dispatch(command: MullvadCommand, config: &AppConfig) -> anyhow::Re
         },
         MullvadCommand::Logout => cmd_logout(config).await,
         MullvadCommand::Info => cmd_info(config).await,
-        MullvadCommand::Servers { country } => cmd_servers(country).await,
-        MullvadCommand::Connect {
-            server,
-            country,
-            backend,
-            proxy,
-            local_proxy,
-            socks_port,
-            http_port,
-            proxy_access_log,
-        } => {
+        MullvadCommand::Servers { country, tag, sort } => cmd_servers(country, tag, sort).await,
+        MullvadCommand::Connect(args) => {
             cmd_connect(
-                server,
-                country,
-                backend,
-                proxy,
-                local_proxy,
-                socks_port,
-                http_port,
-                proxy_access_log,
+                args.server,
+                args.country,
+                args.sort,
+                args.backend,
+                args.proxy,
+                args.local_proxy,
+                args.disable_ipv6,
+                args.socks_port,
+                args.http_port,
+                args.proxy_access_log,
                 config,
             )
             .await
         }
-        MullvadCommand::Disconnect { instance, all } => cmd_disconnect(instance, all),
+        MullvadCommand::Disconnect { instance, all } => cmd_disconnect(instance, all, config),
     }
 }
 
@@ -293,7 +289,7 @@ async fn login_with_client(
 }
 
 async fn cmd_logout(config: &AppConfig) -> anyhow::Result<()> {
-    let _ = cmd_disconnect(None, true);
+    let _ = cmd_disconnect(None, true, config);
 
     if let Ok(session) = config::load_session::<MullvadSession>(PROVIDER, config) {
         let client = api_client()?;
@@ -336,7 +332,11 @@ async fn cmd_info(config: &AppConfig) -> anyhow::Result<()> {
     Ok(())
 }
 
-async fn cmd_servers(country: Option<String>) -> anyhow::Result<()> {
+async fn cmd_servers(
+    country: Option<String>,
+    tags: Vec<String>,
+    sort: String,
+) -> anyhow::Result<()> {
     let client = api_client()?;
     let manifest = load_manifest_cached_or_fetch(&client).await?;
     let mut relays: Vec<&MullvadRelay> = manifest
@@ -349,6 +349,60 @@ async fn cmd_servers(country: Option<String>) -> anyhow::Result<()> {
     if let Some(cc) = country {
         let cc_upper = cc.to_uppercase();
         relays.retain(|r| country_code_from_location(&r.location) == cc_upper);
+    }
+
+    let normalized_tags = normalize_tags(&tags);
+    if !normalized_tags.is_empty() {
+        relays.retain(|relay| mullvad_relay_matches_tags(&manifest, relay, &normalized_tags));
+    }
+
+    let sort_by_latency = sort == "latency";
+
+    if sort_by_latency {
+        let probe_port = choose_mullvad_port(&manifest.wireguard.port_ranges);
+        let targets: Vec<(String, u16)> = relays
+            .iter()
+            .map(|relay| (relay.ipv4_addr_in.clone(), probe_port))
+            .collect();
+        let latencies =
+            latency::probe_endpoints_tcp(&targets, Duration::from_millis(800), 24).await;
+
+        let mut rows: Vec<(&MullvadRelay, Option<Duration>)> =
+            relays.into_iter().zip(latencies).collect();
+        rows.sort_by(|a, b| {
+            latency_order(&a.1, &b.1).then_with(|| a.0.hostname.cmp(&b.0.hostname))
+        });
+
+        if rows.is_empty() {
+            println!("No servers match the given filters.");
+            return Ok(());
+        }
+
+        println!(
+            "{:<20} {:>2}  {:<20} {:<14} {:>8}  Ingress",
+            "Hostname", "CC", "City", "Provider", "Latency"
+        );
+        println!("{}", "-".repeat(94));
+
+        for (relay, latency) in rows {
+            let cc = country_code_from_location(&relay.location);
+            let city = manifest
+                .locations
+                .get(&relay.location)
+                .map(|l| l.city.as_str())
+                .unwrap_or("-");
+            println!(
+                "{:<20} {:>2}  {:<20} {:<14} {:>8}  {}",
+                relay.hostname,
+                cc,
+                city,
+                relay.provider,
+                format_latency(latency),
+                relay.ipv4_addr_in
+            );
+        }
+
+        return Ok(());
     }
 
     relays.sort_by(|a, b| a.hostname.cmp(&b.hostname));
@@ -380,13 +434,75 @@ async fn cmd_servers(country: Option<String>) -> anyhow::Result<()> {
     Ok(())
 }
 
+fn latency_order(a: &Option<Duration>, b: &Option<Duration>) -> std::cmp::Ordering {
+    match (a, b) {
+        (Some(a), Some(b)) => a.cmp(b),
+        (Some(_), None) => std::cmp::Ordering::Less,
+        (None, Some(_)) => std::cmp::Ordering::Greater,
+        (None, None) => std::cmp::Ordering::Equal,
+    }
+}
+
+fn format_latency(latency: Option<Duration>) -> String {
+    match latency {
+        Some(value) => format!("{}ms", value.as_millis()),
+        None => "-".to_string(),
+    }
+}
+
+fn normalize_tags(tags: &[String]) -> Vec<String> {
+    tags.iter()
+        .map(|tag| tag.trim().to_ascii_lowercase())
+        .filter(|tag| !tag.is_empty())
+        .collect()
+}
+
+fn mullvad_relay_matches_tags(
+    manifest: &MullvadManifest,
+    relay: &MullvadRelay,
+    tags: &[String],
+) -> bool {
+    let cc = country_code_from_location(&relay.location).to_ascii_lowercase();
+    let city = manifest
+        .locations
+        .get(&relay.location)
+        .map(|location| location.city.to_ascii_lowercase())
+        .unwrap_or_default();
+    let country = manifest
+        .locations
+        .get(&relay.location)
+        .map(|location| location.country.to_ascii_lowercase())
+        .unwrap_or_default();
+    let hostname = relay.hostname.to_ascii_lowercase();
+    let provider = relay.provider.to_ascii_lowercase();
+    let location = relay.location.to_ascii_lowercase();
+
+    tags.iter().all(|tag| {
+        if tag == "ipv6" {
+            return relay
+                .ipv6_addr_in
+                .as_ref()
+                .is_some_and(|address| !address.is_empty());
+        }
+
+        hostname.contains(tag)
+            || provider.contains(tag)
+            || location.contains(tag)
+            || cc.contains(tag)
+            || city.contains(tag)
+            || country.contains(tag)
+    })
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn cmd_connect(
     server_name: Option<String>,
     country: Option<String>,
+    sort: String,
     backend_arg: Option<String>,
     use_proxy: bool,
     use_local_proxy: bool,
+    disable_ipv6: bool,
     socks_port_arg: Option<u16>,
     http_port_arg: Option<u16>,
     proxy_access_log_arg: bool,
@@ -412,17 +528,55 @@ async fn cmd_connect(
         wireguard::backend::WgBackend::from_str_arg(backend_str)?
     };
 
+    if disable_ipv6
+        && (use_proxy || use_local_proxy || backend != wireguard::backend::WgBackend::Kernel)
+    {
+        anyhow::bail!(
+            "--disable-ipv6 is supported only for direct kernel mode (no --proxy/--local-proxy)"
+        );
+    }
+
     let effective_country = country.or_else(|| config.mullvad.default_country.clone());
     let proxy_access_log = proxy_access_log_arg || config.general.proxy_access_log;
 
     let session: MullvadSession = config::load_session(PROVIDER, config)?;
     let client = api_client()?;
     let manifest = load_manifest_cached_or_fetch(&client).await?;
-    let relay = select_relay(
-        &manifest,
-        server_name.as_deref(),
-        effective_country.as_deref(),
-    )?;
+    let relay = if server_name.is_some() || sort != "latency" {
+        select_relay(
+            &manifest,
+            server_name.as_deref(),
+            effective_country.as_deref(),
+        )?
+    } else {
+        let mut relays: Vec<&MullvadRelay> = manifest
+            .wireguard
+            .relays
+            .iter()
+            .filter(|r| r.active)
+            .collect();
+        if let Some(ref cc) = effective_country {
+            let cc_upper = cc.to_uppercase();
+            relays.retain(|r| country_code_from_location(&r.location) == cc_upper);
+        }
+
+        let probe_port = choose_mullvad_port(&manifest.wireguard.port_ranges);
+        let targets: Vec<(String, u16)> = relays
+            .iter()
+            .map(|relay| (relay.ipv4_addr_in.clone(), probe_port))
+            .collect();
+        let latencies =
+            latency::probe_endpoints_tcp(&targets, Duration::from_millis(800), 24).await;
+
+        let mut rows: Vec<(&MullvadRelay, Option<Duration>)> =
+            relays.into_iter().zip(latencies).collect();
+        rows.sort_by(|a, b| {
+            latency_order(&a.1, &b.1).then_with(|| a.0.hostname.cmp(&b.0.hostname))
+        });
+        rows.first()
+            .map(|(relay, _)| *relay)
+            .ok_or(error::AppError::NoServerFound)?
+    };
 
     let server_port = choose_mullvad_port(&manifest.wireguard.port_ranges);
     let mut addresses = vec![ensure_cidr(&session.ipv4_address, "/32")];
@@ -458,6 +612,7 @@ async fn cmd_connect(
             socks_port_arg,
             http_port_arg,
             proxy_access_log,
+            config,
         )?;
     } else if use_local_proxy {
         connect_local_proxy(
@@ -466,9 +621,10 @@ async fn cmd_connect(
             socks_port_arg,
             http_port_arg,
             proxy_access_log,
+            config,
         )?;
     } else {
-        connect_direct(relay, &params, backend)?;
+        connect_direct(relay, &params, backend, disable_ipv6, config)?;
     }
 
     Ok(())
@@ -480,6 +636,7 @@ fn connect_proxy(
     socks_port_arg: Option<u16>,
     http_port_arg: Option<u16>,
     proxy_access_log: bool,
+    config: &AppConfig,
 ) -> anyhow::Result<()> {
     let instance = proxy::instance_name(&relay.hostname);
 
@@ -549,6 +706,7 @@ fn connect_proxy(
         keepalive_secs: None,
     };
     state.save()?;
+    hooks::run_ifup(config, PROVIDER, &state);
 
     println!(
         "Connected {} ({}) -- SOCKS5 127.0.0.1:{}, HTTP 127.0.0.1:{}",
@@ -563,6 +721,7 @@ fn connect_local_proxy(
     socks_port_arg: Option<u16>,
     http_port_arg: Option<u16>,
     proxy_access_log: bool,
+    config: &AppConfig,
 ) -> anyhow::Result<()> {
     let instance = proxy::instance_name(&relay.hostname);
 
@@ -624,6 +783,7 @@ fn connect_local_proxy(
         keepalive_secs: cfg.keepalive,
     };
     state.save()?;
+    hooks::run_ifup(config, PROVIDER, &state);
 
     println!(
         "Connected {} ({}) -- SOCKS5 127.0.0.1:{}, HTTP 127.0.0.1:{}",
@@ -636,6 +796,8 @@ fn connect_direct(
     relay: &MullvadRelay,
     params: &wireguard::config::WgConfigParams<'_>,
     backend: wireguard::backend::WgBackend,
+    disable_ipv6: bool,
+    config: &AppConfig,
 ) -> anyhow::Result<()> {
     use wireguard::connection::DIRECT_INSTANCE;
 
@@ -645,7 +807,7 @@ fn connect_direct(
     if wireguard::wg_quick::is_interface_active(INTERFACE_NAME)
         || wireguard::userspace::is_interface_active(INTERFACE_NAME)
     {
-        anyhow::bail!("Already connected. Run `tunmux mullvad disconnect` first.");
+        anyhow::bail!("Already connected. Run `tunmux disconnect --provider mullvad` first.");
     }
 
     println!("Connecting to {} ({})...", relay.hostname, params.server_ip);
@@ -703,18 +865,28 @@ fn connect_direct(
             state.save()?;
         }
         wireguard::backend::WgBackend::Kernel => {
-            wireguard::kernel::up(params, INTERFACE_NAME, PROVIDER.dir_name(), &relay.hostname)?;
+            wireguard::kernel::up(
+                params,
+                INTERFACE_NAME,
+                PROVIDER.dir_name(),
+                &relay.hostname,
+                disable_ipv6,
+            )?;
         }
         wireguard::backend::WgBackend::LocalProxy => {
             anyhow::bail!("use --local-proxy flag to start userspace WireGuard proxy mode");
         }
     }
 
+    if let Some(state) = wireguard::connection::ConnectionState::load(DIRECT_INSTANCE)? {
+        hooks::run_ifup(config, PROVIDER, &state);
+    }
+
     println!("Connected to {} [backend: {}]", relay.hostname, backend);
     Ok(())
 }
 
-fn cmd_disconnect(instance: Option<String>, all: bool) -> anyhow::Result<()> {
+fn cmd_disconnect(instance: Option<String>, all: bool, config: &AppConfig) -> anyhow::Result<()> {
     let provider_name = PROVIDER.dir_name();
 
     if all {
@@ -728,7 +900,7 @@ fn cmd_disconnect(instance: Option<String>, all: bool) -> anyhow::Result<()> {
             return Ok(());
         }
         for conn in mine {
-            disconnect_one(&conn)?;
+            disconnect_one(&conn, config)?;
             println!("Disconnected {}", conn.instance_name);
         }
         return Ok(());
@@ -744,7 +916,7 @@ fn cmd_disconnect(instance: Option<String>, all: bool) -> anyhow::Result<()> {
                 conn.provider
             );
         }
-        disconnect_one(&conn)?;
+        disconnect_one(&conn, config)?;
         println!("Disconnected {}", name);
         return Ok(());
     }
@@ -761,7 +933,7 @@ fn cmd_disconnect(instance: Option<String>, all: bool) -> anyhow::Result<()> {
         }
         1 => {
             let conn = &mine[0];
-            disconnect_one(conn)?;
+            disconnect_one(conn, config)?;
             println!("Disconnected {}", conn.instance_name);
         }
         _ => {
@@ -776,17 +948,22 @@ fn cmd_disconnect(instance: Option<String>, all: bool) -> anyhow::Result<()> {
                     conn.instance_name, conn.server_display_name, ports
                 );
             }
-            println!("\nUsage: tunmux mullvad disconnect <instance>");
-            println!("       tunmux mullvad disconnect --all");
+            println!("\nUsage: tunmux disconnect <instance>");
+            println!("       tunmux disconnect --provider mullvad --all");
         }
     }
 
     Ok(())
 }
 
-fn disconnect_one(state: &wireguard::connection::ConnectionState) -> anyhow::Result<()> {
+fn disconnect_one(
+    state: &wireguard::connection::ConnectionState,
+    config: &AppConfig,
+) -> anyhow::Result<()> {
     if state.backend == wireguard::backend::WgBackend::LocalProxy {
-        return local_proxy::disconnect(state, &state.instance_name);
+        local_proxy::disconnect(state, &state.instance_name)?;
+        hooks::run_ifdown(config, PROVIDER, state);
+        return Ok(());
     }
 
     if let Some(pid) = state.proxy_pid {
@@ -822,6 +999,7 @@ fn disconnect_one(state: &wireguard::connection::ConnectionState) -> anyhow::Res
         }
     }
 
+    hooks::run_ifdown(config, PROVIDER, state);
     Ok(())
 }
 

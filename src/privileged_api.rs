@@ -297,7 +297,10 @@ pub fn validate_namespace_name(name: &str) -> Result<(), String> {
 }
 
 fn validate_interface_name(interface: &str) -> Result<(), String> {
-    if matches!(interface, "proton0" | "airvpn0" | "mullvad0" | "ivpn0") {
+    if matches!(
+        interface,
+        "proton0" | "airvpn0" | "mullvad0" | "ivpn0" | "wgconf0"
+    ) {
         return Ok(());
     }
     // On macOS, WireGuard TUN interfaces are named utunN (kernel-assigned).
@@ -312,7 +315,8 @@ fn validate_interface_name(interface: &str) -> Result<(), String> {
     }
     if !interface.starts_with("wg-") {
         return Err(
-            "interface must be proton0, airvpn0, mullvad0, ivpn0, utun, utunN, or wg-*".into(),
+            "interface must be proton0, airvpn0, mullvad0, ivpn0, wgconf0, utun, utunN, or wg-*"
+                .into(),
         );
     }
     let suffix = &interface["wg-".len()..];
@@ -344,10 +348,13 @@ fn validate_host_interface_name(name: &str) -> Result<(), String> {
 }
 
 fn validate_provider(provider: &str) -> Result<(), String> {
-    if matches!(provider, "proton" | "airvpn" | "mullvad" | "ivpn") {
+    if matches!(
+        provider,
+        "proton" | "airvpn" | "mullvad" | "ivpn" | "wgconf"
+    ) {
         Ok(())
     } else {
-        Err("provider must be proton, airvpn, mullvad or ivpn".into())
+        Err("provider must be proton, airvpn, mullvad, ivpn or wgconf".into())
     }
 }
 
@@ -425,6 +432,7 @@ fn validate_host_endpoint(endpoint: &str) -> Result<(), String> {
     let mut parts = endpoint.rsplitn(2, ':');
     let port = parts.next().ok_or("endpoint missing port")?;
     let host = parts.next().ok_or("endpoint missing host")?;
+    let host = host.trim_matches(['[', ']']);
     if host.is_empty() || port.is_empty() {
         return Err("endpoint format invalid".into());
     }
@@ -538,11 +546,11 @@ fn validate_no_parent_component(path: &str) -> Result<(), String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{validate_interface_name, validate_provider};
+    use super::{validate_host_endpoint, validate_interface_name, validate_provider};
 
     #[test]
     fn direct_provider_interfaces_are_allowed() {
-        for iface in ["proton0", "airvpn0", "mullvad0", "ivpn0"] {
+        for iface in ["proton0", "airvpn0", "mullvad0", "ivpn0", "wgconf0"] {
             assert!(validate_interface_name(iface).is_ok(), "iface {}", iface);
         }
     }
@@ -563,8 +571,13 @@ mod tests {
 
     #[test]
     fn known_providers_are_allowed() {
-        for provider in ["proton", "airvpn", "mullvad", "ivpn"] {
+        for provider in ["proton", "airvpn", "mullvad", "ivpn", "wgconf"] {
             assert!(validate_provider(provider).is_ok(), "provider {}", provider);
         }
+    }
+
+    #[test]
+    fn bracketed_ipv6_endpoint_is_allowed() {
+        assert!(validate_host_endpoint("[2001:db8::1]:51820").is_ok());
     }
 }

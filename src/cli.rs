@@ -1,4 +1,4 @@
-use clap::{Parser, Subcommand};
+use clap::{Args, Parser, Subcommand, ValueEnum};
 
 #[derive(Parser)]
 #[command(
@@ -41,11 +41,43 @@ pub enum TopCommand {
         command: IvpnCommand,
     },
 
+    /// WireGuard config file/profile commands
+    Wgconf {
+        #[command(subcommand)]
+        command: WgconfCommand,
+    },
+
+    /// Connect to a VPN server (`tunmux connect <provider> ...`)
+    Connect {
+        #[command(subcommand)]
+        provider: ConnectProviderCommand,
+    },
+
+    /// Disconnect VPN connection(s)
+    Disconnect {
+        /// Instance name to disconnect (from `tunmux status`)
+        instance: Option<String>,
+
+        /// Provider to scope disconnect operations
+        #[arg(short = 'p', long, value_enum)]
+        provider: Option<ProviderArg>,
+
+        /// Disconnect all active connections (all providers unless --provider is set)
+        #[arg(short = 'a', long, conflicts_with = "instance")]
+        all: bool,
+    },
+
     /// Show active VPN connections and proxy instances
     Status,
 
     /// Show WireGuard tunnel state for active direct connection(s)
     Wg,
+
+    /// Hook utilities
+    Hook {
+        #[command(subcommand)]
+        command: HookCommand,
+    },
 
     /// Internal: proxy daemon process (hidden)
     #[command(hide = true)]
@@ -107,6 +139,276 @@ pub enum TopCommand {
 }
 
 #[derive(Subcommand)]
+pub enum HookCommand {
+    /// Run a predefined hook check now
+    Run {
+        /// Builtin hook entry
+        #[arg(value_enum)]
+        builtin: HookBuiltinArg,
+    },
+
+    /// Print the hook environment payload for an active instance
+    Debug {
+        /// Instance name (from `tunmux status`)
+        instance: Option<String>,
+
+        /// Provider to scope instance selection when `instance` is omitted
+        #[arg(short = 'p', long, value_enum)]
+        provider: Option<ProviderArg>,
+
+        /// Hook event payload to print
+        #[arg(long, value_enum, default_value = "ifup")]
+        event: HookEventArg,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum HookEventArg {
+    Ifup,
+    Ifdown,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum HookBuiltinArg {
+    Connectivity,
+    ExternalIp,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum ProviderArg {
+    Proton,
+    Airvpn,
+    Mullvad,
+    Ivpn,
+    Wgconf,
+}
+
+#[derive(Subcommand)]
+pub enum ConnectProviderCommand {
+    /// Connect using Proton VPN
+    Proton(ProtonConnectArgs),
+
+    /// Connect using AirVPN
+    Airvpn(AirVpnConnectArgs),
+
+    /// Connect using Mullvad VPN
+    Mullvad(MullvadConnectArgs),
+
+    /// Connect using IVPN
+    Ivpn(IvpnConnectArgs),
+
+    /// Connect using a WireGuard config file/profile
+    Wgconf(WgconfConnectArgs),
+}
+
+#[derive(Args, Clone)]
+pub struct ProtonConnectArgs {
+    /// Server name (e.g., US#1, CH#5)
+    pub server: Option<String>,
+
+    /// Connect to a server in this country
+    #[arg(short, long)]
+    pub country: Option<String>,
+
+    /// Prefer P2P-capable servers
+    #[arg(long)]
+    pub p2p: bool,
+
+    /// Server selection order when auto-selecting
+    #[arg(short = 's', long, default_value = "score", value_parser = ["score", "load", "name", "latency"])]
+    pub sort: String,
+
+    /// WireGuard backend: wg-quick, userspace, kernel
+    #[arg(short = 'b', long)]
+    pub backend: Option<String>,
+
+    /// Start a SOCKS5/HTTP proxy (Linux only; VPN traffic isolated in network namespace)
+    #[arg(long)]
+    pub proxy: bool,
+
+    /// Start a userspace SOCKS5/HTTP proxy without root or VpnService
+    #[arg(long)]
+    pub local_proxy: bool,
+
+    /// Disable host IPv6 egress while connected (direct kernel mode, IPv4-only profile)
+    #[arg(long)]
+    pub disable_ipv6: bool,
+
+    /// SOCKS5 proxy port (default: auto-assign from 1080)
+    #[arg(long)]
+    pub socks_port: Option<u16>,
+
+    /// HTTP proxy port (default: auto-assign from 8118)
+    #[arg(long)]
+    pub http_port: Option<u16>,
+
+    /// Enable proxy access logging to the instance log file
+    #[arg(long)]
+    pub proxy_access_log: bool,
+}
+
+#[derive(Args, Clone)]
+pub struct AirVpnConnectArgs {
+    /// Server name (e.g., Castor, Vega)
+    pub server: Option<String>,
+
+    /// Connect to a server in this country
+    #[arg(short, long)]
+    pub country: Option<String>,
+
+    /// WireGuard key name (see `airvpn info` for available keys)
+    #[arg(short, long)]
+    pub key: Option<String>,
+
+    /// Server selection order when auto-selecting
+    #[arg(short = 's', long, default_value = "load", value_parser = ["load", "name", "latency"])]
+    pub sort: String,
+
+    /// WireGuard backend: wg-quick, userspace, kernel
+    #[arg(short = 'b', long)]
+    pub backend: Option<String>,
+
+    /// Start a SOCKS5/HTTP proxy (Linux only; VPN traffic isolated in network namespace)
+    #[arg(long)]
+    pub proxy: bool,
+
+    /// Start a userspace SOCKS5/HTTP proxy without root or VpnService
+    #[arg(long)]
+    pub local_proxy: bool,
+
+    /// Disable host IPv6 egress while connected (direct kernel mode, IPv4-only profile)
+    #[arg(long)]
+    pub disable_ipv6: bool,
+
+    /// SOCKS5 proxy port (default: auto-assign from 1080)
+    #[arg(long)]
+    pub socks_port: Option<u16>,
+
+    /// HTTP proxy port (default: auto-assign from 8118)
+    #[arg(long)]
+    pub http_port: Option<u16>,
+
+    /// Enable proxy access logging to the instance log file
+    #[arg(long)]
+    pub proxy_access_log: bool,
+}
+
+#[derive(Args, Clone)]
+pub struct MullvadConnectArgs {
+    /// Server hostname (e.g., us-nyc-wg-401)
+    pub server: Option<String>,
+
+    /// Connect to a server in this country
+    #[arg(short, long)]
+    pub country: Option<String>,
+
+    /// Server selection order when auto-selecting
+    #[arg(short = 's', long, default_value = "name", value_parser = ["name", "latency"])]
+    pub sort: String,
+
+    /// WireGuard backend: wg-quick, userspace, kernel
+    #[arg(short = 'b', long)]
+    pub backend: Option<String>,
+
+    /// Start a SOCKS5/HTTP proxy (Linux only; VPN traffic isolated in network namespace)
+    #[arg(long)]
+    pub proxy: bool,
+
+    /// Start a userspace SOCKS5/HTTP proxy without root or VpnService
+    #[arg(long)]
+    pub local_proxy: bool,
+
+    /// Disable host IPv6 egress while connected (direct kernel mode, IPv4-only profile)
+    #[arg(long)]
+    pub disable_ipv6: bool,
+
+    /// SOCKS5 proxy port (default: auto-assign from 1080)
+    #[arg(long)]
+    pub socks_port: Option<u16>,
+
+    /// HTTP proxy port (default: auto-assign from 8118)
+    #[arg(long)]
+    pub http_port: Option<u16>,
+
+    /// Enable proxy access logging to the instance log file
+    #[arg(long)]
+    pub proxy_access_log: bool,
+}
+
+#[derive(Args, Clone)]
+pub struct IvpnConnectArgs {
+    /// Server hostname or gateway (e.g., us-ny4.wg.ivpn.net, us.wg.ivpn.net)
+    pub server: Option<String>,
+
+    /// Connect to a server in this country
+    #[arg(short, long)]
+    pub country: Option<String>,
+
+    /// Server selection order when auto-selecting
+    #[arg(short = 's', long, default_value = "load", value_parser = ["load", "name", "latency"])]
+    pub sort: String,
+
+    /// WireGuard backend: wg-quick, userspace, kernel
+    #[arg(short = 'b', long)]
+    pub backend: Option<String>,
+
+    /// Start a SOCKS5/HTTP proxy (Linux only; VPN traffic isolated in network namespace)
+    #[arg(long)]
+    pub proxy: bool,
+
+    /// Start a userspace SOCKS5/HTTP proxy without root or VpnService
+    #[arg(long)]
+    pub local_proxy: bool,
+
+    /// Disable host IPv6 egress while connected (direct kernel mode, IPv4-only profile)
+    #[arg(long)]
+    pub disable_ipv6: bool,
+
+    /// SOCKS5 proxy port (default: auto-assign from 1080)
+    #[arg(long)]
+    pub socks_port: Option<u16>,
+
+    /// HTTP proxy port (default: auto-assign from 8118)
+    #[arg(long)]
+    pub http_port: Option<u16>,
+
+    /// Enable proxy access logging to the instance log file
+    #[arg(long)]
+    pub proxy_access_log: bool,
+}
+
+#[derive(Args, Clone)]
+pub struct WgconfConnectArgs {
+    /// WireGuard .conf file path
+    #[arg(long, required_unless_present = "profile", conflicts_with = "profile")]
+    pub file: Option<String>,
+
+    /// Saved profile name
+    #[arg(long, required_unless_present = "file", conflicts_with = "file")]
+    pub profile: Option<String>,
+
+    /// Save loaded config as a reusable profile name
+    #[arg(long)]
+    pub save_as: Option<String>,
+
+    /// WireGuard backend: wg-quick, userspace, kernel
+    #[arg(short = 'b', long)]
+    pub backend: Option<String>,
+
+    /// Start a SOCKS5/HTTP proxy (Linux only; VPN traffic isolated in network namespace)
+    #[arg(long, conflicts_with = "local_proxy")]
+    pub proxy: bool,
+
+    /// Start a userspace SOCKS5/HTTP proxy without root or VpnService
+    #[arg(long, conflicts_with = "proxy")]
+    pub local_proxy: bool,
+
+    /// Disable host IPv6 egress while connected (only valid for direct kernel mode with IPv4-only config)
+    #[arg(long)]
+    pub disable_ipv6: bool,
+}
+
+#[derive(Subcommand)]
 pub enum ProtonCommand {
     /// Sign in with Proton VPN credentials
     Login {
@@ -129,45 +431,18 @@ pub enum ProtonCommand {
         /// Show only free servers
         #[arg(short, long)]
         free: bool,
+
+        /// Filter by server feature tag (repeatable or comma-separated): secure-core, tor, p2p, streaming, ipv6
+        #[arg(short = 't', long, value_delimiter = ',')]
+        tag: Vec<String>,
+
+        /// Sort order for server listing
+        #[arg(short = 's', long, default_value = "score", value_parser = ["score", "load", "name", "latency"])]
+        sort: String,
     },
 
     /// Connect to a VPN server
-    Connect {
-        /// Server name (e.g., US#1, CH#5)
-        server: Option<String>,
-
-        /// Connect to a server in this country
-        #[arg(short, long)]
-        country: Option<String>,
-
-        /// Prefer P2P-capable servers
-        #[arg(long)]
-        p2p: bool,
-
-        /// WireGuard backend: wg-quick, userspace, kernel
-        #[arg(long)]
-        backend: Option<String>,
-
-        /// Start a SOCKS5/HTTP proxy (Linux only; VPN traffic isolated in network namespace)
-        #[arg(long)]
-        proxy: bool,
-
-        /// Start a userspace SOCKS5/HTTP proxy without root or VpnService
-        #[arg(long)]
-        local_proxy: bool,
-
-        /// SOCKS5 proxy port (default: auto-assign from 1080)
-        #[arg(long)]
-        socks_port: Option<u16>,
-
-        /// HTTP proxy port (default: auto-assign from 8118)
-        #[arg(long)]
-        http_port: Option<u16>,
-
-        /// Enable proxy access logging to the instance log file
-        #[arg(long)]
-        proxy_access_log: bool,
-    },
+    Connect(ProtonConnectArgs),
 
     /// Disconnect from VPN
     Disconnect {
@@ -176,7 +451,7 @@ pub enum ProtonCommand {
         instance: Option<String>,
 
         /// Disconnect all active connections for this provider
-        #[arg(long)]
+        #[arg(short = 'a', long)]
         all: bool,
     },
 }
@@ -200,45 +475,18 @@ pub enum AirVpnCommand {
         /// Filter by country code (e.g., US, CH, JP)
         #[arg(short, long)]
         country: Option<String>,
+
+        /// Filter by keyword tag (repeatable or comma-separated)
+        #[arg(short = 't', long, value_delimiter = ',')]
+        tag: Vec<String>,
+
+        /// Sort order for server listing
+        #[arg(short = 's', long, default_value = "name", value_parser = ["name", "load", "latency"])]
+        sort: String,
     },
 
     /// Connect to a VPN server
-    Connect {
-        /// Server name (e.g., Castor, Vega)
-        server: Option<String>,
-
-        /// Connect to a server in this country
-        #[arg(short, long)]
-        country: Option<String>,
-
-        /// WireGuard key name (see `airvpn info` for available keys)
-        #[arg(short, long)]
-        key: Option<String>,
-
-        /// WireGuard backend: wg-quick, userspace, kernel
-        #[arg(long)]
-        backend: Option<String>,
-
-        /// Start a SOCKS5/HTTP proxy (Linux only; VPN traffic isolated in network namespace)
-        #[arg(long)]
-        proxy: bool,
-
-        /// Start a userspace SOCKS5/HTTP proxy without root or VpnService
-        #[arg(long)]
-        local_proxy: bool,
-
-        /// SOCKS5 proxy port (default: auto-assign from 1080)
-        #[arg(long)]
-        socks_port: Option<u16>,
-
-        /// HTTP proxy port (default: auto-assign from 8118)
-        #[arg(long)]
-        http_port: Option<u16>,
-
-        /// Enable proxy access logging to the instance log file
-        #[arg(long)]
-        proxy_access_log: bool,
-    },
+    Connect(AirVpnConnectArgs),
 
     /// Disconnect from VPN
     Disconnect {
@@ -247,7 +495,7 @@ pub enum AirVpnCommand {
         instance: Option<String>,
 
         /// Disconnect all active connections for this provider
-        #[arg(long)]
+        #[arg(short = 'a', long)]
         all: bool,
     },
 
@@ -358,41 +606,18 @@ pub enum MullvadCommand {
         /// Filter by country code (e.g., US, CH, JP)
         #[arg(short, long)]
         country: Option<String>,
+
+        /// Filter by keyword tag (repeatable or comma-separated)
+        #[arg(short = 't', long, value_delimiter = ',')]
+        tag: Vec<String>,
+
+        /// Sort order for server listing
+        #[arg(short = 's', long, default_value = "name", value_parser = ["name", "latency"])]
+        sort: String,
     },
 
     /// Connect to a VPN server
-    Connect {
-        /// Server hostname (e.g., us-nyc-wg-401)
-        server: Option<String>,
-
-        /// Connect to a server in this country
-        #[arg(short, long)]
-        country: Option<String>,
-
-        /// WireGuard backend: wg-quick, userspace, kernel
-        #[arg(long)]
-        backend: Option<String>,
-
-        /// Start a SOCKS5/HTTP proxy (Linux only; VPN traffic isolated in network namespace)
-        #[arg(long)]
-        proxy: bool,
-
-        /// Start a userspace SOCKS5/HTTP proxy without root or VpnService
-        #[arg(long)]
-        local_proxy: bool,
-
-        /// SOCKS5 proxy port (default: auto-assign from 1080)
-        #[arg(long)]
-        socks_port: Option<u16>,
-
-        /// HTTP proxy port (default: auto-assign from 8118)
-        #[arg(long)]
-        http_port: Option<u16>,
-
-        /// Enable proxy access logging to the instance log file
-        #[arg(long)]
-        proxy_access_log: bool,
-    },
+    Connect(MullvadConnectArgs),
 
     /// Disconnect from VPN
     Disconnect {
@@ -401,7 +626,7 @@ pub enum MullvadCommand {
         instance: Option<String>,
 
         /// Disconnect all active connections for this provider
-        #[arg(long)]
+        #[arg(short = 'a', long)]
         all: bool,
     },
 }
@@ -446,41 +671,18 @@ pub enum IvpnCommand {
         /// Filter by country code (e.g., US, CH, JP)
         #[arg(short, long)]
         country: Option<String>,
+
+        /// Filter by keyword tag (repeatable or comma-separated)
+        #[arg(short = 't', long, value_delimiter = ',')]
+        tag: Vec<String>,
+
+        /// Sort order for server listing
+        #[arg(short = 's', long, default_value = "load", value_parser = ["load", "name", "latency"])]
+        sort: String,
     },
 
     /// Connect to a VPN server
-    Connect {
-        /// Server hostname or gateway (e.g., us-ny4.wg.ivpn.net, us.wg.ivpn.net)
-        server: Option<String>,
-
-        /// Connect to a server in this country
-        #[arg(short, long)]
-        country: Option<String>,
-
-        /// WireGuard backend: wg-quick, userspace, kernel
-        #[arg(long)]
-        backend: Option<String>,
-
-        /// Start a SOCKS5/HTTP proxy (Linux only; VPN traffic isolated in network namespace)
-        #[arg(long)]
-        proxy: bool,
-
-        /// Start a userspace SOCKS5/HTTP proxy without root or VpnService
-        #[arg(long)]
-        local_proxy: bool,
-
-        /// SOCKS5 proxy port (default: auto-assign from 1080)
-        #[arg(long)]
-        socks_port: Option<u16>,
-
-        /// HTTP proxy port (default: auto-assign from 8118)
-        #[arg(long)]
-        http_port: Option<u16>,
-
-        /// Enable proxy access logging to the instance log file
-        #[arg(long)]
-        proxy_access_log: bool,
-    },
+    Connect(IvpnConnectArgs),
 
     /// Disconnect from VPN
     Disconnect {
@@ -489,8 +691,45 @@ pub enum IvpnCommand {
         instance: Option<String>,
 
         /// Disconnect all active connections for this provider
-        #[arg(long)]
+        #[arg(short = 'a', long)]
         all: bool,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum WgconfCommand {
+    /// Connect from a WireGuard config file or saved profile
+    Connect(WgconfConnectArgs),
+
+    /// Disconnect from VPN
+    Disconnect {
+        /// Instance name to disconnect (from `tunmux status`). If omitted,
+        /// disconnects the sole active connection or lists choices.
+        instance: Option<String>,
+
+        /// Disconnect all active connections for this provider
+        #[arg(short = 'a', long)]
+        all: bool,
+    },
+
+    /// Save a WireGuard config file as a named profile
+    Save {
+        /// WireGuard .conf file path
+        #[arg(long)]
+        file: String,
+
+        /// Profile name
+        #[arg(long)]
+        name: String,
+    },
+
+    /// List saved profiles
+    List,
+
+    /// Remove a saved profile
+    Remove {
+        /// Profile name
+        name: String,
     },
 }
 
@@ -636,4 +875,176 @@ pub enum ApiKeyAction {
         /// Key name
         key: String,
     },
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        Cli, ConnectProviderCommand, HookBuiltinArg, HookCommand, ProviderArg, TopCommand,
+        WgconfCommand,
+    };
+    use clap::Parser;
+
+    #[test]
+    fn parse_connect_wgconf_with_file() {
+        let cli = Cli::try_parse_from([
+            "tunmux",
+            "connect",
+            "wgconf",
+            "--file",
+            "/tmp/test.conf",
+            "--backend",
+            "userspace",
+            "--disable-ipv6",
+        ])
+        .expect("parse connect wgconf file");
+
+        match cli.command {
+            TopCommand::Connect {
+                provider: ConnectProviderCommand::Wgconf(args),
+            } => assert!(args.disable_ipv6),
+            other => panic!("unexpected command: {:?}", std::mem::discriminant(&other)),
+        }
+    }
+
+    #[test]
+    fn parse_connect_wgconf_with_profile() {
+        let cli = Cli::try_parse_from([
+            "tunmux",
+            "connect",
+            "wgconf",
+            "--profile",
+            "work",
+            "--save-as",
+            "saved-work",
+        ])
+        .expect("parse connect wgconf profile");
+
+        match cli.command {
+            TopCommand::Connect {
+                provider: ConnectProviderCommand::Wgconf(args),
+            } => {
+                assert_eq!(args.profile.as_deref(), Some("work"));
+                assert_eq!(args.save_as.as_deref(), Some("saved-work"));
+            }
+            _ => panic!("expected wgconf connect provider"),
+        }
+    }
+
+    #[test]
+    fn parse_connect_wgconf_requires_exactly_one_source() {
+        let missing = Cli::try_parse_from(["tunmux", "connect", "wgconf"]);
+        assert!(missing.is_err());
+
+        let both = Cli::try_parse_from([
+            "tunmux",
+            "connect",
+            "wgconf",
+            "--file",
+            "/tmp/a.conf",
+            "--profile",
+            "a",
+        ]);
+        assert!(both.is_err());
+    }
+
+    #[test]
+    fn parse_provider_prefixed_wgconf_commands() {
+        let cli = Cli::try_parse_from(["tunmux", "wgconf", "connect", "--profile", "home"])
+            .expect("parse wgconf connect");
+        match cli.command {
+            TopCommand::Wgconf {
+                command: WgconfCommand::Connect(args),
+            } => assert_eq!(args.profile.as_deref(), Some("home")),
+            _ => panic!("expected wgconf connect command"),
+        }
+
+        let cli = Cli::try_parse_from(["tunmux", "disconnect", "--provider", "wgconf"])
+            .expect("parse disconnect provider wgconf");
+        match cli.command {
+            TopCommand::Disconnect {
+                provider: Some(ProviderArg::Wgconf),
+                ..
+            } => {}
+            _ => panic!("expected disconnect provider wgconf"),
+        }
+    }
+
+    #[test]
+    fn parse_disable_ipv6_for_all_provider_connect_commands() {
+        let proton = Cli::try_parse_from(["tunmux", "connect", "proton", "--disable-ipv6"])
+            .expect("parse proton");
+        match proton.command {
+            TopCommand::Connect {
+                provider: ConnectProviderCommand::Proton(args),
+            } => assert!(args.disable_ipv6),
+            _ => panic!("expected proton connect provider"),
+        }
+
+        let airvpn = Cli::try_parse_from(["tunmux", "connect", "airvpn", "--disable-ipv6"])
+            .expect("parse airvpn");
+        match airvpn.command {
+            TopCommand::Connect {
+                provider: ConnectProviderCommand::Airvpn(args),
+            } => assert!(args.disable_ipv6),
+            _ => panic!("expected airvpn connect provider"),
+        }
+
+        let mullvad = Cli::try_parse_from(["tunmux", "connect", "mullvad", "--disable-ipv6"])
+            .expect("parse mullvad");
+        match mullvad.command {
+            TopCommand::Connect {
+                provider: ConnectProviderCommand::Mullvad(args),
+            } => assert!(args.disable_ipv6),
+            _ => panic!("expected mullvad connect provider"),
+        }
+
+        let ivpn = Cli::try_parse_from(["tunmux", "connect", "ivpn", "--disable-ipv6"])
+            .expect("parse ivpn");
+        match ivpn.command {
+            TopCommand::Connect {
+                provider: ConnectProviderCommand::Ivpn(args),
+            } => assert!(args.disable_ipv6),
+            _ => panic!("expected ivpn connect provider"),
+        }
+    }
+
+    #[test]
+    fn parse_hook_debug_command() {
+        let cli = Cli::try_parse_from([
+            "tunmux",
+            "hook",
+            "debug",
+            "test-instance",
+            "--event",
+            "ifdown",
+        ])
+        .expect("parse hook debug");
+
+        match cli.command {
+            TopCommand::Hook {
+                command:
+                    HookCommand::Debug {
+                        instance, provider, ..
+                    },
+            } => {
+                assert_eq!(instance.as_deref(), Some("test-instance"));
+                assert!(provider.is_none());
+            }
+            _ => panic!("expected hook debug command"),
+        }
+    }
+
+    #[test]
+    fn parse_hook_run_builtin_command() {
+        let cli = Cli::try_parse_from(["tunmux", "hook", "run", "external-ip"])
+            .expect("parse hook run builtin");
+
+        match cli.command {
+            TopCommand::Hook {
+                command: HookCommand::Run { builtin },
+            } => assert_eq!(builtin, HookBuiltinArg::ExternalIp),
+            _ => panic!("expected hook run command"),
+        }
+    }
 }

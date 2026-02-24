@@ -3,7 +3,7 @@
 //! Used by all four provider handler modules to spawn and stop the
 //! local-proxy-daemon subprocess.
 
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::process::Stdio;
 use std::time::{Duration, Instant};
 
@@ -42,9 +42,7 @@ pub fn local_proxy_config_from_params(
         .map(|s| decode_key(s, "preshared_key"))
         .transpose()?;
 
-    let endpoint: SocketAddr = format!("{}:{}", params.server_ip, params.server_port)
-        .parse()
-        .with_context(|| format!("parse endpoint {}:{}", params.server_ip, params.server_port))?;
+    let endpoint = parse_endpoint(params.server_ip, params.server_port)?;
 
     let virtual_ips = params.addresses.iter().map(|s| s.to_string()).collect();
 
@@ -58,6 +56,25 @@ pub fn local_proxy_config_from_params(
         socks_port,
         http_port,
     })
+}
+
+fn parse_endpoint(host: &str, port: u16) -> anyhow::Result<SocketAddr> {
+    let endpoint = format!("{}:{}", host, port);
+    if let Ok(addr) = endpoint.parse::<SocketAddr>() {
+        return Ok(addr);
+    }
+
+    let (raw_host, raw_port) = endpoint
+        .rsplit_once(':')
+        .ok_or_else(|| anyhow::anyhow!("invalid endpoint {}", endpoint))?;
+    let ip: IpAddr = raw_host
+        .trim_matches(['[', ']'])
+        .parse()
+        .with_context(|| format!("invalid endpoint IP {}", raw_host))?;
+    let port: u16 = raw_port
+        .parse()
+        .with_context(|| format!("invalid endpoint port {}", raw_port))?;
+    Ok(SocketAddr::new(ip, port))
 }
 
 /// Spawn a `tunmux local-proxy-daemon` subprocess and return its PID.

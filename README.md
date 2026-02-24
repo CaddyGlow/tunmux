@@ -3,29 +3,32 @@
 `tunmux` is a multi-provider VPN CLI written in Rust.
 
 Supported platforms:
-- Linux: direct mode and proxy mode
-- macOS: direct mode only (proxy mode is not available)
+- Linux: direct mode, `--proxy` mode, and `--local-proxy` mode
+- macOS: direct mode and `--local-proxy` mode (`--proxy` is not available)
 
-It supports Proton VPN, AirVPN, Mullvad, and IVPN with WireGuard connectivity in:
+It supports Proton VPN, AirVPN, Mullvad, IVPN, and local WireGuard config profiles (`wgconf`) with WireGuard connectivity in:
 - direct mode (system-wide routing)
-- proxy mode (isolated per-connection namespace with local SOCKS5/HTTP proxies)
+- Linux namespace proxy mode (`--proxy`, isolated per-connection namespace)
+- local-proxy mode (`--local-proxy`, userspace SOCKS5/HTTP proxy without root)
 
 ## What It Does
 
 - Connect/disconnect VPN sessions across multiple providers
 - Run multiple VPN exits side-by-side in proxy mode
 - In proxy mode, keep host traffic unchanged unless an app explicitly uses a proxy
+- Run rootless userspace local-proxy mode with `--local-proxy` (no `sudo` required)
 - Manage provider-specific account and utility commands from one CLI
 - Support multiple WireGuard backends: `wg-quick`, `userspace`, `kernel`
 
 ## Platform And Requirements
 
 - Rust (stable, edition 2021)
-- Linux for full feature set (kernel backend + network namespace proxy isolation)
-- macOS for direct mode (`--proxy` is Linux-only; use `--backend userspace` or `--backend wg-quick`)
-- `sudo` access for privileged operations (`tunmux privileged --serve`)
+- Linux for full feature set (kernel backend + `--proxy` namespace isolation)
+- macOS for direct mode and `--local-proxy` mode (`--proxy` is Linux-only)
+- `sudo` access for privileged operations (`tunmux privileged --serve`) used by direct mode and `--proxy`
 
 `userspace` mode uses the embedded `gotatun` library through a built-in helper; no separate `gotatun` CLI install is required.
+`--local-proxy` uses that userspace engine to run a SOCKS5/HTTP proxy without root.
 
 Optional:
 - systemd socket activation via `systemd/tunmux-privileged.socket`
@@ -64,19 +67,19 @@ Container tags:
 
 ```bash
 tunmux proton login <username>
-tunmux proton connect --country CH --backend wg-quick
+tunmux connect proton --country CH --backend wg-quick
 tunmux status
-tunmux proton disconnect
+tunmux disconnect --provider proton
 ```
 
 ### 2) Start isolated proxy exits (proxy mode)
 
 ```bash
 # First proxy instance (typically SOCKS5 1080, HTTP 8118)
-tunmux proton connect --proxy --country US
+tunmux connect proton --proxy --country US
 
 # Second proxy instance (next available ports)
-tunmux proton connect --proxy --country CH
+tunmux connect proton --proxy --country CH
 
 # Use a specific proxy
 curl --socks5 127.0.0.1:1080 https://api.ipify.org
@@ -85,16 +88,34 @@ curl --socks5 127.0.0.1:1080 https://api.ipify.org
 curl https://api.ipify.org
 ```
 
+### 3) Start local-proxy mode (no root)
+
+```bash
+# No sudo required; app traffic goes through SOCKS5/HTTP proxy
+tunmux connect proton --local-proxy --country US
+
+# Use the proxy from an app/tool
+curl --socks5 127.0.0.1:1080 https://api.ipify.org
+
+# Stop local-proxy instance(s)
+tunmux disconnect --provider proton
+```
+
 ## Command Map
 
 Top-level commands:
 
 ```bash
 tunmux status
+tunmux connect <provider> [provider connect flags]
+tunmux disconnect [instance] [--provider <provider>] [--all]
+tunmux hook run <connectivity|external-ip>
+tunmux hook debug [instance] [--provider <provider>] [--event ifup|ifdown]
 tunmux proton <...>
 tunmux airvpn <...>
 tunmux mullvad <...>
 tunmux ivpn <...>
+tunmux wgconf <...>
 ```
 
 Common provider flows:
@@ -102,17 +123,48 @@ Common provider flows:
 ```bash
 tunmux <provider> login ...
 tunmux <provider> info
-tunmux <provider> servers [--country XX]
-tunmux <provider> connect [server] [--country XX] [--backend ...] [--proxy]
-tunmux <provider> disconnect [instance] [--all]
+tunmux <provider> servers [--country XX] [--tag ...] [--sort ...]
+tunmux connect <provider> [server] [--country XX] [--sort ...] [--backend ...] [--proxy|--local-proxy]
+tunmux disconnect [instance] [--provider <provider>] [--all]
 tunmux <provider> logout
 ```
+
+`wgconf` provider flow:
+
+```bash
+tunmux connect wgconf --file ./my-tunnel.conf
+tunmux connect wgconf --file ./my-tunnel.conf --save-as work
+tunmux connect wgconf --profile work
+tunmux wgconf list
+tunmux wgconf remove work
+```
+
+Legacy provider-prefixed forms (`tunmux <provider> connect ...`, `tunmux <provider> disconnect ...`) remain supported for compatibility.
+
+Disconnect semantics:
+
+```bash
+tunmux disconnect --all                     # all providers
+tunmux disconnect --provider proton --all   # proton only
+tunmux disconnect --provider wgconf --all   # wgconf only
+tunmux disconnect <instance>                # exact instance
+tunmux disconnect --provider proton         # provider-scoped single/list behavior
+
+# short forms
+tunmux disconnect -a
+tunmux disconnect -p proton -a
+```
+
+Common short forms:
+- `connect`: `-c` (country), `-s` (sort), `-b` (backend)
+- `disconnect`: `-p` (provider), `-a` (all)
+- `servers`: `-c` (country), `-t` (tag), `-s` (sort)
 
 Use verbose logs when needed:
 
 ```bash
-tunmux -v <provider> <command>
-RUST_LOG=debug tunmux <provider> <command>
+tunmux -v connect proton --country CH
+RUST_LOG=debug tunmux disconnect --all
 ```
 
 ## Provider Examples
@@ -123,9 +175,11 @@ RUST_LOG=debug tunmux <provider> <command>
 tunmux proton login <username>
 tunmux proton info
 tunmux proton servers --country US --free
-tunmux proton connect US#1
-tunmux proton connect --country CH --p2p
-tunmux proton disconnect --all
+tunmux proton servers --country CH --tag p2p --sort latency
+tunmux connect proton US#1
+tunmux connect proton --country CH --p2p
+tunmux connect proton --country CH --sort latency
+tunmux disconnect --provider proton --all
 tunmux proton logout
 ```
 
@@ -134,16 +188,18 @@ tunmux proton logout
 ```bash
 tunmux airvpn login <username>
 tunmux airvpn info
-tunmux airvpn servers --country NL
-tunmux airvpn connect Castor
-tunmux airvpn connect --country DE --key "my device"
+tunmux airvpn servers --country NL --tag nl
+tunmux airvpn servers --sort latency
+tunmux connect airvpn Castor
+tunmux connect airvpn --country DE --key "my device"
+tunmux connect airvpn --country DE --sort latency
 tunmux airvpn sessions
 tunmux airvpn generate -s nl -s be -p wg-1637 -o config.conf
 tunmux airvpn ports list
 tunmux airvpn ports add 8080 --protocol tcp --ddns myhost
 tunmux airvpn devices list
 tunmux airvpn api list
-tunmux airvpn disconnect --all
+tunmux disconnect --provider airvpn --all
 tunmux airvpn logout
 ```
 
@@ -154,9 +210,11 @@ tunmux mullvad login <account_number>
 tunmux mullvad create-account
 tunmux mullvad payment monero --json
 tunmux mullvad info
-tunmux mullvad servers --country US
-tunmux mullvad connect us-nyc-wg-401
-tunmux mullvad disconnect
+tunmux mullvad servers --country US --tag us-nyc
+tunmux mullvad servers --sort latency
+tunmux connect mullvad us-nyc-wg-401
+tunmux connect mullvad --country SE --sort latency
+tunmux disconnect --provider mullvad
 tunmux mullvad logout
 ```
 
@@ -168,13 +226,33 @@ tunmux ivpn create-account --product pro
 tunmux ivpn payment monero --duration 1m
 tunmux ivpn login <account_id>
 tunmux ivpn info
-tunmux ivpn servers --country US
-tunmux ivpn connect us-ny4.wg.ivpn.net
-tunmux ivpn disconnect
+tunmux ivpn servers --country US --tag us1
+tunmux ivpn servers --sort latency
+tunmux connect ivpn us-ny4.wg.ivpn.net
+tunmux connect ivpn --country US --sort latency
+tunmux disconnect --provider ivpn
 tunmux ivpn logout
 ```
 
-## Proxy Mode Details
+### WGConf (local WireGuard config/profile provider)
+
+```bash
+tunmux connect wgconf --file ./my-tunnel.conf --backend wg-quick
+tunmux connect wgconf --file ./my-tunnel.conf --save-as office
+tunmux connect wgconf --profile office --local-proxy
+tunmux connect wgconf --file ./ipv4-only.conf --backend kernel --disable-ipv6
+tunmux wgconf save --file ./my-tunnel.conf --name backup
+tunmux wgconf list
+tunmux wgconf remove backup
+tunmux disconnect --provider wgconf
+```
+
+`--disable-ipv6` is supported by `connect` for `proton`, `airvpn`, `mullvad`,
+`ivpn`, and `wgconf`. It is accepted only for direct kernel mode (no
+`--proxy`/`--local-proxy`) and only when the selected WireGuard config has no
+IPv6 interface address.
+
+## Linux Namespace Proxy Mode (`--proxy`)
 
 Each `--proxy` connection creates:
 - a dedicated Linux network namespace
@@ -182,6 +260,15 @@ Each `--proxy` connection creates:
 - a local SOCKS5 and HTTP proxy bound on localhost
 
 Multiple instances can run at once, each with different exits and ports.
+
+## Local Proxy Mode (`--local-proxy`)
+
+`--local-proxy` starts a userspace WireGuard tunnel and local SOCKS5/HTTP proxy without `sudo`.
+
+- no root/privileged daemon required
+- no host routing changes (only apps configured to use the proxy are tunneled)
+- available on Linux and macOS
+- supports multiple instances with the same auto-port behavior as `--proxy`
 
 Port behavior:
 - default scan starts at `1080` (SOCKS5) and `8118` (HTTP)
@@ -192,25 +279,31 @@ Instance naming is derived from the selected server and used in status/disconnec
 
 ## Direct Mode Details
 
-Direct mode is the default when `--proxy` is not used.
+Direct mode is the default when neither `--proxy` nor `--local-proxy` is used.
 - one direct connection is active at a time
 - host traffic is routed through that WireGuard tunnel
 - stored internally as `_direct` connection state
 
-Direct and proxy sessions can coexist.
+Direct, `--proxy`, and `--local-proxy` sessions can coexist.
 
 ## Multi-Instance Disconnect
 
 If multiple instances exist for a provider, running disconnect without an instance will prompt selection:
 
 ```bash
-tunmux proton disconnect
+tunmux disconnect --provider proton
 ```
 
 Disconnect all for one provider:
 
 ```bash
-tunmux proton disconnect --all
+tunmux disconnect --provider proton --all
+```
+
+Disconnect all active connections across all providers:
+
+```bash
+tunmux disconnect --all
 ```
 
 ## Configuration
@@ -223,9 +316,10 @@ Example:
 
 ```toml
 [general]
-backend = "wg-quick"              # wg-quick, userspace, kernel
+backend = "kernel"                # default: kernel on unix (except macOS), wg-quick on macOS
 credential_store = "keyring"      # keyring or file
 proxy_access_log = false
+hooks = { ifup = ["builtin:connectivity", "builtin:external-ip"], ifdown = [] }
 privileged_transport = "socket"   # socket or stdio
 privileged_autostart = true
 privileged_autostart_timeout_ms = 5000
@@ -235,19 +329,40 @@ privileged_autostop_timeout_ms = 30000
 
 [proton]
 default_country = "CH"
+hooks = { ifup = ["/usr/local/bin/proton-ifup.sh"], ifdown = ["/usr/local/bin/proton-ifdown.sh"] }
 
 [airvpn]
 default_country = "NL"
 default_device = "laptop"
+hooks = { ifup = [], ifdown = [] }
 
 [mullvad]
 default_country = "SE"
+hooks = { ifup = [], ifdown = [] }
 
 [ivpn]
 default_country = "CH"
+hooks = { ifup = [], ifdown = [] }
+
+[wgconf]
+hooks = { ifup = [], ifdown = [] }
 ```
 
 CLI flags override config values.
+
+Hook behavior:
+- `general.hooks` runs for every provider, then provider-specific hooks run after it.
+- `ifup` runs after successful connect; `ifdown` runs after successful disconnect.
+- Built-ins are opt-in via hook entries:
+  - `builtin:connectivity`: ping IPv4 (`1.1.1.1`) and IPv6 (`2606:4700:4700::1111`)
+  - `builtin:external-ip`: fetch external IP via `https://ipinfo.io` and `https://v6.ipinfo.io`
+- Hook commands run with env vars such as `TUNMUX_HOOK_EVENT`, `TUNMUX_PROVIDER`,
+  `TUNMUX_INSTANCE`, `TUNMUX_BACKEND`, `TUNMUX_INTERFACE`, `TUNMUX_SERVER`,
+  `TUNMUX_ENDPOINT`, plus optional proxy fields (`TUNMUX_NAMESPACE`, `TUNMUX_SOCKS_PORT`,
+  `TUNMUX_HTTP_PORT`, `TUNMUX_PROXY_PID`).
+- Manual builtin checks: `tunmux hook run connectivity` or `tunmux hook run external-ip`.
+- Debug helper: `tunmux hook debug <instance>` prints the exact env payload used for hooks
+  (`--event ifup|ifdown`, default `ifup`).
 
 ## Privileged Service
 
@@ -302,6 +417,9 @@ User data under `~/.config/tunmux/`:
     account_id.json
     session.json
     manifest.json
+  wgconf/
+    profiles/
+      <name>.conf
 ```
 
 Runtime state (Linux):

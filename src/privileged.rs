@@ -737,7 +737,12 @@ fn execute_unit(result: Result<()>) -> PrivilegedResponse {
 }
 
 fn execute_route(op: &str, destination: &str, via: Option<&str>, dev: &str) -> PrivilegedResponse {
-    let mut args = vec!["ip", "route", op, destination];
+    let is_ipv6_route = destination.contains(':') || via.is_some_and(|gw| gw.contains(':'));
+    let mut args = if is_ipv6_route {
+        vec!["ip", "-6", "route", op, destination]
+    } else {
+        vec!["ip", "route", op, destination]
+    };
     if let Some(gw) = via {
         args.push("via");
         args.push(gw);

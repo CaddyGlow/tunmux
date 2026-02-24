@@ -1,9 +1,10 @@
+use std::net::IpAddr;
 use std::process::Command;
 
 use crate::error::{AppError, Result};
 use crate::netns;
 use crate::privileged_client::PrivilegedClient;
-use tracing::debug;
+use tracing::{debug, info, warn};
 
 use super::backend::WgBackend;
 use super::config::WgConfigParams;
@@ -15,13 +16,36 @@ pub fn up(
     interface_name: &str,
     provider: &str,
     server_display_name: &str,
+    disable_ipv6: bool,
 ) -> Result<()> {
+    info!(
+        interface = interface_name,
+        provider,
+        server = server_display_name,
+        endpoint_host = params.server_ip,
+        endpoint_port = params.server_port,
+        "kernel_tunnel_setup_start"
+    );
+
     let (gw_ip, gw_iface) = get_default_gateway()?;
+    info!(
+        interface = interface_name,
+        gateway_ip = gw_ip,
+        gateway_iface = gw_iface,
+        "kernel_default_gateway_detected"
+    );
+
     let original_resolv = if should_manage_global_resolv_conf() {
         std::fs::read_to_string("/etc/resolv.conf").ok()
     } else {
         None
     };
+
+    if disable_ipv6 && has_ipv6_interface_address(params.addresses) {
+        return Err(AppError::WireGuard(
+            "--disable-ipv6 can only be used when Interface.Address has no IPv6 entry".into(),
+        ));
+    }
 
     let state = ConnectionState {
         instance_name: DIRECT_INSTANCE.to_string(),
@@ -50,11 +74,19 @@ pub fn up(
         &gw_ip,
         &gw_iface,
         should_manage_global_resolv_conf(),
+        disable_ipv6,
     ) {
         let _ = PrivilegedClient::new().interface_delete(interface_name);
         ConnectionState::remove(DIRECT_INSTANCE)?;
         return Err(e);
     }
+
+    info!(
+        interface = interface_name,
+        provider,
+        server = server_display_name,
+        "kernel_tunnel_setup_complete"
+    );
 
     Ok(())
 }
@@ -65,12 +97,31 @@ pub fn up_in_netns(
     interface_name: &str,
     namespace: &str,
 ) -> Result<()> {
+    info!(
+        interface = interface_name,
+        namespace,
+        endpoint_host = params.server_ip,
+        endpoint_port = params.server_port,
+        "kernel_tunnel_setup_in_namespace_start"
+    );
+
     let client = PrivilegedClient::new();
 
+    log_kernel_setup_command(
+        interface_name,
+        &format!("ip link add dev {} type wireguard", interface_name),
+    );
     client.interface_create_wireguard(interface_name)?;
 
     let endpoint = format!("{}:{}", params.server_ip, params.server_port);
     let allowed_ips_wg = params.allowed_ips.replace(", ", ",");
+    log_kernel_setup_command(
+        interface_name,
+        &format!(
+            "wg set {} peer {} endpoint {} allowed-ips {}",
+            interface_name, params.server_public_key, endpoint, allowed_ips_wg
+        ),
+    );
     if let Err(e) = client.wireguard_set(
         interface_name,
         params.private_key,
@@ -82,14 +133,29 @@ pub fn up_in_netns(
         return Err(e);
     }
     if let Some(psk) = params.preshared_key {
+        log_kernel_setup_command(
+            interface_name,
+            &format!(
+                "wg set {} peer {} preshared-key <redacted>",
+                interface_name, params.server_public_key
+            ),
+        );
         client.wireguard_set_psk(interface_name, params.server_public_key, psk)?;
     }
+    log_kernel_setup_command(
+        interface_name,
+        &format!("ip link set {} netns {}", interface_name, namespace),
+    );
     if let Err(e) = client.interface_move_to_netns(interface_name, namespace) {
         let _ = client.interface_delete(interface_name);
         return Err(e);
     }
 
     for addr in params.addresses {
+        log_kernel_setup_command(
+            interface_name,
+            &format!("ip addr add {} dev {}", addr, interface_name),
+        );
         if let Err(e) = netns::exec(
             namespace,
             &["ip", "addr", "add", addr, "dev", interface_name],
@@ -100,6 +166,10 @@ pub fn up_in_netns(
         }
     }
 
+    log_kernel_setup_command(
+        interface_name,
+        &format!("ip link set up dev {}", interface_name),
+    );
     if let Err(e) = netns::exec(
         namespace,
         &["ip", "link", "set", "up", "dev", interface_name],
@@ -108,6 +178,10 @@ pub fn up_in_netns(
         let _ = client.interface_delete(interface_name);
         return Err(e);
     }
+    log_kernel_setup_command(
+        interface_name,
+        &format!("ip route add default dev {}", interface_name),
+    );
     if let Err(e) = netns::exec(
         namespace,
         &["ip", "route", "add", "default", "dev", interface_name],
@@ -119,6 +193,10 @@ pub fn up_in_netns(
 
     let has_ipv6 = params.addresses.iter().any(|a| a.contains(':'));
     if has_ipv6 {
+        log_kernel_setup_command(
+            interface_name,
+            &format!("ip -6 route add default dev {}", interface_name),
+        );
         if let Err(e) = netns::exec(
             namespace,
             &["ip", "-6", "route", "add", "default", "dev", interface_name],
@@ -130,17 +208,27 @@ pub fn up_in_netns(
     }
 
     let netns_etc = format!("/etc/netns/{}", namespace);
+    log_kernel_setup_command(interface_name, &format!("mkdir -p {}", netns_etc));
     client.ensure_dir(&netns_etc, 0o700)?;
     let dns_content: String = params
         .dns_servers
         .iter()
         .map(|d| format!("nameserver {}\n", d))
         .collect();
+    log_kernel_setup_command(interface_name, &format!("write {}/resolv.conf", netns_etc));
     client.write_file(
         &format!("{}/resolv.conf", netns_etc),
         dns_content.as_bytes(),
         0o644,
     )?;
+
+    info!(
+        interface = interface_name,
+        namespace,
+        ipv6_default = has_ipv6,
+        dns_servers = params.dns_servers.len(),
+        "kernel_tunnel_setup_in_namespace_complete"
+    );
 
     Ok(())
 }
@@ -150,6 +238,14 @@ pub fn down(state: &ConnectionState) -> Result<()> {
     let iface = &state.interface_name;
     let client = PrivilegedClient::new();
 
+    info!(
+        interface = iface,
+        provider = state.provider,
+        server = state.server_display_name,
+        "kernel_tunnel_teardown_start"
+    );
+
+    log_kernel_teardown_command(iface, &format!("ip link delete dev {}", iface));
     let _ = client.interface_delete(iface);
 
     if let (Some(gw_ip), Some(gw_iface)) =
@@ -161,16 +257,27 @@ pub fn down(state: &ConnectionState) -> Result<()> {
             .next()
             .unwrap_or(&state.server_endpoint);
         let host_route = format!("{}/32", endpoint_ip);
+        log_kernel_teardown_command(
+            iface,
+            &format!("ip route del {} via {} dev {}", host_route, gw_ip, gw_iface),
+        );
         let _ = client.host_ip_route_del(&host_route, Some(gw_ip), gw_iface);
     }
 
     if let Some(ref original) = state.original_resolv_conf {
         if should_manage_global_resolv_conf() {
+            log_kernel_teardown_command(iface, "write /etc/resolv.conf");
             client.write_file("/etc/resolv.conf", original.as_bytes(), 0o644)?;
         }
     }
 
     ConnectionState::remove(&state.instance_name)?;
+    info!(
+        interface = iface,
+        provider = state.provider,
+        server = state.server_display_name,
+        "kernel_tunnel_teardown_complete"
+    );
     Ok(())
 }
 
@@ -180,12 +287,34 @@ fn bring_up(
     gw_ip: &str,
     gw_iface: &str,
     manage_resolv_conf: bool,
+    disable_ipv6: bool,
 ) -> Result<()> {
     let client = PrivilegedClient::new();
+    info!(
+        interface = interface_name,
+        endpoint_host = params.server_ip,
+        endpoint_port = params.server_port,
+        address_count = params.addresses.len(),
+        dns_servers = params.dns_servers.len(),
+        manage_resolv_conf,
+        "kernel_tunnel_apply_start"
+    );
+
+    log_kernel_setup_command(
+        interface_name,
+        &format!("ip link add dev {} type wireguard", interface_name),
+    );
     client.interface_create_wireguard(interface_name)?;
 
     let endpoint = format!("{}:{}", params.server_ip, params.server_port);
     let allowed_ips_wg = params.allowed_ips.replace(", ", ",");
+    log_kernel_setup_command(
+        interface_name,
+        &format!(
+            "wg set {} peer {} endpoint {} allowed-ips {}",
+            interface_name, params.server_public_key, endpoint, allowed_ips_wg
+        ),
+    );
     client.wireguard_set(
         interface_name,
         params.private_key,
@@ -195,15 +324,79 @@ fn bring_up(
     )?;
 
     for addr in params.addresses {
+        log_kernel_setup_command(
+            interface_name,
+            &format!("ip addr add {} dev {}", addr, interface_name),
+        );
         client.host_ip_addr_add(interface_name, addr)?;
     }
 
+    log_kernel_setup_command(
+        interface_name,
+        &format!("ip link set up dev {}", interface_name),
+    );
     client.host_ip_link_set_up(interface_name)?;
 
     let host_route = format!("{}/32", params.server_ip);
+    log_kernel_setup_command(
+        interface_name,
+        &format!("ip route add {} via {} dev {}", host_route, gw_ip, gw_iface),
+    );
     client.host_ip_route_add(&host_route, Some(gw_ip), gw_iface)?;
+    log_kernel_setup_command(
+        interface_name,
+        &format!("ip route add 0.0.0.0/1 dev {}", interface_name),
+    );
     client.host_ip_route_add("0.0.0.0/1", None, interface_name)?;
+    log_kernel_setup_command(
+        interface_name,
+        &format!("ip route add 128.0.0.0/1 dev {}", interface_name),
+    );
     client.host_ip_route_add("128.0.0.0/1", None, interface_name)?;
+    info!(
+        interface = interface_name,
+        "kernel_ipv4_split_routes_installed"
+    );
+
+    if should_install_ipv6_default_routes(params) {
+        log_kernel_setup_command(
+            interface_name,
+            &format!("ip -6 route add ::/1 dev {}", interface_name),
+        );
+        client.host_ip_route_add("::/1", None, interface_name)?;
+        log_kernel_setup_command(
+            interface_name,
+            &format!("ip -6 route add 8000::/1 dev {}", interface_name),
+        );
+        client.host_ip_route_add("8000::/1", None, interface_name)?;
+        info!(
+            interface = interface_name,
+            "kernel_ipv6_split_routes_installed"
+        );
+    } else if allowed_ips_contains_ipv6_default(params.allowed_ips) {
+        if disable_ipv6 {
+            log_kernel_setup_command(
+                interface_name,
+                &format!("ip -6 route add ::/1 dev {}", interface_name),
+            );
+            client.host_ip_route_add("::/1", None, interface_name)?;
+            log_kernel_setup_command(
+                interface_name,
+                &format!("ip -6 route add 8000::/1 dev {}", interface_name),
+            );
+            client.host_ip_route_add("8000::/1", None, interface_name)?;
+            info!(
+                interface = interface_name,
+                "kernel_ipv6_fallback_block_routes_installed"
+            );
+        } else {
+            warn!(
+                interface = interface_name,
+                allowed_ips = params.allowed_ips,
+                "kernel_ipv6_default_requested_but_no_ipv6_interface_address"
+            );
+        }
+    }
 
     let dns_content: String = params
         .dns_servers
@@ -211,7 +404,18 @@ fn bring_up(
         .map(|d| format!("nameserver {}\n", d))
         .collect();
     if manage_resolv_conf {
+        log_kernel_setup_command(interface_name, "write /etc/resolv.conf");
         client.write_file("/etc/resolv.conf", dns_content.as_bytes(), 0o644)?;
+        info!(
+            interface = interface_name,
+            dns_servers = params.dns_servers.len(),
+            "kernel_resolv_conf_updated"
+        );
+    } else {
+        info!(
+            interface = interface_name,
+            "kernel_resolv_conf_skipped_systemd_resolved_managed"
+        );
     }
 
     Ok(())
@@ -219,6 +423,33 @@ fn bring_up(
 
 fn should_manage_global_resolv_conf() -> bool {
     !is_systemd_resolved_managed_resolv_conf("/etc/resolv.conf")
+}
+
+fn log_kernel_setup_command(interface_name: &str, command: &str) {
+    info!(interface = interface_name, command, "kernel_setup_command");
+}
+
+fn log_kernel_teardown_command(interface_name: &str, command: &str) {
+    info!(
+        interface = interface_name,
+        command, "kernel_teardown_command"
+    );
+}
+
+fn should_install_ipv6_default_routes(params: &WgConfigParams<'_>) -> bool {
+    has_ipv6_interface_address(params.addresses)
+        && allowed_ips_contains_ipv6_default(params.allowed_ips)
+}
+
+fn has_ipv6_interface_address(addresses: &[&str]) -> bool {
+    addresses.iter().any(|cidr| {
+        let ip = cidr.split('/').next().unwrap_or_default().trim();
+        ip.parse::<IpAddr>().is_ok_and(|addr| addr.is_ipv6())
+    })
+}
+
+fn allowed_ips_contains_ipv6_default(allowed_ips: &str) -> bool {
+    allowed_ips.split(',').any(|entry| entry.trim() == "::/0")
 }
 
 fn is_systemd_resolved_managed_resolv_conf(path: &str) -> bool {
@@ -291,5 +522,26 @@ mod tests {
     fn test_parse_default_route_no_default() {
         let output = "10.0.0.0/24 dev eth0 proto kernel scope link src 10.0.0.5\n";
         assert!(parse_default_route(output).is_err());
+    }
+
+    #[test]
+    fn test_should_install_ipv6_default_routes_true() {
+        let addresses = ["10.0.0.2/32", "fd7d:76ee:e68f:a993::2/128"];
+        assert!(has_ipv6_interface_address(&addresses));
+        assert!(allowed_ips_contains_ipv6_default("0.0.0.0/0, ::/0"));
+    }
+
+    #[test]
+    fn test_should_install_ipv6_default_routes_false_without_v6_address() {
+        let addresses = ["10.0.0.2/32"];
+        assert!(!has_ipv6_interface_address(&addresses));
+        assert!(allowed_ips_contains_ipv6_default("0.0.0.0/0,::/0"));
+    }
+
+    #[test]
+    fn test_should_install_ipv6_default_routes_false_without_v6_allowed_ips() {
+        let addresses = ["fd7d:76ee:e68f:a993::2/128"];
+        assert!(has_ipv6_interface_address(&addresses));
+        assert!(!allowed_ips_contains_ipv6_default("0.0.0.0/0"));
     }
 }

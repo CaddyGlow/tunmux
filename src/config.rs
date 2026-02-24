@@ -19,6 +19,7 @@ pub struct AppConfig {
     pub airvpn: AirVpnConfig,
     pub mullvad: MullvadConfig,
     pub ivpn: IvpnConfig,
+    pub wgconf: WgconfConfig,
 }
 
 #[derive(Debug, Deserialize)]
@@ -36,6 +37,7 @@ pub struct GeneralConfig {
     pub privileged_authorized_group: String,
     pub privileged_autostop_mode: PrivilegedAutostopMode,
     pub privileged_autostop_timeout_ms: u64,
+    pub hooks: HookConfig,
 }
 
 impl Default for GeneralConfig {
@@ -53,8 +55,16 @@ impl Default for GeneralConfig {
             privileged_authorized_group: String::new(),
             privileged_autostop_mode: PrivilegedAutostopMode::Never,
             privileged_autostop_timeout_ms: 30000,
+            hooks: HookConfig::default(),
         }
     }
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(default)]
+pub struct HookConfig {
+    pub ifup: Vec<String>,
+    pub ifdown: Vec<String>,
 }
 
 #[derive(Debug, Clone, Copy, Default, Deserialize, PartialEq, Eq)]
@@ -70,9 +80,13 @@ pub enum CredentialStore {
 fn default_backend() -> &'static str {
     #[cfg(target_os = "macos")]
     {
-        "userspace"
+        "wg-quick"
     }
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(all(unix, not(target_os = "macos")))]
+    {
+        "kernel"
+    }
+    #[cfg(not(unix))]
     {
         "wg-quick"
     }
@@ -110,6 +124,7 @@ pub enum PrivilegedTransport {
 #[serde(default)]
 pub struct ProtonConfig {
     pub default_country: Option<String>,
+    pub hooks: HookConfig,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -117,18 +132,27 @@ pub struct ProtonConfig {
 pub struct AirVpnConfig {
     pub default_country: Option<String>,
     pub default_device: Option<String>,
+    pub hooks: HookConfig,
 }
 
 #[derive(Debug, Default, Deserialize)]
 #[serde(default)]
 pub struct MullvadConfig {
     pub default_country: Option<String>,
+    pub hooks: HookConfig,
 }
 
 #[derive(Debug, Default, Deserialize)]
 #[serde(default)]
 pub struct IvpnConfig {
     pub default_country: Option<String>,
+    pub hooks: HookConfig,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(default)]
+pub struct WgconfConfig {
+    pub hooks: HookConfig,
 }
 
 pub fn load_config() -> AppConfig {
@@ -152,6 +176,7 @@ pub enum Provider {
     AirVpn,
     Mullvad,
     Ivpn,
+    Wgconf,
 }
 
 impl Provider {
@@ -162,6 +187,7 @@ impl Provider {
             Provider::AirVpn => "airvpn",
             Provider::Mullvad => "mullvad",
             Provider::Ivpn => "ivpn",
+            Provider::Wgconf => "wgconf",
         }
     }
 }
