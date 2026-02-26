@@ -74,6 +74,18 @@ fn cmd_connect(args: WgconfConnectArgs, config: &AppConfig) -> anyhow::Result<()
             "--disable-ipv6 is supported only for direct kernel mode (no --proxy/--local-proxy)"
         );
     }
+    if args.mtu.is_some() && args.local_proxy {
+        anyhow::bail!("--mtu is not supported with --local-proxy");
+    }
+    if args.mtu.is_some()
+        && !args.proxy
+        && !args.local_proxy
+        && backend != wireguard::backend::WgBackend::Kernel
+    {
+        anyhow::bail!(
+            "--mtu for wgconf is supported only in kernel mode (or with --proxy kernel mode)"
+        );
+    }
 
     let source = resolve_source(args.file.as_deref(), args.profile.as_deref())?;
 
@@ -105,14 +117,21 @@ fn cmd_connect(args: WgconfConnectArgs, config: &AppConfig) -> anyhow::Result<()
         let routed = routed
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("missing parsed routed config"))?;
-        connect_proxy(&source, routed, config)?;
+        connect_proxy(&source, routed, args.mtu, config)?;
     } else if args.local_proxy {
         let routed = routed
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("missing parsed routed config"))?;
-        connect_local_proxy(&source, routed, config)?;
+        connect_local_proxy(&source, routed, args.mtu, config)?;
     } else {
-        connect_direct(&source, backend, routed.as_ref(), args.disable_ipv6, config)?;
+        connect_direct(
+            &source,
+            backend,
+            routed.as_ref(),
+            args.disable_ipv6,
+            args.mtu,
+            config,
+        )?;
     }
 
     Ok(())
@@ -149,6 +168,7 @@ fn connect_direct(
     backend: wireguard::backend::WgBackend,
     routed: Option<&RoutedConfig>,
     disable_ipv6: bool,
+    mtu: Option<u16>,
     config: &AppConfig,
 ) -> anyhow::Result<()> {
     use wireguard::connection::DIRECT_INSTANCE;
@@ -167,6 +187,9 @@ fn connect_direct(
     let state_endpoint = routed
         .map(|cfg| format_endpoint(&cfg.server_ip, cfg.server_port))
         .unwrap_or_else(|| best_effort_endpoint(&source.config_text));
+    let state_dns_servers = wireguard::config::parse_config(&source.config_text)
+        .map(|parsed| parsed.dns_servers)
+        .unwrap_or_default();
 
     match backend {
         wireguard::backend::WgBackend::WgQuick => {
@@ -186,6 +209,7 @@ fn connect_direct(
                 proxy_pid: None,
                 socks_port: None,
                 http_port: None,
+                dns_servers: state_dns_servers.clone(),
                 peer_public_key: None,
                 local_public_key: None,
                 virtual_ips: vec![],
@@ -209,6 +233,7 @@ fn connect_direct(
                 proxy_pid: None,
                 socks_port: None,
                 http_port: None,
+                dns_servers: state_dns_servers.clone(),
                 peer_public_key: None,
                 local_public_key: None,
                 virtual_ips: vec![],
@@ -233,6 +258,7 @@ fn connect_direct(
                 private_key: &routed.private_key,
                 addresses: &addresses,
                 dns_servers: &dns_servers,
+                mtu,
                 server_public_key: &routed.server_public_key,
                 server_ip: &routed.server_ip,
                 server_port: routed.server_port,
@@ -266,6 +292,7 @@ fn connect_direct(
 fn connect_proxy(
     source: &ConfigSource,
     routed: &RoutedConfig,
+    mtu: Option<u16>,
     config: &AppConfig,
 ) -> anyhow::Result<()> {
     let instance = proxy::instance_name(&source.instance_seed);
@@ -295,6 +322,7 @@ fn connect_proxy(
         private_key: &routed.private_key,
         addresses: &addresses,
         dns_servers: &dns_servers,
+        mtu,
         server_public_key: &routed.server_public_key,
         server_ip: &routed.server_ip,
         server_port: routed.server_port,
@@ -315,7 +343,8 @@ fn connect_proxy(
         return Err(e.into());
     }
 
-    let pid = match proxy::spawn_daemon(&instance, &namespace_name, &proxy_config) {
+    let pid = match proxy::spawn_daemon(&instance, &interface_name, &namespace_name, &proxy_config)
+    {
         Ok(pid) => pid,
         Err(e) => {
             netns::delete(&namespace_name)?;
@@ -337,6 +366,7 @@ fn connect_proxy(
         proxy_pid: Some(pid),
         socks_port: Some(proxy_config.socks_port),
         http_port: Some(proxy_config.http_port),
+        dns_servers: routed.dns_servers.clone(),
         peer_public_key: None,
         local_public_key: None,
         virtual_ips: vec![],
@@ -356,6 +386,7 @@ fn connect_proxy(
 fn connect_local_proxy(
     source: &ConfigSource,
     routed: &RoutedConfig,
+    mtu: Option<u16>,
     config: &AppConfig,
 ) -> anyhow::Result<()> {
     let instance = proxy::instance_name(&source.instance_seed);
@@ -382,6 +413,7 @@ fn connect_local_proxy(
         private_key: &routed.private_key,
         addresses: &addresses,
         dns_servers: &dns_servers,
+        mtu,
         server_public_key: &routed.server_public_key,
         server_ip: &routed.server_ip,
         server_port: routed.server_port,
@@ -419,6 +451,7 @@ fn connect_local_proxy(
         proxy_pid: Some(pid),
         socks_port: Some(proxy_config.socks_port),
         http_port: Some(proxy_config.http_port),
+        dns_servers: routed.dns_servers.clone(),
         peer_public_key: Some(routed.server_public_key.clone()),
         local_public_key,
         virtual_ips: routed.addresses.clone(),

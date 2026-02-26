@@ -154,6 +154,7 @@ pub async fn dispatch(command: MullvadCommand, config: &AppConfig) -> anyhow::Re
                 args.proxy,
                 args.local_proxy,
                 args.disable_ipv6,
+                args.mtu,
                 args.socks_port,
                 args.http_port,
                 args.proxy_access_log,
@@ -503,6 +504,7 @@ async fn cmd_connect(
     use_proxy: bool,
     use_local_proxy: bool,
     disable_ipv6: bool,
+    mtu_arg: Option<u16>,
     socks_port_arg: Option<u16>,
     http_port_arg: Option<u16>,
     proxy_access_log_arg: bool,
@@ -598,6 +600,7 @@ async fn cmd_connect(
         private_key: &session.wg_private_key,
         addresses: &address_refs,
         dns_servers: &dns_refs,
+        mtu: mtu_arg,
         server_public_key: &relay.public_key,
         server_ip: &relay.ipv4_addr_in,
         server_port,
@@ -678,7 +681,8 @@ fn connect_proxy(
         return Err(e.into());
     }
 
-    let pid = match proxy::spawn_daemon(&instance, &namespace_name, &proxy_config) {
+    let pid = match proxy::spawn_daemon(&instance, &interface_name, &namespace_name, &proxy_config)
+    {
         Ok(pid) => pid,
         Err(e) => {
             netns::delete(&namespace_name)?;
@@ -700,6 +704,7 @@ fn connect_proxy(
         proxy_pid: Some(pid),
         socks_port: Some(proxy_config.socks_port),
         http_port: Some(proxy_config.http_port),
+        dns_servers: params.dns_servers.iter().map(|s| s.to_string()).collect(),
         peer_public_key: None,
         local_public_key: None,
         virtual_ips: vec![],
@@ -777,6 +782,7 @@ fn connect_local_proxy(
         proxy_pid: Some(pid),
         socks_port: Some(proxy_config.socks_port),
         http_port: Some(proxy_config.http_port),
+        dns_servers: params.dns_servers.iter().map(|s| s.to_string()).collect(),
         peer_public_key: Some(params.server_public_key.to_string()),
         local_public_key,
         virtual_ips: params.addresses.iter().map(|s| s.to_string()).collect(),
@@ -832,6 +838,7 @@ fn connect_direct(
                 proxy_pid: None,
                 socks_port: None,
                 http_port: None,
+                dns_servers: params.dns_servers.iter().map(|s| s.to_string()).collect(),
                 peer_public_key: None,
                 local_public_key: None,
                 virtual_ips: vec![],
@@ -857,6 +864,7 @@ fn connect_direct(
                 proxy_pid: None,
                 socks_port: None,
                 http_port: None,
+                dns_servers: params.dns_servers.iter().map(|s| s.to_string()).collect(),
                 peer_public_key: None,
                 local_public_key: None,
                 virtual_ips: vec![],

@@ -27,6 +27,8 @@ pub struct ConnectionState {
     pub proxy_pid: Option<u32>,
     pub socks_port: Option<u16>,
     pub http_port: Option<u16>,
+    #[serde(default)]
+    pub dns_servers: Vec<String>,
     /// Base64-encoded WireGuard public key of the remote peer (local-proxy mode).
     #[serde(default)]
     pub peer_public_key: Option<String>,

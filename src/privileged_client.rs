@@ -250,6 +250,13 @@ impl PrivilegedClient {
         })
     }
 
+    pub fn host_ip_link_set_mtu(&self, interface: &str, mtu: u16) -> Result<()> {
+        self.send_unit(PrivilegedRequest::HostIpLinkSetMtu {
+            interface: interface.to_string(),
+            mtu,
+        })
+    }
+
     pub fn host_ip_route_add(&self, destination: &str, via: Option<&str>, dev: &str) -> Result<()> {
         self.send_unit(PrivilegedRequest::HostIpRouteAdd {
             destination: destination.to_string(),
@@ -381,22 +388,27 @@ impl PrivilegedClient {
         self.send_unit(PrivilegedRequest::KillPid { pid, signal })
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn spawn_proxy_daemon(
         &self,
         netns: &str,
+        interface: &str,
         socks_port: u16,
         http_port: u16,
         proxy_access_log: bool,
         pid_file: &str,
         log_file: &str,
+        startup_status_file: &str,
     ) -> Result<u32> {
         match self.send(PrivilegedRequest::SpawnProxyDaemon {
             netns: netns.to_string(),
+            interface: interface.to_string(),
             socks_port,
             http_port,
             proxy_access_log,
             pid_file: pid_file.to_string(),
             log_file: log_file.to_string(),
+            startup_status_file: startup_status_file.to_string(),
         })? {
             PrivilegedResponse::Pid(pid) => Ok(pid),
             _ => Err(AppError::Other(
@@ -1204,6 +1216,7 @@ fn request_kind(request: &PrivilegedRequest) -> &'static str {
         PrivilegedRequest::NetnsExec { .. } => "NetnsExec",
         PrivilegedRequest::HostIpAddrAdd { .. } => "HostIpAddrAdd",
         PrivilegedRequest::HostIpLinkSetUp { .. } => "HostIpLinkSetUp",
+        PrivilegedRequest::HostIpLinkSetMtu { .. } => "HostIpLinkSetMtu",
         PrivilegedRequest::HostIpRouteAdd { .. } => "HostIpRouteAdd",
         PrivilegedRequest::HostIpRouteDel { .. } => "HostIpRouteDel",
         PrivilegedRequest::HostResolvedSetDns { .. } => "HostResolvedSetDns",

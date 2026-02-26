@@ -3,6 +3,8 @@ use crate::privileged_api::GotaTunAction;
 use crate::privileged_client::PrivilegedClient;
 use tracing::info;
 
+use super::handshake;
+
 /// Bring up a WireGuard tunnel using the embedded gotatun userspace backend.
 pub fn up(config_content: &str, interface_name: &str) -> Result<()> {
     let client = PrivilegedClient::new();
@@ -10,7 +12,9 @@ pub fn up(config_content: &str, interface_name: &str) -> Result<()> {
         interface = ?interface_name,
         "Requesting privileged gotatun userspace up"
     );
-    client.gotatun_run(GotaTunAction::Up, interface_name, config_content)
+    client.gotatun_run(GotaTunAction::Up, interface_name, config_content)?;
+    let dns_servers = handshake::dns_servers_from_config(config_content);
+    handshake::wait_for_handshake(interface_name, &dns_servers)
 }
 
 /// Tear down a userspace WireGuard tunnel.

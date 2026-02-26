@@ -351,7 +351,8 @@ pub fn wg_set_device(
     msg.add_attr_u32(WGDEVICE_A_FLAGS, WGDEVICE_F_REPLACE_PEERS);
 
     let peers_pos = msg.attr_start(WGDEVICE_A_PEERS);
-    let peer_pos = msg.attr_start(0); // peer index 0 (nested in peers)
+    // Netlink nested arrays are 1-indexed; index 0 may be ignored by the kernel.
+    let peer_pos = msg.attr_start(1); // first peer entry (nested in peers)
 
     msg.add_attr(WGPEER_A_PUBLIC_KEY, &pub_key);
     msg.add_attr_u32(WGPEER_A_FLAGS, WGPEER_F_REPLACE_ALLOWEDIPS);
@@ -364,7 +365,7 @@ pub fn wg_set_device(
             continue;
         }
         let (af, ip_bytes, prefix) = parse_cidr(cidr)?;
-        let aip_pos = msg.attr_start(i as u16); // index within allowedips
+        let aip_pos = msg.attr_start((i + 1) as u16); // 1-indexed within allowedips
         msg.add_attr_u16(WGALLOWEDIP_A_FAMILY, af);
         msg.add_attr(WGALLOWEDIP_A_IPADDR, &ip_bytes);
         msg.add_attr(WGALLOWEDIP_A_CIDR_MASK, &[prefix]);
@@ -393,7 +394,7 @@ pub fn wg_set_psk(interface: &str, peer_pubkey_b64: &str, psk_b64: &str) -> Resu
     msg.add_attr_str(WGDEVICE_A_IFNAME, interface);
 
     let peers_pos = msg.attr_start(WGDEVICE_A_PEERS);
-    let peer_pos = msg.attr_start(0);
+    let peer_pos = msg.attr_start(1);
     msg.add_attr(WGPEER_A_PUBLIC_KEY, &pub_key);
     msg.add_attr(WGPEER_A_PRESHARED_KEY, &psk);
     msg.attr_end(peer_pos);
@@ -542,6 +543,11 @@ fn build_peer_uapi(peer_data: &[u8]) -> String {
         match ty {
             WGPEER_A_PUBLIC_KEY if val.len() == 32 => {
                 out.push_str("public_key=");
+                out.push_str(&bytes_to_hex(val));
+                out.push('\n');
+            }
+            WGPEER_A_PRESHARED_KEY if val.len() == 32 => {
+                out.push_str("preshared_key=");
                 out.push_str(&bytes_to_hex(val));
                 out.push('\n');
             }

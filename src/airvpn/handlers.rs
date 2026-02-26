@@ -12,7 +12,7 @@ use crate::shared::latency;
 use crate::wireguard;
 
 use super::api::AirVpnClient;
-use super::models::{AirManifest, AirSession};
+use super::models::{AirManifest, AirServer, AirSession};
 use super::web::{AirVpnWeb, AirVpnWebApi};
 
 const PROVIDER: Provider = Provider::AirVpn;
@@ -35,6 +35,7 @@ pub async fn dispatch(command: AirVpnCommand, config: &AppConfig) -> anyhow::Res
                 args.proxy,
                 args.local_proxy,
                 args.disable_ipv6,
+                args.mtu,
                 args.socks_port,
                 args.http_port,
                 args.proxy_access_log,
@@ -144,47 +145,36 @@ async fn cmd_servers(
         servers.retain(|s| airvpn_server_matches_tags(s, &normalized_tags));
     }
 
-    let sort_by_latency = sort == "latency";
+    let sort_with_latency = sort == "latency" || sort == "score";
 
-    if sort_by_latency {
+    if sort_with_latency {
         let wg_mode = manifest
             .wg_modes
             .first()
             .ok_or_else(|| error::AppError::Other("no WireGuard modes in manifest".into()))?;
-        let entry_idx = wg_mode.entry_index as usize;
-
-        let mut targets: Vec<(String, u16)> = Vec::new();
-        let mut target_indexes: Vec<usize> = Vec::new();
-        for (idx, server) in servers.iter().enumerate() {
-            if let Some(ip) = server
-                .ips_entry
-                .get(entry_idx)
-                .or_else(|| server.ips_entry.first())
-            {
-                targets.push((ip.clone(), wg_mode.port));
-                target_indexes.push(idx);
-            }
+        let latencies =
+            probe_airvpn_latencies(&servers, wg_mode.entry_index as usize, wg_mode.port).await;
+        let mut rows: Vec<(AirServer, Option<Duration>, i64)> = servers
+            .into_iter()
+            .zip(latencies)
+            .map(|(server, latency)| {
+                let score = airvpn_eddie_speed_score(&server, latency);
+                (server, latency, score)
+            })
+            .collect();
+        match sort.as_str() {
+            "latency" => rows.sort_by(|a, b| {
+                latency_order(&a.1, &b.1)
+                    .then_with(|| a.2.cmp(&b.2))
+                    .then_with(|| a.0.name.cmp(&b.0.name))
+            }),
+            "score" => rows.sort_by(|a, b| {
+                a.2.cmp(&b.2)
+                    .then_with(|| latency_order(&a.1, &b.1))
+                    .then_with(|| a.0.name.cmp(&b.0.name))
+            }),
+            _ => unreachable!(),
         }
-
-        let measured = latency::probe_endpoints_tcp(&targets, Duration::from_millis(800), 24).await;
-        let mut latencies = vec![None; servers.len()];
-        for (probe_idx, latency) in measured.into_iter().enumerate() {
-            if let Some(server_idx) = target_indexes.get(probe_idx) {
-                latencies[*server_idx] = latency;
-            }
-        }
-
-        let mut rows: Vec<(super::models::AirServer, Option<Duration>)> =
-            servers.into_iter().zip(latencies).collect();
-        rows.sort_by(|a, b| {
-            latency_order(&a.1, &b.1)
-                .then_with(|| {
-                    airvpn_load_ratio(&a.0)
-                        .partial_cmp(&airvpn_load_ratio(&b.0))
-                        .unwrap_or(Ordering::Equal)
-                })
-                .then_with(|| a.0.name.cmp(&b.0.name))
-        });
 
         if rows.is_empty() {
             println!("No servers match the given filters.");
@@ -192,20 +182,21 @@ async fn cmd_servers(
         }
 
         println!(
-            "{:<20} {:>2}  {:>12}  {:>6}  {:>6}  {:>8}  Location",
-            "Name", "CC", "Bandwidth", "Users", "Max", "Latency"
+            "{:<20} {:>2}  {:>12}  {:>6}  {:>6}  {:>7}  {:>8}  Location",
+            "Name", "CC", "Bandwidth", "Users", "Max", "Score", "Latency"
         );
-        println!("{}", "-".repeat(84));
+        println!("{}", "-".repeat(94));
 
-        for (server, latency) in &rows {
+        for (server, latency, score) in &rows {
             let bw_mbps = server.bandwidth / 1_000_000;
             println!(
-                "{:<20} {:>2}  {:>9} Mb  {:>4}/{:<4}  {:>8}  {}",
+                "{:<20} {:>2}  {:>9} Mb  {:>4}/{:<4}  {:>7}  {:>8}  {}",
                 server.name,
                 server.country_code,
                 bw_mbps,
                 server.users,
                 server.users_max,
+                score,
                 format_latency(*latency),
                 server.location,
             );
@@ -225,6 +216,14 @@ async fn cmd_servers(
                     .partial_cmp(&airvpn_load_ratio(b))
                     .unwrap_or(Ordering::Equal)
                     .then_with(|| a.name.cmp(&b.name))
+            });
+        }
+        "score" => {
+            servers.sort_by(|a, b| {
+                // No live ping in this mode: same Eddie sentinel score for all.
+                let score_a = airvpn_eddie_speed_score(a, None);
+                let score_b = airvpn_eddie_speed_score(b, None);
+                score_a.cmp(&score_b).then_with(|| a.name.cmp(&b.name))
             });
         }
         _ => unreachable!(),
@@ -256,11 +255,72 @@ async fn cmd_servers(
 }
 
 fn airvpn_load_ratio(server: &super::models::AirServer) -> f64 {
-    if server.users_max > 0 {
-        server.users as f64 / server.users_max as f64
-    } else {
-        1.0
+    airvpn_load_perc(server) as f64
+}
+
+fn airvpn_load_perc(server: &AirServer) -> i64 {
+    if server.bandwidth_max <= 0 {
+        return 100;
     }
+    let bw_cur_mbit = server
+        .bandwidth
+        .saturating_mul(2)
+        .saturating_mul(8)
+        .saturating_div(1_000_000);
+    bw_cur_mbit
+        .saturating_mul(100)
+        .saturating_div(server.bandwidth_max)
+        .max(0)
+}
+
+fn airvpn_users_perc(server: &AirServer) -> i64 {
+    if server.users_max <= 0 {
+        return 100;
+    }
+    server
+        .users
+        .saturating_mul(100)
+        .saturating_div(server.users_max)
+        .max(0)
+}
+
+fn airvpn_eddie_speed_score(server: &AirServer, latency: Option<Duration>) -> i64 {
+    let Some(latency) = latency else {
+        return 99_995;
+    };
+    let ping = latency.as_millis().min(i64::MAX as u128) as i64;
+    ping.saturating_add(airvpn_load_perc(server))
+        .saturating_add(airvpn_users_perc(server))
+        .saturating_add(server.score_base.max(0))
+}
+
+async fn probe_airvpn_latencies(
+    servers: &[AirServer],
+    entry_idx: usize,
+    port: u16,
+) -> Vec<Option<Duration>> {
+    let mut targets: Vec<(String, u16)> = Vec::new();
+    let mut target_indexes: Vec<usize> = Vec::new();
+    for (idx, server) in servers.iter().enumerate() {
+        if let Some(ip) = server
+            .ips_entry
+            .get(entry_idx)
+            .or_else(|| server.ips_entry.first())
+        {
+            targets.push((ip.clone(), port));
+            target_indexes.push(idx);
+        }
+    }
+
+    let measured = latency::probe_endpoints_tcp(&targets, Duration::from_millis(800), 24).await;
+    let mut latencies = vec![None; servers.len()];
+    for (probe_idx, latency) in measured.into_iter().enumerate() {
+        if let Some(server_idx) = target_indexes.get(probe_idx) {
+            latencies[*server_idx] = latency;
+        }
+    }
+
+    latencies
 }
 
 fn latency_order(a: &Option<Duration>, b: &Option<Duration>) -> Ordering {
@@ -289,6 +349,7 @@ async fn cmd_connect(
     use_proxy: bool,
     use_local_proxy: bool,
     disable_ipv6: bool,
+    mtu_arg: Option<u16>,
     socks_port_arg: Option<u16>,
     http_port_arg: Option<u16>,
     proxy_access_log_arg: bool,
@@ -373,43 +434,33 @@ async fn cmd_connect(
             candidates.retain(|s| s.country_code.eq_ignore_ascii_case(&cc_upper));
         }
 
-        if sort == "latency" {
-            let entry_idx = wg_mode.entry_index as usize;
-            let mut targets: Vec<(String, u16)> = Vec::new();
-            let mut idx_map: Vec<usize> = Vec::new();
-            for (idx, candidate) in candidates.iter().enumerate() {
-                if let Some(ip) = candidate
-                    .ips_entry
-                    .get(entry_idx)
-                    .or_else(|| candidate.ips_entry.first())
-                {
-                    targets.push((ip.clone(), wg_mode.port));
-                    idx_map.push(idx);
-                }
+        if sort == "latency" || sort == "score" {
+            let latencies =
+                probe_airvpn_latencies(&candidates, wg_mode.entry_index as usize, wg_mode.port)
+                    .await;
+            let mut rows: Vec<(AirServer, Option<Duration>, i64)> = candidates
+                .into_iter()
+                .zip(latencies)
+                .map(|(server, latency)| {
+                    let score = airvpn_eddie_speed_score(&server, latency);
+                    (server, latency, score)
+                })
+                .collect();
+            match sort.as_str() {
+                "latency" => rows.sort_by(|a, b| {
+                    latency_order(&a.1, &b.1)
+                        .then_with(|| a.2.cmp(&b.2))
+                        .then_with(|| a.0.name.cmp(&b.0.name))
+                }),
+                "score" => rows.sort_by(|a, b| {
+                    a.2.cmp(&b.2)
+                        .then_with(|| latency_order(&a.1, &b.1))
+                        .then_with(|| a.0.name.cmp(&b.0.name))
+                }),
+                _ => unreachable!(),
             }
-
-            let measured =
-                latency::probe_endpoints_tcp(&targets, Duration::from_millis(800), 24).await;
-            let mut latencies = vec![None; candidates.len()];
-            for (probe_idx, latency) in measured.into_iter().enumerate() {
-                if let Some(candidate_idx) = idx_map.get(probe_idx) {
-                    latencies[*candidate_idx] = latency;
-                }
-            }
-
-            let mut rows: Vec<(super::models::AirServer, Option<Duration>)> =
-                candidates.into_iter().zip(latencies).collect();
-            rows.sort_by(|a, b| {
-                latency_order(&a.1, &b.1)
-                    .then_with(|| {
-                        airvpn_load_ratio(&a.0)
-                            .partial_cmp(&airvpn_load_ratio(&b.0))
-                            .unwrap_or(Ordering::Equal)
-                    })
-                    .then_with(|| a.0.name.cmp(&b.0.name))
-            });
             rows.first()
-                .map(|(server, _)| server.clone())
+                .map(|(server, _, _)| server.clone())
                 .ok_or(error::AppError::NoServerFound)?
         } else {
             match sort.as_str() {
@@ -424,6 +475,13 @@ async fn cmd_connect(
                             .then_with(|| a.name.cmp(&b.name))
                     });
                 }
+                "score" => {
+                    candidates.sort_by(|a, b| {
+                        let score_a = airvpn_eddie_speed_score(a, None);
+                        let score_b = airvpn_eddie_speed_score(b, None);
+                        score_a.cmp(&score_b).then_with(|| a.name.cmp(&b.name))
+                    });
+                }
                 _ => unreachable!(),
             }
 
@@ -434,34 +492,26 @@ async fn cmd_connect(
         }
     };
 
-    // Pick the entry IP based on the mode's entry_index
-    let entry_idx = wg_mode.entry_index as usize;
     let server_ip = server
         .ips_entry
-        .get(entry_idx)
+        .get(wg_mode.entry_index as usize)
         .or_else(|| server.ips_entry.first())
+        .map(String::as_str)
         .ok_or_else(|| error::AppError::NoServerFound)?;
-
-    // Build WireGuard config params
-    let ipv4_addr = &wg_key.wg_ipv4;
-    let ipv6_addr = &wg_key.wg_ipv6;
-    let dns_v4 = &wg_key.wg_dns_ipv4;
-    let dns_v6 = &wg_key.wg_dns_ipv6;
-
     let mut addresses: Vec<&str> = Vec::new();
-    if !ipv4_addr.is_empty() {
-        addresses.push(ipv4_addr);
+    if !wg_key.wg_ipv4.is_empty() {
+        addresses.push(wg_key.wg_ipv4.as_str());
     }
-    if !ipv6_addr.is_empty() {
-        addresses.push(ipv6_addr);
+    if !wg_key.wg_ipv6.is_empty() {
+        addresses.push(wg_key.wg_ipv6.as_str());
     }
 
     let mut dns_servers: Vec<&str> = Vec::new();
-    if !dns_v4.is_empty() {
-        dns_servers.push(dns_v4);
+    if !wg_key.wg_dns_ipv4.is_empty() {
+        dns_servers.push(wg_key.wg_dns_ipv4.as_str());
     }
-    if !dns_v6.is_empty() {
-        dns_servers.push(dns_v6);
+    if !wg_key.wg_dns_ipv6.is_empty() {
+        dns_servers.push(wg_key.wg_dns_ipv6.as_str());
     }
 
     let preshared = if wg_key.wg_preshared.is_empty() {
@@ -474,6 +524,7 @@ async fn cmd_connect(
         private_key: &wg_key.wg_private_key,
         addresses: &addresses,
         dns_servers: &dns_servers,
+        mtu: mtu_arg,
         server_public_key: &session.wg_public_key,
         server_ip,
         server_port: wg_mode.port,
@@ -594,7 +645,8 @@ fn connect_proxy(
         return Err(e.into());
     }
 
-    let pid = match proxy::spawn_daemon(&instance, &namespace_name, &proxy_config) {
+    let pid = match proxy::spawn_daemon(&instance, &interface_name, &namespace_name, &proxy_config)
+    {
         Ok(pid) => pid,
         Err(e) => {
             netns::delete(&namespace_name)?;
@@ -616,6 +668,7 @@ fn connect_proxy(
         proxy_pid: Some(pid),
         socks_port: Some(proxy_config.socks_port),
         http_port: Some(proxy_config.http_port),
+        dns_servers: params.dns_servers.iter().map(|s| s.to_string()).collect(),
         peer_public_key: None,
         local_public_key: None,
         virtual_ips: vec![],
@@ -693,6 +746,7 @@ fn connect_local_proxy(
         proxy_pid: Some(pid),
         socks_port: Some(proxy_config.socks_port),
         http_port: Some(proxy_config.http_port),
+        dns_servers: params.dns_servers.iter().map(|s| s.to_string()).collect(),
         peer_public_key: Some(params.server_public_key.to_string()),
         local_public_key,
         virtual_ips: params.addresses.iter().map(|s| s.to_string()).collect(),
@@ -750,6 +804,7 @@ fn connect_direct(
                 proxy_pid: None,
                 socks_port: None,
                 http_port: None,
+                dns_servers: params.dns_servers.iter().map(|s| s.to_string()).collect(),
                 peer_public_key: None,
                 local_public_key: None,
                 virtual_ips: vec![],
@@ -775,6 +830,7 @@ fn connect_direct(
                 proxy_pid: None,
                 socks_port: None,
                 http_port: None,
+                dns_servers: params.dns_servers.iter().map(|s| s.to_string()).collect(),
                 peer_public_key: None,
                 local_public_key: None,
                 virtual_ips: vec![],
@@ -1517,4 +1573,54 @@ fn load_manifest() -> anyhow::Result<AirManifest> {
     })?;
     let manifest: AirManifest = serde_json::from_slice(&data)?;
     Ok(manifest)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn make_server(
+        bandwidth: i64,
+        bandwidth_max: i64,
+        users: i64,
+        users_max: i64,
+        score_base: i64,
+    ) -> AirServer {
+        AirServer {
+            name: "Castor".to_string(),
+            ips_entry: vec!["1.2.3.4".to_string()],
+            country_code: "NL".to_string(),
+            location: "Amsterdam".to_string(),
+            score_base,
+            bandwidth,
+            bandwidth_max,
+            users,
+            users_max,
+            group: "earth".to_string(),
+        }
+    }
+
+    #[test]
+    fn test_airvpn_load_perc_matches_eddie_formula() {
+        let server = make_server(50_000_000, 1000, 10, 100, 0);
+        // Eddie formula: load = ((2 * bw * 8) / 1_000_000) * 100 / bw_max.
+        assert_eq!(airvpn_load_perc(&server), 80);
+    }
+
+    #[test]
+    fn test_airvpn_eddie_speed_score_prefers_lower_latency() {
+        let server = make_server(25_000_000, 1000, 20, 100, 5);
+        let fast = airvpn_eddie_speed_score(&server, Some(Duration::from_millis(20)));
+        let slow = airvpn_eddie_speed_score(&server, Some(Duration::from_millis(60)));
+        assert!(fast < slow);
+    }
+
+    #[test]
+    fn test_airvpn_eddie_speed_score_penalizes_missing_latency() {
+        let server = make_server(0, 1000, 0, 100, 0);
+        let with_ping = airvpn_eddie_speed_score(&server, Some(Duration::from_millis(40)));
+        let missing_ping = airvpn_eddie_speed_score(&server, None);
+        assert!(with_ping < missing_ping);
+        assert_eq!(missing_ping, 99_995);
+    }
 }

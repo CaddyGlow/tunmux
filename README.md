@@ -124,7 +124,7 @@ Common provider flows:
 tunmux <provider> login ...
 tunmux <provider> info
 tunmux <provider> servers [--country XX] [--tag ...] [--sort ...]
-tunmux connect <provider> [server] [--country XX] [--sort ...] [--backend ...] [--proxy|--local-proxy]
+tunmux connect <provider> [server] [--country XX] [--sort ...] [--backend ...] [--mtu N] [--proxy|--local-proxy]
 tunmux disconnect [instance] [--provider <provider>] [--all]
 tunmux <provider> logout
 ```
@@ -179,6 +179,7 @@ tunmux proton servers --country CH --tag p2p --sort latency
 tunmux connect proton US#1
 tunmux connect proton --country CH --p2p
 tunmux connect proton --country CH --sort latency
+tunmux connect proton FR#183 --mtu 1280
 tunmux disconnect --provider proton --all
 tunmux proton logout
 ```
@@ -241,6 +242,7 @@ tunmux connect wgconf --file ./my-tunnel.conf --backend wg-quick
 tunmux connect wgconf --file ./my-tunnel.conf --save-as office
 tunmux connect wgconf --profile office --local-proxy
 tunmux connect wgconf --file ./ipv4-only.conf --backend kernel --disable-ipv6
+tunmux connect wgconf --file ./my-tunnel.conf --backend kernel --mtu 1280
 tunmux wgconf save --file ./my-tunnel.conf --name backup
 tunmux wgconf list
 tunmux wgconf remove backup
@@ -251,6 +253,11 @@ tunmux disconnect --provider wgconf
 `ivpn`, and `wgconf`. It is accepted only for direct kernel mode (no
 `--proxy`/`--local-proxy`) and only when the selected WireGuard config has no
 IPv6 interface address.
+
+`--mtu` is supported by provider `connect` commands. For most providers it
+applies to direct and proxy kernel tunnels, as well as generated wg-quick and
+userspace configs. For `wgconf`, `--mtu` is supported in kernel mode (direct
+or `--proxy`) and is not supported with `--local-proxy`.
 
 ## Linux Namespace Proxy Mode (`--proxy`)
 
@@ -269,6 +276,8 @@ Multiple instances can run at once, each with different exits and ports.
 - no host routing changes (only apps configured to use the proxy are tunneled)
 - available on Linux and macOS
 - supports multiple instances with the same auto-port behavior as `--proxy`
+- hostname resolution for proxy requests prefers the VPN-pushed DNS servers
+- set `TUNMUX_LOCAL_PROXY_DNS_SERVERS` (or `TUNMUX_DNS_SERVERS`) to override local-proxy DNS resolver servers (comma or whitespace separated)
 
 Port behavior:
 - default scan starts at `1080` (SOCKS5) and `8118` (HTTP)
@@ -363,10 +372,12 @@ Hook behavior:
   `TUNMUX_INSTANCE`, `TUNMUX_BACKEND`, `TUNMUX_INTERFACE`, `TUNMUX_SERVER`,
   `TUNMUX_ENDPOINT`, plus optional proxy fields (`TUNMUX_NAMESPACE`, `TUNMUX_SOCKS_PORT`,
   `TUNMUX_HTTP_PORT`, `TUNMUX_PROXY_PID`).
+- Hook env also includes `TUNMUX_DNS_SERVERS` when VPN DNS servers are known.
 - When proxy ports are present, hook commands also receive standard proxy vars:
   `HTTP_PROXY`/`HTTPS_PROXY` and `ALL_PROXY` (plus lowercase variants).
 - Builtin HTTP checks (`external-ip`, `dns-detection`, and proxy-mode `connectivity`) use
   the active connection proxy automatically when available.
+- `dns-detection` reverse DNS lookup prefers VPN-configured DNS servers first.
 - Manual builtin checks: `tunmux hook run connectivity`, `tunmux hook run external-ip`,
   or `tunmux hook run dns-detection`.
 - Debug helper: `tunmux hook debug <instance>` prints the exact env payload used for hooks

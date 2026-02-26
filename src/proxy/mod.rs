@@ -1,6 +1,7 @@
 #![cfg(all(feature = "proxy", target_os = "linux"))]
 
 pub mod daemon;
+pub mod dns;
 pub mod http;
 pub mod socks5;
 
@@ -50,6 +51,11 @@ pub fn log_file(instance: &str) -> PathBuf {
     config::privileged_proxy_dir().join(format!("{}.log", instance))
 }
 
+#[must_use]
+pub fn status_file(instance: &str) -> PathBuf {
+    config::privileged_proxy_dir().join(format!("{}.status", instance))
+}
+
 /// Path helpers for user-owned local-proxy instance files.
 #[must_use]
 pub fn local_pid_file(instance: &str) -> PathBuf {
@@ -65,20 +71,24 @@ pub fn local_log_file(instance: &str) -> PathBuf {
 /// Returns the daemon PID.
 pub fn spawn_daemon(
     instance: &str,
+    interface_name: &str,
     netns_name: &str,
     proxy_config: &ProxyConfig,
 ) -> anyhow::Result<u32> {
     let client = PrivilegedClient::new();
     let pid_path = pid_file(instance);
     let log_path = log_file(instance);
+    let status_path = status_file(instance);
 
     let pid = client.spawn_proxy_daemon(
         netns_name,
+        interface_name,
         proxy_config.socks_port,
         proxy_config.http_port,
         proxy_config.access_log,
         &pid_path.to_string_lossy(),
         &log_path.to_string_lossy(),
+        &status_path.to_string_lossy(),
     )?;
 
     info!( pid = ?pid, namespace = ?netns_name, "spawned_proxy_daemon");

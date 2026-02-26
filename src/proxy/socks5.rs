@@ -10,6 +10,8 @@ use tokio::sync::RwLock;
 use tokio::task::AbortHandle;
 use tracing::{debug, info, warn};
 
+use crate::proxy::dns::{resolve_host_port, DnsResolver};
+
 // SOCKS5 constants
 const SOCKS_VERSION: u8 = 0x05;
 const AUTH_NONE: u8 = 0x00;
@@ -85,6 +87,7 @@ pub async fn handle_socks5(
     mut client: TcpStream,
     associations: Arc<UdpAssociations>,
     udp_relay: Option<(Arc<UdpSocket>, SocketAddr)>,
+    dns_resolver: Option<DnsResolver>,
     access_log: bool,
 ) -> anyhow::Result<()> {
     // 1. Greeting: client sends version + method list
@@ -112,7 +115,7 @@ pub async fn handle_socks5(
     let atyp = client.read_u8().await?;
 
     match cmd {
-        CMD_CONNECT => handle_connect(client, atyp, access_log).await,
+        CMD_CONNECT => handle_connect(client, atyp, dns_resolver, access_log).await,
         CMD_UDP_ASSOCIATE => {
             handle_udp_associate(client, atyp, associations, udp_relay, access_log).await
         }
@@ -151,7 +154,12 @@ async fn parse_address(client: &mut TcpStream, atyp: u8) -> anyhow::Result<(Stri
     Ok((addr, port))
 }
 
-async fn handle_connect(mut client: TcpStream, atyp: u8, access_log: bool) -> anyhow::Result<()> {
+async fn handle_connect(
+    mut client: TcpStream,
+    atyp: u8,
+    dns_resolver: Option<DnsResolver>,
+    access_log: bool,
+) -> anyhow::Result<()> {
     let (addr, port) = parse_address(&mut client, atyp).await?;
     let target = format!("{}:{}", addr, port);
     let peer_addr = client.peer_addr().ok().map(|addr| addr.to_string());
@@ -162,7 +170,21 @@ async fn handle_connect(mut client: TcpStream, atyp: u8, access_log: bool) -> an
             target = ?target.as_str(), "proxy_socks5_access_connect");
     }
 
-    match TcpStream::connect(&target).await {
+    let resolved_target = match resolve_host_port(addr.as_str(), port, dns_resolver.as_ref()).await
+    {
+        Ok(target) => target,
+        Err(error) => {
+            warn!(
+                target = ?target.as_str(),
+                error = ?error.to_string(),
+                "socks5_dns_resolve_failed"
+            );
+            send_reply(&mut client, REP_GENERAL_FAILURE, None).await?;
+            return Ok(());
+        }
+    };
+
+    match TcpStream::connect(resolved_target).await {
         Ok(mut remote) => {
             send_reply(&mut client, REP_SUCCESS, None).await?;
             let result = tokio::io::copy_bidirectional(&mut client, &mut remote).await;
@@ -523,6 +545,7 @@ mod tests {
                 stream,
                 associations,
                 Some((relay_socket, relay_addr)),
+                None,
                 false,
             )
             .await;

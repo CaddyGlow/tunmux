@@ -57,6 +57,10 @@ pub enum PrivilegedRequest {
     HostIpLinkSetUp {
         interface: String,
     },
+    HostIpLinkSetMtu {
+        interface: String,
+        mtu: u16,
+    },
     HostIpRouteAdd {
         destination: String,
         via: Option<String>,
@@ -121,11 +125,13 @@ pub enum PrivilegedRequest {
     },
     SpawnProxyDaemon {
         netns: String,
+        interface: String,
         socks_port: u16,
         http_port: u16,
         proxy_access_log: bool,
         pid_file: String,
         log_file: String,
+        startup_status_file: String,
     },
     LeaseAcquire {
         token: String,
@@ -179,6 +185,13 @@ impl PrivilegedRequest {
                 validate_cidr(cidr)
             }
             Self::HostIpLinkSetUp { interface } => validate_interface_name(interface),
+            Self::HostIpLinkSetMtu { interface, mtu } => {
+                validate_interface_name(interface)?;
+                if *mtu < 576 {
+                    return Err("mtu must be >= 576".into());
+                }
+                Ok(())
+            }
             Self::HostIpRouteAdd {
                 destination,
                 via,
@@ -274,18 +287,22 @@ impl PrivilegedRequest {
             }
             Self::SpawnProxyDaemon {
                 netns,
+                interface,
                 socks_port,
                 http_port,
                 proxy_access_log: _,
                 pid_file,
                 log_file,
+                startup_status_file,
             } => {
                 validate_namespace_name(netns)?;
+                validate_interface_name(interface)?;
                 if *socks_port == 0 || *http_port == 0 {
                     return Err("ports must be non-zero".into());
                 }
                 validate_write_path(pid_file)?;
                 validate_write_path(log_file)?;
+                validate_write_path(startup_status_file)?;
                 Ok(())
             }
             Self::LeaseAcquire { token } | Self::LeaseRelease { token } => {

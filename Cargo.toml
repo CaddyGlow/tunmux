@@ -30,6 +30,7 @@ tokio = { version = "1", features = ["full"] }
 
 # HTTP
 reqwest = { version = "0.12", features = ["json", "rustls-tls", "cookies", "blocking"], default-features = false }
+hickory-resolver = { version = "0.24", features = ["tokio-runtime"] }
 
 # Serialization
 serde = { version = "1", features = ["derive"] }
@@ -76,6 +77,7 @@ cookie = "0.18"
 
 # XML parsing
 roxmltree = "0.20"
+x509-parser = "0.16"
 
 # Error handling
 thiserror = "2"
@@ -88,6 +90,7 @@ keyring = { version = "3", optional = true }
 boringtun = "0.7"
 smoltcp = { version = "0.12", default-features = false, features = [
     "socket-tcp",
+    "socket-udp",
     "proto-ipv4",
     "proto-ipv6",
     "medium-ip",

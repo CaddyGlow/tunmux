@@ -358,6 +358,7 @@ fn describe_request(request: &PrivilegedRequest) -> &'static str {
         PrivilegedRequest::NetnsExec { .. } => "NetnsExec",
         PrivilegedRequest::HostIpAddrAdd { .. } => "HostIpAddrAdd",
         PrivilegedRequest::HostIpLinkSetUp { .. } => "HostIpLinkSetUp",
+        PrivilegedRequest::HostIpLinkSetMtu { .. } => "HostIpLinkSetMtu",
         PrivilegedRequest::HostIpRouteAdd { .. } => "HostIpRouteAdd",
         PrivilegedRequest::HostIpRouteDel { .. } => "HostIpRouteDel",
         PrivilegedRequest::HostResolvedSetDns { .. } => "HostResolvedSetDns",
@@ -458,6 +459,19 @@ fn dispatch(request: PrivilegedRequest, control_state: &mut ControlState) -> Pri
 
         PrivilegedRequest::HostIpLinkSetUp { interface } => {
             execute_unit(run(&["ip", "link", "set", "up", "dev", interface.as_str()]))
+        }
+
+        PrivilegedRequest::HostIpLinkSetMtu { interface, mtu } => {
+            let mtu = mtu.to_string();
+            execute_unit(run(&[
+                "ip",
+                "link",
+                "set",
+                "dev",
+                interface.as_str(),
+                "mtu",
+                mtu.as_str(),
+            ]))
         }
 
         PrivilegedRequest::HostIpRouteAdd {
@@ -668,18 +682,22 @@ fn dispatch(request: PrivilegedRequest, control_state: &mut ControlState) -> Pri
 
         PrivilegedRequest::SpawnProxyDaemon {
             netns,
+            interface,
             socks_port,
             http_port,
             proxy_access_log,
             pid_file,
             log_file,
+            startup_status_file,
         } => match spawn_proxy_daemon(
             netns.as_str(),
+            interface.as_str(),
             socks_port,
             http_port,
             proxy_access_log,
             pid_file.as_str(),
             log_file.as_str(),
+            startup_status_file.as_str(),
         ) {
             Ok(pid) => match register_managed_pid(pid) {
                 Ok(()) => PrivilegedResponse::Pid(pid),
@@ -748,19 +766,32 @@ fn execute_unit(result: Result<()>) -> PrivilegedResponse {
 }
 
 fn execute_route(op: &str, destination: &str, via: Option<&str>, dev: &str) -> PrivilegedResponse {
-    let is_ipv6_route = destination.contains(':') || via.is_some_and(|gw| gw.contains(':'));
-    let mut args = if is_ipv6_route {
-        vec!["ip", "-6", "route", op, destination]
-    } else {
-        vec!["ip", "route", op, destination]
+    let args = build_route_args(op, destination, via, dev);
+    let output = match run_output(&args) {
+        Ok(output) => output,
+        Err(error) => return execute_unit(Err(error)),
     };
-    if let Some(gw) = via {
-        args.push("via");
-        args.push(gw);
+    if output.status.success() {
+        return PrivilegedResponse::Unit;
     }
-    args.push("dev");
-    args.push(dev);
-    execute_unit(run(&args))
+
+    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+    if op == "add" && route_add_conflicts_with_existing_route(&stderr) {
+        let replace_args = build_route_args("replace", destination, via, dev);
+        info!(
+            destination,
+            via = via.unwrap_or(""),
+            dev,
+            "host_route_add_exists_retrying_replace"
+        );
+        return execute_unit(run(&replace_args));
+    }
+
+    execute_unit(Err(AppError::Other(format_command_failure(
+        &args,
+        output.status,
+        &stderr,
+    ))))
 }
 
 fn run(args: &[&str]) -> Result<()> {
@@ -773,6 +804,47 @@ fn run(args: &[&str]) -> Result<()> {
         )));
     }
     Ok(())
+}
+
+fn run_output(args: &[&str]) -> Result<std::process::Output> {
+    debug!(cmd = args.join(" "), "exec");
+    Command::new(args[0])
+        .args(&args[1..])
+        .output()
+        .map_err(|error| AppError::Other(format!("command {} failed to start: {}", args[0], error)))
+}
+
+fn build_route_args<'a>(
+    op: &'a str,
+    destination: &'a str,
+    via: Option<&'a str>,
+    dev: &'a str,
+) -> Vec<&'a str> {
+    let is_ipv6_route = destination.contains(':') || via.is_some_and(|gw| gw.contains(':'));
+    let mut args = if is_ipv6_route {
+        vec!["ip", "-6", "route", op, destination]
+    } else {
+        vec!["ip", "route", op, destination]
+    };
+    if let Some(gw) = via {
+        args.push("via");
+        args.push(gw);
+    }
+    args.push("dev");
+    args.push(dev);
+    args
+}
+
+fn route_add_conflicts_with_existing_route(stderr: &str) -> bool {
+    stderr.to_ascii_lowercase().contains("file exists")
+}
+
+fn format_command_failure(args: &[&str], status: std::process::ExitStatus, stderr: &str) -> String {
+    if stderr.is_empty() {
+        format!("command {} failed: {}", args[0], status)
+    } else {
+        format!("command {} failed: {} ({})", args[0], status, stderr)
+    }
 }
 
 fn run_resolved_set_dns(interface: &str, dns_servers: &[String]) -> Result<()> {
@@ -901,6 +973,7 @@ fn format_wg_show(raw: &str, interface: &str) -> Result<String> {
 
     struct PeerState {
         public_key_b64: String,
+        has_preshared_key: bool,
         endpoint: Option<String>,
         allowed_ips: Vec<String>,
         last_handshake_sec: u64,
@@ -945,6 +1018,7 @@ fn format_wg_show(raw: &str, interface: &str) -> Result<String> {
                 if let Ok(bytes) = wg_hex_to_32(value) {
                     current_peer = Some(PeerState {
                         public_key_b64: base64::engine::general_purpose::STANDARD.encode(bytes),
+                        has_preshared_key: false,
                         endpoint: None,
                         allowed_ips: Vec::new(),
                         last_handshake_sec: 0,
@@ -957,6 +1031,10 @@ fn format_wg_show(raw: &str, interface: &str) -> Result<String> {
             _ => {
                 if let Some(ref mut peer) = current_peer {
                     match key {
+                        "preshared_key" => {
+                            peer.has_preshared_key =
+                                value.as_bytes().iter().any(|byte| *byte != b'0')
+                        }
                         "endpoint" => peer.endpoint = Some(value.to_string()),
                         "allowed_ip" => peer.allowed_ips.push(value.to_string()),
                         "last_handshake_time_sec" => {
@@ -995,6 +1073,9 @@ fn format_wg_show(raw: &str, interface: &str) -> Result<String> {
         }
         if !peer.allowed_ips.is_empty() {
             out.push_str(&format!("  allowed ips: {}\n", peer.allowed_ips.join(", ")));
+        }
+        if peer.has_preshared_key {
+            out.push_str("  preshared key: (hidden)\n");
         }
         if peer.last_handshake_sec > 0 {
             let ago = now_secs.saturating_sub(peer.last_handshake_sec);
@@ -1140,13 +1221,16 @@ fn set_preshared_key(_interface: &str, _peer_public_key: &str, _psk: &str) -> Re
     ))
 }
 
+#[allow(clippy::too_many_arguments)]
 fn spawn_proxy_daemon(
     netns: &str,
+    interface: &str,
     socks_port: u16,
     http_port: u16,
     proxy_access_log: bool,
     pid_file: &str,
     log_file: &str,
+    startup_status_file: &str,
 ) -> Result<u32> {
     let exe = self_executable_for_spawn()?;
     info!(
@@ -1160,6 +1244,7 @@ fn spawn_proxy_daemon(
 
     let _ = std::fs::remove_file(pid_file);
     let _ = std::fs::remove_file(log_file);
+    let _ = std::fs::remove_file(startup_status_file);
 
     let socks = socks_port.to_string();
     let http = http_port.to_string();
@@ -1170,6 +1255,8 @@ fn spawn_proxy_daemon(
         "proxy-daemon",
         "--netns",
         netns,
+        "--interface",
+        interface,
         "--socks-port",
         socks.as_str(),
         "--http-port",
@@ -1178,6 +1265,8 @@ fn spawn_proxy_daemon(
         pid_file,
         "--log-file",
         log_file,
+        "--startup-status-file",
+        startup_status_file,
     ]);
     if proxy_access_log {
         command.arg("--proxy-access-log");
@@ -1210,6 +1299,15 @@ fn spawn_proxy_daemon(
     }
 
     let pid = wait_for_pid_file(pid_file, Duration::from_secs(5))?;
+    if !wait_for_startup_ready(startup_status_file, Duration::from_secs(12)) {
+        terminate_managed_process(pid);
+        let detail = tail_file(log_file, 12);
+        return Err(AppError::Proxy(format!(
+            "proxy tunnel did not establish a WireGuard handshake within 12s (instance interface {}). Recent log:\n{}",
+            interface, detail
+        )));
+    }
+
     Ok(pid)
 }
 
@@ -1251,6 +1349,42 @@ fn wait_for_pid_file(pid_file: &str, timeout: Duration) -> Result<u32> {
     Err(AppError::Other(
         "proxy daemon did not write a valid pid".into(),
     ))
+}
+
+fn wait_for_startup_ready(startup_status_file: &str, timeout: Duration) -> bool {
+    let start = Instant::now();
+    while Instant::now().duration_since(start) < timeout {
+        if let Ok(text) = std::fs::read_to_string(startup_status_file) {
+            if text.trim() == "ready" {
+                return true;
+            }
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    false
+}
+
+fn terminate_managed_process(pid: u32) {
+    let target = Pid::from_raw(pid as i32);
+    let _ = kill(target, Signal::SIGTERM);
+    for _ in 0..20 {
+        std::thread::sleep(Duration::from_millis(100));
+        if !std::path::Path::new(&format!("/proc/{pid}")).exists() {
+            return;
+        }
+    }
+    let _ = kill(target, Signal::SIGKILL);
+}
+
+fn tail_file(path: &str, lines: usize) -> String {
+    let Ok(content) = std::fs::read_to_string(path) else {
+        return "<log unavailable>".to_string();
+    };
+    let mut rows: Vec<&str> = content.lines().collect();
+    if rows.len() > lines {
+        rows = rows.split_off(rows.len() - lines);
+    }
+    rows.join("\n")
 }
 
 fn resolve_authorized_group(cli_group: Option<String>) -> Option<String> {
@@ -1537,6 +1671,19 @@ mod tests {
             }
             assert!(!stale_path.exists());
         });
+    }
+
+    #[test]
+    fn route_add_conflict_detects_file_exists_case_insensitive() {
+        assert!(route_add_conflicts_with_existing_route(
+            "RTNETLINK answers: File exists"
+        ));
+        assert!(route_add_conflicts_with_existing_route(
+            "rtnetlink answers: file exists"
+        ));
+        assert!(!route_add_conflicts_with_existing_route(
+            "network unreachable"
+        ));
     }
 
     fn live_token() -> String {

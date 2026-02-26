@@ -3,9 +3,9 @@
 //! Runs a WireGuard session backed by boringtun + smoltcp and exposes it as
 //! SOCKS5 and HTTP proxies on loopback -- no TUN device, root, or netns needed.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU16, Ordering};
 use std::sync::{Arc, LazyLock, RwLock as StdRwLock};
 use std::time::{Duration, Instant};
 
@@ -18,6 +18,9 @@ use serde::{Deserialize, Serialize};
 use smoltcp::iface::{Config, Interface, SocketSet};
 use smoltcp::phy::{DeviceCapabilities, Medium, RxToken, TxToken};
 use smoltcp::socket::tcp::{Socket as TcpSocket, SocketBuffer as TcpSocketBuffer};
+use smoltcp::socket::udp::{
+    PacketBuffer as UdpPacketBuffer, PacketMetadata as UdpPacketMetadata, Socket as SmolUdpSocket,
+};
 use smoltcp::wire::{IpAddress, IpEndpoint, IpListenEndpoint};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
@@ -39,10 +42,13 @@ const ACTIVE_CONN_BATCH_MAX: usize = 384;
 const ACTIVE_CONN_TOPUP_TARGET: usize = 768;
 const ACTIVE_CONN_SWEEP_BATCH_MAX: usize = 384;
 const DNS_CACHE_TTL: Duration = Duration::from_secs(15);
+const DNS_TUNNEL_QUERY_TTL: Duration = Duration::from_secs(5);
+const DNS_UDP_PACKET_CAP: usize = 2048;
 const PERF_LOG_INTERVAL: Duration = Duration::from_secs(5);
 
 type DnsCache = HashMap<String, (Instant, Vec<SocketAddr>)>;
 static DNS_CACHE: LazyLock<StdRwLock<DnsCache>> = LazyLock::new(|| StdRwLock::new(HashMap::new()));
+static DNS_QUERY_ID: AtomicU16 = AtomicU16::new(1);
 
 fn smoltcp_now() -> smoltcp::time::Instant {
     let millis = std::time::SystemTime::UNIX_EPOCH
@@ -65,6 +71,16 @@ pub struct LocalProxyConfig {
     pub keepalive: Option<u16>,
     pub socks_port: u16,
     pub http_port: u16,
+    #[serde(default)]
+    pub dns_servers: Vec<String>,
+}
+
+#[derive(Clone)]
+struct TunnelDnsResolver {
+    dns_servers: Arc<Vec<IpAddr>>,
+    virtual_ipv4: Ipv4Addr,
+    virtual_ipv6: Option<Ipv6Addr>,
+    dns_req_tx: mpsc::Sender<DnsUdpRequest>,
 }
 
 // ── Internal message types ────────────────────────────────────────────────────
@@ -75,6 +91,13 @@ struct ConnRequest {
     to_client_tx: Arc<ByteQueue>,
     from_client_rx: Arc<ByteQueue>,
     connected_tx: oneshot::Sender<Result<(), String>>,
+}
+
+struct DnsUdpRequest {
+    dns_server: IpAddress,
+    source_ip: IpAddress,
+    payload: Vec<u8>,
+    response_tx: oneshot::Sender<Result<Vec<u8>, String>>,
 }
 
 enum QueuePushError {
@@ -253,6 +276,18 @@ struct ConnEntry {
     active: bool,
 }
 
+struct DnsUdpEntry {
+    handle: smoltcp::iface::SocketHandle,
+    response_tx: Option<oneshot::Sender<Result<Vec<u8>, String>>>,
+    deadline: Instant,
+}
+
+#[derive(Clone, Copy)]
+struct VirtualTunnelIps {
+    ipv4: Ipv4Addr,
+    ipv6: Option<Ipv6Addr>,
+}
+
 fn conn_has_runnable_work(entry: &ConnEntry, sock: &TcpSocket<'_>) -> bool {
     entry.connected_tx.is_some()
         || (!entry.from_client_rx.is_empty()
@@ -417,7 +452,12 @@ impl DataplanePerf {
 // ── Public entry point ────────────────────────────────────────────────────────
 
 /// Run the local proxy. Returns when the tokio task is aborted or on fatal error.
-pub async fn run_local_proxy(cfg: LocalProxyConfig) -> anyhow::Result<()> {
+pub async fn run_local_proxy(
+    cfg: LocalProxyConfig,
+    startup_status_file: Option<&str>,
+) -> anyhow::Result<()> {
+    let dns_servers = parse_dns_servers(&cfg);
+
     let udp = UdpSocket::bind("0.0.0.0:0")
         .await
         .context("bind WireGuard UDP socket")?;
@@ -440,7 +480,14 @@ pub async fn run_local_proxy(cfg: LocalProxyConfig) -> anyhow::Result<()> {
         .iter()
         .find_map(|s| s.split('/').next()?.parse::<Ipv4Addr>().ok())
         .ok_or_else(|| anyhow!("no IPv4 address in virtual_ips"))?;
-    let virtual_ip = IpAddress::Ipv4(virtual_ipv4);
+    let virtual_ipv6: Option<Ipv6Addr> = cfg
+        .virtual_ips
+        .iter()
+        .find_map(|s| s.split('/').next()?.parse::<Ipv6Addr>().ok());
+    let virtual_ips = VirtualTunnelIps {
+        ipv4: virtual_ipv4,
+        ipv6: virtual_ipv6,
+    };
 
     let mut device = VirtualDevice::new();
     let mut iface = Interface::new(
@@ -458,6 +505,11 @@ pub async fn run_local_proxy(cfg: LocalProxyConfig) -> anyhow::Result<()> {
     let _ = iface
         .routes_mut()
         .add_default_ipv4_route(Ipv4Addr::new(0, 0, 0, 1));
+    if virtual_ipv6.is_some() {
+        let _ = iface
+            .routes_mut()
+            .add_default_ipv6_route(Ipv6Addr::LOCALHOST);
+    }
 
     let mut sockets = SocketSet::new(vec![]);
 
@@ -471,6 +523,8 @@ pub async fn run_local_proxy(cfg: LocalProxyConfig) -> anyhow::Result<()> {
     info!(
         socks_port = cfg.socks_port,
         http_port = cfg.http_port,
+        dns_servers = dns_servers.len(),
+        custom_dns = !dns_servers.is_empty(),
         endpoint = ?cfg.endpoint,
         "local_proxy_started"
     );
@@ -489,10 +543,22 @@ pub async fn run_local_proxy(cfg: LocalProxyConfig) -> anyhow::Result<()> {
     }
 
     let (conn_req_tx, mut conn_req_rx) = mpsc::channel::<ConnRequest>(CLIENT_CHANNEL_CAP);
+    let (dns_req_tx, mut dns_req_rx) = mpsc::channel::<DnsUdpRequest>(CLIENT_CHANNEL_CAP);
     let loop_notify = Arc::new(Notify::new());
+    let dns_resolver = if dns_servers.is_empty() {
+        None
+    } else {
+        Some(TunnelDnsResolver {
+            dns_servers: Arc::new(dns_servers),
+            virtual_ipv4,
+            virtual_ipv6,
+            dns_req_tx: dns_req_tx.clone(),
+        })
+    };
 
     let tx = conn_req_tx.clone();
     let notify = loop_notify.clone();
+    let socks_dns_resolver = dns_resolver.clone();
     tokio::spawn(async move {
         loop {
             match socks_listener.accept().await {
@@ -503,8 +569,9 @@ pub async fn run_local_proxy(cfg: LocalProxyConfig) -> anyhow::Result<()> {
                     }
                     let tx = tx.clone();
                     let notify = notify.clone();
+                    let dns_resolver = socks_dns_resolver.clone();
                     tokio::spawn(async move {
-                        if let Err(e) = socks5_serve(stream, tx, notify).await {
+                        if let Err(e) = socks5_serve(stream, tx, notify, dns_resolver).await {
                             debug!(error = ?e.to_string(), "socks5_error");
                         }
                     });
@@ -521,6 +588,7 @@ pub async fn run_local_proxy(cfg: LocalProxyConfig) -> anyhow::Result<()> {
 
     let tx = conn_req_tx.clone();
     let notify = loop_notify.clone();
+    let http_dns_resolver = dns_resolver.clone();
     tokio::spawn(async move {
         loop {
             match http_listener.accept().await {
@@ -531,8 +599,9 @@ pub async fn run_local_proxy(cfg: LocalProxyConfig) -> anyhow::Result<()> {
                     }
                     let tx = tx.clone();
                     let notify = notify.clone();
+                    let dns_resolver = http_dns_resolver.clone();
                     tokio::spawn(async move {
-                        if let Err(e) = http_connect_serve(stream, tx, notify).await {
+                        if let Err(e) = http_connect_serve(stream, tx, notify, dns_resolver).await {
                             debug!(error = ?e.to_string(), "http_error");
                         }
                     });
@@ -551,16 +620,42 @@ pub async fn run_local_proxy(cfg: LocalProxyConfig) -> anyhow::Result<()> {
     let mut decap_buf = vec![0u8; UDP_BUF];
     let mut enc_buf = vec![0u8; UDP_BUF + 32];
     let mut conns: Vec<ConnEntry> = Vec::new();
+    let mut dns_udp_entries: Vec<DnsUdpEntry> = Vec::new();
     let mut next_port: u16 = LOCAL_PORT_START;
     let mut wg_pending_tx: VecDeque<Bytes> = VecDeque::new();
     let mut active_conns: VecDeque<usize> = VecDeque::new();
     let mut scan_cursor: usize = 0;
     let mut wg_timer_deadline = Instant::now();
     let mut perf = DataplanePerf::new(perf_enabled);
+    let mut startup_ready_written = startup_status_file.is_none();
+
+    // Trigger an initial handshake proactively so the parent connect command
+    // can report success only after an actual tunnel handshake.
+    queue_tunn_network_write(
+        tunn.format_handshake_initiation(&mut enc_buf, false),
+        udp.as_ref(),
+        &mut wg_pending_tx,
+        &mut perf,
+    );
+    flush_udp_writes(udp.as_ref(), &mut wg_pending_tx, &mut perf);
 
     loop {
         let now_std = Instant::now();
         let now = smoltcp_now();
+
+        if !startup_ready_written && tunn.time_since_last_handshake().is_some() {
+            if let Some(path) = startup_status_file {
+                if let Err(error) = std::fs::write(path, "ready\n") {
+                    warn!(
+                        status_file = path,
+                        error = %error,
+                        "local_proxy_startup_status_write_failed"
+                    );
+                }
+            }
+            startup_ready_written = true;
+            info!("local_proxy_handshake_established");
+        }
 
         if now_std >= wg_timer_deadline {
             queue_tunn_network_write(
@@ -576,12 +671,15 @@ pub async fn run_local_proxy(cfg: LocalProxyConfig) -> anyhow::Result<()> {
             add_virtual_connection(
                 req,
                 &mut next_port,
-                virtual_ip,
+                virtual_ips,
                 &mut iface,
                 &mut sockets,
                 &mut conns,
                 &mut active_conns,
             );
+        }
+        while let Ok(req) = dns_req_rx.try_recv() {
+            add_dns_udp_query(req, &mut next_port, &mut sockets, &mut dns_udp_entries);
         }
 
         for _ in 0..UDP_RECV_BURST_MAX {
@@ -628,6 +726,7 @@ pub async fn run_local_proxy(cfg: LocalProxyConfig) -> anyhow::Result<()> {
             );
         }
         flush_udp_writes(udp.as_ref(), &mut wg_pending_tx, &mut perf);
+        process_dns_udp_entries(&mut sockets, &mut dns_udp_entries, now_std);
 
         if active_conns.len() < ACTIVE_CONN_TOPUP_TARGET {
             top_up_active_conns(
@@ -787,7 +886,8 @@ pub async fn run_local_proxy(cfg: LocalProxyConfig) -> anyhow::Result<()> {
         let has_pending_work = !device.inbound.is_empty()
             || !device.outbound.is_empty()
             || !active_conns.is_empty()
-            || conns.iter().any(|entry| entry.connected_tx.is_some());
+            || conns.iter().any(|entry| entry.connected_tx.is_some())
+            || !dns_udp_entries.is_empty();
         perf.observe_loop(active_conns.len(), wg_pending_tx.len());
         perf.maybe_log_and_reset(conns.len());
         if has_pending_work {
@@ -812,11 +912,22 @@ pub async fn run_local_proxy(cfg: LocalProxyConfig) -> anyhow::Result<()> {
                     add_virtual_connection(
                         req,
                         &mut next_port,
-                        virtual_ip,
+                        virtual_ips,
                         &mut iface,
                         &mut sockets,
                         &mut conns,
                         &mut active_conns,
+                    );
+                }
+                IdleWakeReason::ConnReq
+            }
+            maybe_dns_req = dns_req_rx.recv() => {
+                if let Some(req) = maybe_dns_req {
+                    add_dns_udp_query(
+                        req,
+                        &mut next_port,
+                        &mut sockets,
+                        &mut dns_udp_entries,
                     );
                 }
                 IdleWakeReason::ConnReq
@@ -930,7 +1041,7 @@ fn top_up_active_conns(
 fn add_virtual_connection(
     req: ConnRequest,
     next_port: &mut u16,
-    virtual_ip: IpAddress,
+    virtual_ips: VirtualTunnelIps,
     iface: &mut Interface,
     sockets: &mut SocketSet<'_>,
     conns: &mut Vec<ConnEntry>,
@@ -950,8 +1061,20 @@ fn add_virtual_connection(
     sock.set_nagle_enabled(false);
     sock.set_ack_delay(None);
     let remote = IpEndpoint::new(req.target_ip, req.target_port);
+    let local_ip = match req.target_ip {
+        IpAddress::Ipv4(_) => IpAddress::Ipv4(virtual_ips.ipv4),
+        IpAddress::Ipv6(_) => {
+            let Some(v6) = virtual_ips.ipv6 else {
+                let _ = req
+                    .connected_tx
+                    .send(Err("IPv6 is not available in this VPN profile".into()));
+                return;
+            };
+            IpAddress::Ipv6(v6)
+        }
+    };
     let local = IpListenEndpoint {
-        addr: Some(virtual_ip),
+        addr: Some(local_ip),
         port: local_port,
     };
     match sock.connect(iface.context(), remote, local) {
@@ -977,12 +1100,113 @@ fn add_virtual_connection(
     }
 }
 
+fn add_dns_udp_query(
+    req: DnsUdpRequest,
+    next_port: &mut u16,
+    sockets: &mut SocketSet<'_>,
+    dns_udp_entries: &mut Vec<DnsUdpEntry>,
+) {
+    let local_port = *next_port;
+    *next_port = if *next_port >= LOCAL_PORT_END {
+        LOCAL_PORT_START
+    } else {
+        *next_port + 1
+    };
+
+    let rx_meta = vec![UdpPacketMetadata::EMPTY; 1];
+    let tx_meta = vec![UdpPacketMetadata::EMPTY; 1];
+    let rx_buf = UdpPacketBuffer::new(rx_meta, vec![0u8; DNS_UDP_PACKET_CAP]);
+    let tx_buf = UdpPacketBuffer::new(tx_meta, vec![0u8; DNS_UDP_PACKET_CAP]);
+    let mut sock = SmolUdpSocket::new(rx_buf, tx_buf);
+
+    let bind_endpoint = IpListenEndpoint {
+        addr: Some(req.source_ip),
+        port: local_port,
+    };
+    if let Err(error) = sock.bind(bind_endpoint) {
+        let _ = req
+            .response_tx
+            .send(Err(format!("DNS UDP bind failed: {}", error)));
+        return;
+    }
+
+    let remote = IpEndpoint::new(req.dns_server, 53);
+    if let Err(error) = sock.send_slice(req.payload.as_slice(), remote) {
+        let _ = req
+            .response_tx
+            .send(Err(format!("DNS UDP send failed: {}", error)));
+        return;
+    }
+
+    let handle = sockets.add(sock);
+    dns_udp_entries.push(DnsUdpEntry {
+        handle,
+        response_tx: Some(req.response_tx),
+        deadline: Instant::now() + DNS_TUNNEL_QUERY_TTL,
+    });
+}
+
+fn process_dns_udp_entries(
+    sockets: &mut SocketSet<'_>,
+    dns_udp_entries: &mut Vec<DnsUdpEntry>,
+    now: Instant,
+) {
+    let mut remove = Vec::new();
+
+    for (idx, entry) in dns_udp_entries.iter_mut().enumerate() {
+        let mut remove_entry = false;
+        let mut timeout_error = false;
+        let mut response_packet: Option<Vec<u8>> = None;
+
+        {
+            let sock = sockets.get_mut::<SmolUdpSocket>(entry.handle);
+            if sock.can_recv() {
+                match sock.recv() {
+                    Ok((packet, _)) => {
+                        response_packet = Some(packet.to_vec());
+                        remove_entry = true;
+                    }
+                    Err(_) => {
+                        remove_entry = true;
+                    }
+                }
+            }
+        }
+
+        if !remove_entry && now >= entry.deadline {
+            timeout_error = true;
+            remove_entry = true;
+        }
+
+        if remove_entry {
+            if let Some(tx) = entry.response_tx.take() {
+                if let Some(packet) = response_packet {
+                    let _ = tx.send(Ok(packet));
+                } else if timeout_error {
+                    let _ = tx.send(Err("tunnel DNS UDP response timeout".to_string()));
+                } else {
+                    let _ = tx.send(Err("tunnel DNS UDP receive failed".to_string()));
+                }
+            }
+            remove.push(idx);
+        }
+    }
+
+    for idx in remove.into_iter().rev() {
+        if idx < dns_udp_entries.len() {
+            let entry = dns_udp_entries.remove(idx);
+            sockets.remove(entry.handle);
+        }
+    }
+}
+
 // ── SOCKS5 ────────────────────────────────────────────────────────────────────
 
 async fn socks5_serve(
     mut stream: TcpStream,
     conn_req_tx: mpsc::Sender<ConnRequest>,
     loop_notify: Arc<Notify>,
+    dns_resolver: Option<TunnelDnsResolver>,
 ) -> anyhow::Result<()> {
     let mut buf = [0u8; 2];
     stream.read_exact(&mut buf).await?;
@@ -1001,7 +1225,8 @@ async fn socks5_serve(
         anyhow::bail!("only CONNECT supported");
     }
 
-    let (target_ip, target_port) = read_socks5_addr(&mut stream, hdr[3]).await?;
+    let (target_ip, target_port) =
+        read_socks5_addr(&mut stream, hdr[3], dns_resolver.as_ref()).await?;
 
     let to_client_tx = Arc::new(ByteQueue::new(CLIENT_CHANNEL_CAP, loop_notify.clone()));
     let from_client_rx = Arc::new(ByteQueue::new(CLIENT_CHANNEL_CAP, loop_notify));
@@ -1037,7 +1262,11 @@ async fn socks5_serve(
     Ok(())
 }
 
-async fn read_socks5_addr(stream: &mut TcpStream, atyp: u8) -> anyhow::Result<(IpAddress, u16)> {
+async fn read_socks5_addr(
+    stream: &mut TcpStream,
+    atyp: u8,
+    dns_resolver: Option<&TunnelDnsResolver>,
+) -> anyhow::Result<(IpAddress, u16)> {
     match atyp {
         0x01 => {
             let mut a = [0u8; 4];
@@ -1055,7 +1284,7 @@ async fn read_socks5_addr(stream: &mut TcpStream, atyp: u8) -> anyhow::Result<(I
             stream.read_exact(&mut p).await?;
             let port = u16::from_be_bytes(p);
             let host = std::str::from_utf8(&dom)?;
-            let sa = resolve_ipv4_preferred(host, port).await?;
+            let sa = resolve_ipv4_preferred(host, port, dns_resolver).await?;
             Ok((ip_to_smoltcp(sa.ip()), sa.port()))
         }
         0x04 => {
@@ -1075,6 +1304,7 @@ async fn http_connect_serve(
     mut stream: TcpStream,
     conn_req_tx: mpsc::Sender<ConnRequest>,
     loop_notify: Arc<Notify>,
+    dns_resolver: Option<TunnelDnsResolver>,
 ) -> anyhow::Result<()> {
     let request_line = read_crlf_line(&mut stream).await?;
     let mut headers: Vec<String> = Vec::new();
@@ -1097,7 +1327,7 @@ async fn http_connect_serve(
             .rsplit_once(':')
             .ok_or_else(|| anyhow!("no port in CONNECT target: {}", target))?;
         let port: u16 = port_str.parse()?;
-        let sa = resolve_ipv4_preferred(host, port).await?;
+        let sa = resolve_ipv4_preferred(host, port, dns_resolver.as_ref()).await?;
 
         let to_client_tx = Arc::new(ByteQueue::new(CLIENT_CHANNEL_CAP, loop_notify.clone()));
         let from_client_rx = Arc::new(ByteQueue::new(CLIENT_CHANNEL_CAP, loop_notify.clone()));
@@ -1152,7 +1382,7 @@ async fn http_connect_serve(
             (host, port, url.to_string())
         };
 
-        let sa = resolve_ipv4_preferred(&host, port).await?;
+        let sa = resolve_ipv4_preferred(&host, port, dns_resolver.as_ref()).await?;
 
         let to_client_tx = Arc::new(ByteQueue::new(CLIENT_CHANNEL_CAP, loop_notify.clone()));
         let from_client_rx = Arc::new(ByteQueue::new(CLIENT_CHANNEL_CAP, loop_notify.clone()));
@@ -1263,25 +1493,312 @@ async fn bridge(
     to_client_rx.close();
 }
 
+fn parse_dns_servers(cfg: &LocalProxyConfig) -> Vec<IpAddr> {
+    cfg.dns_servers
+        .iter()
+        .filter_map(|dns| normalize_dns_server(dns))
+        .filter_map(|dns| match dns.parse::<IpAddr>() {
+            Ok(ip) => Some(ip),
+            Err(error) => {
+                warn!(dns_server = dns, error = %error, "local_proxy_dns_server_parse_failed");
+                None
+            }
+        })
+        .collect()
+}
+
+fn normalize_dns_server(value: &str) -> Option<&str> {
+    let host = value
+        .trim()
+        .split('/')
+        .next()
+        .unwrap_or_default()
+        .trim()
+        .trim_matches('[')
+        .trim_matches(']');
+    if host.is_empty() {
+        None
+    } else {
+        Some(host)
+    }
+}
+
 /// Resolve `host` to a `SocketAddr`, preferring IPv4.
 ///
 /// The smoltcp virtual interface only has a default IPv4 route, so IPv6
 /// targets would be unroutable. Prefer the first IPv4 result; fall back to
 /// the first address of any family only when no IPv4 address is returned.
-async fn resolve_ipv4_preferred(host: &str, port: u16) -> anyhow::Result<SocketAddr> {
+async fn resolve_ipv4_preferred(
+    host: &str,
+    port: u16,
+    dns_resolver: Option<&TunnelDnsResolver>,
+) -> anyhow::Result<SocketAddr> {
+    if let Ok(ip) = host.parse::<IpAddr>() {
+        return Ok(SocketAddr::new(ip, port));
+    }
+
     let cache_key = format!("{}:{}", host, port);
     if let Some(hit) = dns_cache_get(&cache_key) {
         return select_ipv4_preferred(hit.into_iter())
             .ok_or_else(|| anyhow!("DNS returned no addresses for {}", host));
     }
 
-    let addrs: Vec<SocketAddr> = tokio::net::lookup_host(format!("{}:{}", host, port))
-        .await
-        .with_context(|| format!("DNS lookup failed: {}", host))?
-        .collect();
+    let addrs: Vec<SocketAddr> = if let Some(resolver) = dns_resolver {
+        resolve_with_tunnel_dns(resolver, host, port).await?
+    } else {
+        // Keep system resolver only as a compatibility fallback when config
+        // carries no DNS servers at all.
+        resolve_with_system_dns(host, port).await?
+    };
+
     dns_cache_put(cache_key, addrs.clone());
     select_ipv4_preferred(addrs.into_iter())
         .ok_or_else(|| anyhow!("DNS returned no addresses for {}", host))
+}
+
+async fn resolve_with_tunnel_dns(
+    resolver: &TunnelDnsResolver,
+    host: &str,
+    port: u16,
+) -> anyhow::Result<Vec<SocketAddr>> {
+    let ips = resolve_host_via_tunnel_dns(resolver, host).await?;
+    Ok(ips
+        .into_iter()
+        .map(|ip| SocketAddr::new(ip, port))
+        .collect())
+}
+
+async fn resolve_host_via_tunnel_dns(
+    resolver: &TunnelDnsResolver,
+    host: &str,
+) -> anyhow::Result<Vec<IpAddr>> {
+    let mut last_error: Option<anyhow::Error> = None;
+
+    let mut v4_results: Vec<IpAddr> = Vec::new();
+    for dns_server in resolver.dns_servers.iter().copied() {
+        match dns_query_over_tunnel(resolver, dns_server, host, 1).await {
+            Ok(mut ips) => v4_results.append(&mut ips),
+            Err(error) => {
+                warn!(
+                    host = host,
+                    dns_server = %dns_server,
+                    error = %error,
+                    "tunnel_dns_a_query_failed"
+                );
+                last_error = Some(error);
+            }
+        }
+        if !v4_results.is_empty() {
+            return Ok(dedup_ips(v4_results));
+        }
+    }
+
+    let mut v6_results: Vec<IpAddr> = Vec::new();
+    for dns_server in resolver.dns_servers.iter().copied() {
+        match dns_query_over_tunnel(resolver, dns_server, host, 28).await {
+            Ok(mut ips) => v6_results.append(&mut ips),
+            Err(error) => {
+                warn!(
+                    host = host,
+                    dns_server = %dns_server,
+                    error = %error,
+                    "tunnel_dns_aaaa_query_failed"
+                );
+                last_error = Some(error);
+            }
+        }
+        if !v6_results.is_empty() {
+            return Ok(dedup_ips(v6_results));
+        }
+    }
+
+    if let Some(error) = last_error {
+        return Err(error).context(format!("tunnel DNS lookup failed for {}", host));
+    }
+
+    anyhow::bail!("tunnel DNS returned no addresses for {}", host);
+}
+
+fn dedup_ips(ips: Vec<IpAddr>) -> Vec<IpAddr> {
+    let mut seen: HashSet<IpAddr> = HashSet::new();
+    let mut unique = Vec::with_capacity(ips.len());
+    for ip in ips {
+        if seen.insert(ip) {
+            unique.push(ip);
+        }
+    }
+    unique
+}
+
+async fn dns_query_over_tunnel(
+    resolver: &TunnelDnsResolver,
+    dns_server: IpAddr,
+    host: &str,
+    qtype: u16,
+) -> anyhow::Result<Vec<IpAddr>> {
+    let query_id = DNS_QUERY_ID.fetch_add(1, Ordering::Relaxed);
+    let query = build_dns_query(host, qtype, query_id)?;
+    let source_ip = dns_source_ip_for_server(resolver, dns_server)
+        .ok_or_else(|| anyhow!("no matching local source IP for DNS server {}", dns_server))?;
+    let (response_tx, response_rx) = oneshot::channel();
+
+    resolver
+        .dns_req_tx
+        .send(DnsUdpRequest {
+            dns_server: ip_to_smoltcp(dns_server),
+            source_ip,
+            payload: query,
+            response_tx,
+        })
+        .await
+        .map_err(|_| anyhow!("proxy tunnel exited"))?;
+
+    let response_wait = DNS_TUNNEL_QUERY_TTL + Duration::from_secs(1);
+    let response = tokio::time::timeout(response_wait, response_rx)
+        .await
+        .context("tunnel DNS response wait timeout")?
+        .map_err(|_| anyhow!("tunnel DNS response dropped"))?
+        .map_err(|error| anyhow!(error))?;
+
+    parse_dns_response_ips(response.as_slice(), query_id, qtype)
+}
+
+fn dns_source_ip_for_server(resolver: &TunnelDnsResolver, dns_server: IpAddr) -> Option<IpAddress> {
+    match dns_server {
+        IpAddr::V4(_) => Some(IpAddress::Ipv4(resolver.virtual_ipv4)),
+        IpAddr::V6(_) => resolver.virtual_ipv6.map(IpAddress::Ipv6),
+    }
+}
+
+fn build_dns_query(host: &str, qtype: u16, query_id: u16) -> anyhow::Result<Vec<u8>> {
+    let qname = host.trim().trim_end_matches('.');
+    anyhow::ensure!(!qname.is_empty(), "DNS host is empty");
+
+    let mut out = Vec::with_capacity(512);
+    out.extend_from_slice(&query_id.to_be_bytes());
+    out.extend_from_slice(&0x0100u16.to_be_bytes()); // RD=1
+    out.extend_from_slice(&1u16.to_be_bytes()); // QDCOUNT
+    out.extend_from_slice(&0u16.to_be_bytes()); // ANCOUNT
+    out.extend_from_slice(&0u16.to_be_bytes()); // NSCOUNT
+    out.extend_from_slice(&0u16.to_be_bytes()); // ARCOUNT
+
+    for label in qname.split('.') {
+        anyhow::ensure!(!label.is_empty(), "DNS host contains empty label");
+        anyhow::ensure!(label.len() <= 63, "DNS label too long (max 63): {}", label);
+        out.push(label.len() as u8);
+        out.extend_from_slice(label.as_bytes());
+    }
+    out.push(0); // root
+    out.extend_from_slice(&qtype.to_be_bytes());
+    out.extend_from_slice(&1u16.to_be_bytes()); // IN
+    Ok(out)
+}
+
+fn parse_dns_response_ips(
+    response: &[u8],
+    query_id: u16,
+    qtype: u16,
+) -> anyhow::Result<Vec<IpAddr>> {
+    anyhow::ensure!(response.len() >= 12, "DNS response too short");
+    let id = u16::from_be_bytes([response[0], response[1]]);
+    anyhow::ensure!(
+        id == query_id,
+        "DNS response id mismatch: expected {}, got {}",
+        query_id,
+        id
+    );
+    let flags = u16::from_be_bytes([response[2], response[3]]);
+    anyhow::ensure!((flags & 0x8000) != 0, "DNS response missing QR flag");
+    anyhow::ensure!((flags & 0x0200) == 0, "DNS response was truncated");
+    let rcode = flags & 0x000F;
+    if rcode == 3 {
+        return Ok(Vec::new());
+    }
+    anyhow::ensure!(rcode == 0, "DNS query failed with rcode {}", rcode);
+
+    let qdcount = u16::from_be_bytes([response[4], response[5]]) as usize;
+    let ancount = u16::from_be_bytes([response[6], response[7]]) as usize;
+
+    let mut offset = 12usize;
+    for _ in 0..qdcount {
+        offset = skip_dns_name(response, offset)?;
+        anyhow::ensure!(offset + 4 <= response.len(), "DNS question truncated");
+        offset += 4;
+    }
+
+    let mut ips = Vec::new();
+    for _ in 0..ancount {
+        offset = skip_dns_name(response, offset)?;
+        anyhow::ensure!(offset + 10 <= response.len(), "DNS answer header truncated");
+        let rr_type = u16::from_be_bytes([response[offset], response[offset + 1]]);
+        let rr_class = u16::from_be_bytes([response[offset + 2], response[offset + 3]]);
+        let rdlength = u16::from_be_bytes([response[offset + 8], response[offset + 9]]) as usize;
+        offset += 10;
+        anyhow::ensure!(
+            offset + rdlength <= response.len(),
+            "DNS answer rdata truncated"
+        );
+
+        if rr_class == 1 {
+            if rr_type == 1 && rdlength == 4 {
+                ips.push(IpAddr::V4(Ipv4Addr::new(
+                    response[offset],
+                    response[offset + 1],
+                    response[offset + 2],
+                    response[offset + 3],
+                )));
+            } else if rr_type == 28 && rdlength == 16 {
+                let mut bytes = [0u8; 16];
+                bytes.copy_from_slice(&response[offset..offset + 16]);
+                ips.push(IpAddr::V6(Ipv6Addr::from(bytes)));
+            }
+        }
+        offset += rdlength;
+    }
+
+    if qtype == 1 {
+        ips.retain(|ip| ip.is_ipv4());
+    } else if qtype == 28 {
+        ips.retain(|ip| ip.is_ipv6());
+    }
+
+    Ok(dedup_ips(ips))
+}
+
+fn skip_dns_name(packet: &[u8], mut offset: usize) -> anyhow::Result<usize> {
+    loop {
+        anyhow::ensure!(offset < packet.len(), "DNS name out of bounds");
+        let len = packet[offset];
+        if len == 0 {
+            return Ok(offset + 1);
+        }
+
+        let kind = len & 0xC0;
+        if kind == 0xC0 {
+            anyhow::ensure!(
+                offset + 1 < packet.len(),
+                "DNS name compression pointer truncated"
+            );
+            return Ok(offset + 2);
+        }
+
+        anyhow::ensure!(kind == 0, "DNS name label has invalid high bits");
+        let label_len = len as usize;
+        anyhow::ensure!(label_len <= 63, "DNS label too long in response");
+        offset += 1;
+        anyhow::ensure!(
+            offset + label_len <= packet.len(),
+            "DNS name label truncated in response"
+        );
+        offset += label_len;
+    }
+}
+
+async fn resolve_with_system_dns(host: &str, port: u16) -> anyhow::Result<Vec<SocketAddr>> {
+    Ok(tokio::net::lookup_host(format!("{}:{}", host, port))
+        .await
+        .with_context(|| format!("DNS lookup failed: {}", host))?
+        .collect())
 }
 
 fn select_ipv4_preferred(mut addrs: impl Iterator<Item = SocketAddr>) -> Option<SocketAddr> {
@@ -1317,5 +1834,110 @@ fn ip_to_smoltcp(ip: IpAddr) -> IpAddress {
     match ip {
         IpAddr::V4(a) => IpAddress::Ipv4(a),
         IpAddr::V6(a) => IpAddress::Ipv6(a),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        build_dns_query, dns_source_ip_for_server, normalize_dns_server, parse_dns_response_ips,
+        TunnelDnsResolver,
+    };
+    use std::net::IpAddr;
+    use std::net::{Ipv4Addr, Ipv6Addr};
+    use std::sync::Arc;
+    use tokio::sync::mpsc;
+
+    #[test]
+    fn normalize_dns_server_trims_cidr_and_brackets() {
+        assert_eq!(
+            normalize_dns_server("[2001:4860:4860::8888]/128"),
+            Some("2001:4860:4860::8888")
+        );
+    }
+
+    #[test]
+    fn build_dns_query_encodes_labels() {
+        let query = build_dns_query("example.com", 1, 0x1234).expect("build query");
+        assert_eq!(&query[0..2], &0x1234u16.to_be_bytes());
+        assert_eq!(query[12], 7);
+        assert_eq!(&query[13..20], b"example");
+        assert_eq!(query[20], 3);
+        assert_eq!(&query[21..24], b"com");
+        assert_eq!(query[24], 0);
+    }
+
+    #[test]
+    fn parse_dns_response_extracts_a_record() {
+        let mut response = Vec::new();
+        response.extend_from_slice(&0x1234u16.to_be_bytes()); // id
+        response.extend_from_slice(&0x8180u16.to_be_bytes()); // flags
+        response.extend_from_slice(&1u16.to_be_bytes()); // qdcount
+        response.extend_from_slice(&1u16.to_be_bytes()); // ancount
+        response.extend_from_slice(&0u16.to_be_bytes()); // nscount
+        response.extend_from_slice(&0u16.to_be_bytes()); // arcount
+        response.extend_from_slice(&[
+            7, b'e', b'x', b'a', b'm', b'p', b'l', b'e', 3, b'c', b'o', b'm', 0,
+        ]);
+        response.extend_from_slice(&1u16.to_be_bytes()); // qtype A
+        response.extend_from_slice(&1u16.to_be_bytes()); // qclass IN
+        response.extend_from_slice(&[0xC0, 0x0C]); // name pointer
+        response.extend_from_slice(&1u16.to_be_bytes()); // type A
+        response.extend_from_slice(&1u16.to_be_bytes()); // class IN
+        response.extend_from_slice(&60u32.to_be_bytes()); // ttl
+        response.extend_from_slice(&4u16.to_be_bytes()); // rdlength
+        response.extend_from_slice(&[1, 2, 3, 4]); // rdata
+
+        let ips = parse_dns_response_ips(&response, 0x1234, 1).expect("parse response");
+        assert_eq!(
+            ips,
+            vec!["1.2.3.4".parse::<IpAddr>().expect("parse expected ip")]
+        );
+    }
+
+    #[test]
+    fn parse_dns_response_nxdomain_returns_empty() {
+        let mut response = Vec::new();
+        response.extend_from_slice(&0x4321u16.to_be_bytes()); // id
+        response.extend_from_slice(&0x8183u16.to_be_bytes()); // flags with NXDOMAIN
+        response.extend_from_slice(&1u16.to_be_bytes()); // qdcount
+        response.extend_from_slice(&0u16.to_be_bytes()); // ancount
+        response.extend_from_slice(&0u16.to_be_bytes()); // nscount
+        response.extend_from_slice(&0u16.to_be_bytes()); // arcount
+        response.extend_from_slice(&[
+            7, b'e', b'x', b'a', b'm', b'p', b'l', b'e', 3, b'c', b'o', b'm', 0,
+        ]);
+        response.extend_from_slice(&1u16.to_be_bytes()); // qtype A
+        response.extend_from_slice(&1u16.to_be_bytes()); // qclass IN
+
+        let ips = parse_dns_response_ips(&response, 0x4321, 1).expect("parse response");
+        assert!(ips.is_empty());
+    }
+
+    #[test]
+    fn dns_source_ip_matches_server_family() {
+        let (dns_req_tx, _dns_req_rx) = mpsc::channel(1);
+        let resolver = TunnelDnsResolver {
+            dns_servers: Arc::new(vec!["10.0.0.1"
+                .parse::<IpAddr>()
+                .expect("parse DNS server")]),
+            virtual_ipv4: Ipv4Addr::new(10, 0, 0, 2),
+            virtual_ipv6: Some("fd00::2".parse::<Ipv6Addr>().expect("parse virtual IPv6")),
+            dns_req_tx,
+        };
+
+        let v4 = dns_source_ip_for_server(&resolver, "10.0.0.1".parse().expect("parse v4 DNS"));
+        assert_eq!(
+            v4,
+            Some(smoltcp::wire::IpAddress::Ipv4(Ipv4Addr::new(10, 0, 0, 2)))
+        );
+
+        let v6 = dns_source_ip_for_server(&resolver, "fd00::1".parse().expect("parse v6 DNS"));
+        assert_eq!(
+            v6,
+            Some(smoltcp::wire::IpAddress::Ipv6(
+                "fd00::2".parse::<Ipv6Addr>().expect("parse expected IPv6")
+            ))
+        );
     }
 }

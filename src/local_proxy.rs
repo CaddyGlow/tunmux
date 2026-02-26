@@ -45,6 +45,7 @@ pub fn local_proxy_config_from_params(
     let endpoint = parse_endpoint(params.server_ip, params.server_port)?;
 
     let virtual_ips = params.addresses.iter().map(|s| s.to_string()).collect();
+    let dns_servers = params.dns_servers.iter().map(|s| s.to_string()).collect();
 
     Ok(LocalProxyConfig {
         private_key,
@@ -55,6 +56,7 @@ pub fn local_proxy_config_from_params(
         keepalive,
         socks_port,
         http_port,
+        dns_servers,
     })
 }
 
@@ -90,6 +92,7 @@ pub fn spawn_daemon(
     config::ensure_user_proxy_dir()?;
     let pid_path = proxy::local_pid_file(instance);
     let log_path = proxy::local_log_file(instance);
+    let status_path = std::path::PathBuf::from(format!("{}.status", pid_path.to_string_lossy()));
     let pid_file = pid_path.to_string_lossy();
     let log_file = log_path.to_string_lossy();
 
@@ -100,6 +103,7 @@ pub fn spawn_daemon(
 
     // Remove stale pid/log files so the poll loop below doesn't read old data.
     let _ = std::fs::remove_file(&pid_path);
+    let _ = std::fs::remove_file(&status_path);
 
     let socks = cfg.socks_port.to_string();
     let http = cfg.http_port.to_string();
@@ -150,8 +154,19 @@ pub fn spawn_daemon(
         if let Ok(text) = std::fs::read_to_string(&pid_path) {
             if let Ok(pid) = text.trim().parse::<u32>() {
                 if std::path::Path::new(&format!("/proc/{}/exe", pid)).exists() {
-                    debug!(pid = ?pid, instance = ?instance, "local_proxy_daemon_ready");
-                    return Ok(pid);
+                    if wait_for_startup_ready(&status_path, Duration::from_secs(12)) {
+                        debug!(pid = ?pid, instance = ?instance, "local_proxy_daemon_ready");
+                        return Ok(pid);
+                    }
+
+                    let _ = stop_daemon(pid);
+                    let _ = std::fs::remove_file(&pid_path);
+                    let detail = tail_file(&log_path, 12);
+                    anyhow::bail!(
+                        "local-proxy tunnel did not establish a WireGuard handshake within 12s for instance {}. Recent log:\n{}",
+                        instance,
+                        detail
+                    );
                 }
             }
         }
@@ -159,6 +174,30 @@ pub fn spawn_daemon(
     }
 
     anyhow::bail!("local-proxy-daemon did not write a valid pid within 5 seconds")
+}
+
+fn wait_for_startup_ready(status_path: &std::path::Path, timeout: Duration) -> bool {
+    let deadline = Instant::now() + timeout;
+    while Instant::now() < deadline {
+        if let Ok(text) = std::fs::read_to_string(status_path) {
+            if text.trim() == "ready" {
+                return true;
+            }
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    false
+}
+
+fn tail_file(path: &std::path::Path, lines: usize) -> String {
+    let Ok(content) = std::fs::read_to_string(path) else {
+        return "<log unavailable>".to_string();
+    };
+    let mut rows: Vec<&str> = content.lines().collect();
+    if rows.len() > lines {
+        rows = rows.split_off(rows.len() - lines);
+    }
+    rows.join("\n")
 }
 
 /// Stop a user-owned local-proxy-daemon by PID.

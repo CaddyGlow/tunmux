@@ -29,7 +29,7 @@ mod wireguard;
 use base64::Engine as _;
 
 use clap::Parser;
-use tracing::error;
+use tracing::{error, info};
 
 use cli::{
     Cli, ConnectProviderCommand, HookBuiltinArg, HookCommand, HookEventArg, ProviderArg, TopCommand,
@@ -71,19 +71,23 @@ fn main() {
         // Do not initialize terminal logging here -- the daemon sets up file logging itself.
         TopCommand::ProxyDaemon {
             netns,
+            interface,
             socks_port,
             http_port,
             proxy_access_log,
             pid_file,
             log_file,
+            startup_status_file,
         } => {
             if let Err(e) = proxy::daemon::run(
                 &netns,
+                &interface,
                 socks_port,
                 http_port,
                 proxy_access_log,
                 &pid_file,
                 &log_file,
+                &startup_status_file,
             ) {
                 eprintln!("proxy-daemon error: {}", e);
                 std::process::exit(1);
@@ -474,7 +478,14 @@ fn config_provider_from_dir_name(name: &str) -> Option<config::Provider> {
 fn run_local_proxy_daemon(pid_file: &str, log_file: &str, config_b64: &str) -> anyhow::Result<()> {
     // Decode config before daemonizing so errors surface to the shell.
     let json = base64::engine::general_purpose::STANDARD.decode(config_b64)?;
-    let cfg: wireguard::proxy_tunnel::LocalProxyConfig = serde_json::from_slice(&json)?;
+    let mut cfg: wireguard::proxy_tunnel::LocalProxyConfig = serde_json::from_slice(&json)?;
+    let dns_override_source =
+        if let Some((source, dns_servers)) = local_proxy_dns_override_from_env() {
+            cfg.dns_servers = dns_servers;
+            Some(source)
+        } else {
+            None
+        };
 
     // Ensure the user proxy dir exists before daemonizing.
     config::ensure_user_proxy_dir()?;
@@ -490,6 +501,14 @@ fn run_local_proxy_daemon(pid_file: &str, log_file: &str, config_b64: &str) -> a
     } else {
         // Init file logging -- all subsequent output goes to the log file.
         logging::init_file(log_file, false)?;
+    }
+
+    if let Some(source) = dns_override_source {
+        info!(
+            source = source,
+            dns_servers = cfg.dns_servers.len(),
+            "local_proxy_dns_servers_overridden_from_env"
+        );
     }
 
     // Ensure panics are captured in logs instead of disappearing after daemonize.
@@ -521,6 +540,12 @@ fn run_local_proxy_daemon(pid_file: &str, log_file: &str, config_b64: &str) -> a
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(pid_file, std::fs::Permissions::from_mode(0o644))?;
     }
+    let startup_status_file = format!("{}.status", pid_file);
+    std::fs::write(&startup_status_file, "starting\n")?;
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&startup_status_file, std::fs::Permissions::from_mode(0o644))?;
+    }
 
     let workers = std::thread::available_parallelism()
         .map(|n| n.get())
@@ -531,7 +556,33 @@ fn run_local_proxy_daemon(pid_file: &str, log_file: &str, config_b64: &str) -> a
         .enable_all()
         .build()?;
 
-    rt.block_on(wireguard::proxy_tunnel::run_local_proxy(cfg))
+    rt.block_on(wireguard::proxy_tunnel::run_local_proxy(
+        cfg,
+        Some(startup_status_file.as_str()),
+    ))
+}
+
+fn local_proxy_dns_override_from_env() -> Option<(&'static str, Vec<String>)> {
+    for key in ["TUNMUX_LOCAL_PROXY_DNS_SERVERS", "TUNMUX_DNS_SERVERS"] {
+        let Some(raw_value) = std::env::var_os(key) else {
+            continue;
+        };
+
+        let dns_servers = parse_dns_servers_env_list(&raw_value.to_string_lossy());
+        if !dns_servers.is_empty() {
+            return Some((key, dns_servers));
+        }
+    }
+
+    None
+}
+
+fn parse_dns_servers_env_list(raw: &str) -> Vec<String> {
+    raw.split(|ch: char| ch == ',' || ch.is_ascii_whitespace())
+        .map(str::trim)
+        .filter(|entry| !entry.is_empty())
+        .map(ToOwned::to_owned)
+        .collect()
 }
 
 /// Double-fork daemonize for the local-proxy daemon.
@@ -690,12 +741,22 @@ fn print_local_proxy_info(conn: &wireguard::connection::ConnectionState) {
 
 #[cfg(test)]
 mod tests {
-    use super::{provider_from_dir_name, provider_label};
+    use super::{parse_dns_servers_env_list, provider_from_dir_name, provider_label};
     use crate::cli::ProviderArg;
 
     #[test]
     fn provider_mapping_includes_wgconf() {
         assert_eq!(provider_from_dir_name("wgconf"), Some(ProviderArg::Wgconf));
         assert_eq!(provider_label(ProviderArg::Wgconf), "wgconf");
+    }
+
+    #[test]
+    fn parse_dns_servers_env_list_accepts_csv_and_whitespace() {
+        let parsed = parse_dns_servers_env_list("1.1.1.1, 9.9.9.9\n2606:4700:4700::1111\t8.8.8.8");
+
+        assert_eq!(
+            parsed,
+            vec!["1.1.1.1", "9.9.9.9", "2606:4700:4700::1111", "8.8.8.8"]
+        );
     }
 }

@@ -9,6 +9,7 @@ use tracing::{debug, info, warn};
 use super::backend::WgBackend;
 use super::config::WgConfigParams;
 use super::connection::{ConnectionState, DIRECT_INSTANCE};
+use super::handshake;
 
 /// Bring up a WireGuard tunnel using kernel ip/wg commands (host routing).
 pub fn up(
@@ -46,6 +47,9 @@ pub fn up(
             "--disable-ipv6 can only be used when Interface.Address has no IPv6 entry".into(),
         ));
     }
+    if let Some(mtu) = params.mtu {
+        validate_mtu(mtu)?;
+    }
 
     let state = ConnectionState {
         instance_name: DIRECT_INSTANCE.to_string(),
@@ -61,6 +65,7 @@ pub fn up(
         proxy_pid: None,
         socks_port: None,
         http_port: None,
+        dns_servers: params.dns_servers.iter().map(|s| s.to_string()).collect(),
         peer_public_key: None,
         local_public_key: None,
         virtual_ips: vec![],
@@ -74,8 +79,15 @@ pub fn up(
         &gw_ip,
         &gw_iface,
         should_manage_global_resolv_conf(),
-        disable_ipv6,
-    ) {
+    )
+    .and_then(|_| {
+        let dns_servers: Vec<String> = params
+            .dns_servers
+            .iter()
+            .map(|server| (*server).to_string())
+            .collect();
+        handshake::wait_for_handshake(interface_name, &dns_servers)
+    }) {
         let _ = PrivilegedClient::new().interface_delete(interface_name);
         ConnectionState::remove(DIRECT_INSTANCE)?;
         return Err(e);
@@ -97,11 +109,16 @@ pub fn up_in_netns(
     interface_name: &str,
     namespace: &str,
 ) -> Result<()> {
+    if let Some(mtu) = params.mtu {
+        validate_mtu(mtu)?;
+    }
+
     info!(
         interface = interface_name,
         namespace,
         endpoint_host = params.server_ip,
         endpoint_port = params.server_port,
+        mtu = params.mtu,
         "kernel_tunnel_setup_in_namespace_start"
     );
 
@@ -170,6 +187,29 @@ pub fn up_in_netns(
         interface_name,
         &format!("ip link set up dev {}", interface_name),
     );
+    if let Some(mtu) = params.mtu {
+        log_kernel_setup_command(
+            interface_name,
+            &format!("ip link set dev {} mtu {}", interface_name, mtu),
+        );
+        let mtu = mtu.to_string();
+        if let Err(e) = netns::exec(
+            namespace,
+            &[
+                "ip",
+                "link",
+                "set",
+                "dev",
+                interface_name,
+                "mtu",
+                mtu.as_str(),
+            ],
+        ) {
+            let _ = netns::delete(namespace);
+            let _ = client.interface_delete(interface_name);
+            return Err(e);
+        }
+    }
     if let Err(e) = netns::exec(
         namespace,
         &["ip", "link", "set", "up", "dev", interface_name],
@@ -299,7 +339,6 @@ fn bring_up(
     gw_ip: &str,
     gw_iface: &str,
     manage_resolv_conf: bool,
-    disable_ipv6: bool,
 ) -> Result<()> {
     let client = PrivilegedClient::new();
     info!(
@@ -308,6 +347,7 @@ fn bring_up(
         endpoint_port = params.server_port,
         address_count = params.addresses.len(),
         dns_servers = params.dns_servers.len(),
+        mtu = params.mtu,
         manage_resolv_conf,
         "kernel_tunnel_apply_start"
     );
@@ -334,6 +374,16 @@ fn bring_up(
         &endpoint,
         &allowed_ips_wg,
     )?;
+    if let Some(psk) = params.preshared_key {
+        log_kernel_setup_command(
+            interface_name,
+            &format!(
+                "wg set {} peer {} preshared-key <redacted>",
+                interface_name, params.server_public_key
+            ),
+        );
+        client.wireguard_set_psk(interface_name, params.server_public_key, psk)?;
+    }
 
     for addr in params.addresses {
         log_kernel_setup_command(
@@ -347,6 +397,13 @@ fn bring_up(
         interface_name,
         &format!("ip link set up dev {}", interface_name),
     );
+    if let Some(mtu) = params.mtu {
+        log_kernel_setup_command(
+            interface_name,
+            &format!("ip link set dev {} mtu {}", interface_name, mtu),
+        );
+        client.host_ip_link_set_mtu(interface_name, mtu)?;
+    }
     client.host_ip_link_set_up(interface_name)?;
 
     let host_route = format!("{}/32", params.server_ip);
@@ -385,29 +442,22 @@ fn bring_up(
             interface = interface_name,
             "kernel_ipv6_split_routes_installed"
         );
-    } else if allowed_ips_contains_ipv6_default(params.allowed_ips) {
-        if disable_ipv6 {
-            log_kernel_setup_command(
-                interface_name,
-                &format!("ip -6 route add ::/1 dev {}", interface_name),
-            );
-            client.host_ip_route_add("::/1", None, interface_name)?;
-            log_kernel_setup_command(
-                interface_name,
-                &format!("ip -6 route add 8000::/1 dev {}", interface_name),
-            );
-            client.host_ip_route_add("8000::/1", None, interface_name)?;
-            info!(
-                interface = interface_name,
-                "kernel_ipv6_fallback_block_routes_installed"
-            );
-        } else {
-            warn!(
-                interface = interface_name,
-                allowed_ips = params.allowed_ips,
-                "kernel_ipv6_default_requested_but_no_ipv6_interface_address"
-            );
-        }
+    } else if should_install_ipv6_fallback_block_routes(params) {
+        log_kernel_setup_command(
+            interface_name,
+            &format!("ip -6 route add ::/1 dev {}", interface_name),
+        );
+        client.host_ip_route_add("::/1", None, interface_name)?;
+        log_kernel_setup_command(
+            interface_name,
+            &format!("ip -6 route add 8000::/1 dev {}", interface_name),
+        );
+        client.host_ip_route_add("8000::/1", None, interface_name)?;
+        warn!(
+            interface = interface_name,
+            allowed_ips = params.allowed_ips,
+            "kernel_ipv6_default_requested_without_ipv6_interface_address_blocking_host_ipv6"
+        );
     }
 
     let dns_content: String = params
@@ -468,6 +518,11 @@ fn should_install_ipv6_default_routes(params: &WgConfigParams<'_>) -> bool {
         && allowed_ips_contains_ipv6_default(params.allowed_ips)
 }
 
+fn should_install_ipv6_fallback_block_routes(params: &WgConfigParams<'_>) -> bool {
+    !has_ipv6_interface_address(params.addresses)
+        && allowed_ips_contains_ipv6_default(params.allowed_ips)
+}
+
 fn has_ipv6_interface_address(addresses: &[&str]) -> bool {
     addresses.iter().any(|cidr| {
         let ip = cidr.split('/').next().unwrap_or_default().trim();
@@ -477,6 +532,16 @@ fn has_ipv6_interface_address(addresses: &[&str]) -> bool {
 
 fn allowed_ips_contains_ipv6_default(allowed_ips: &str) -> bool {
     allowed_ips.split(',').any(|entry| entry.trim() == "::/0")
+}
+
+fn validate_mtu(mtu: u16) -> Result<()> {
+    if mtu < 576 {
+        return Err(AppError::WireGuard(format!(
+            "invalid MTU {} (must be >= 576)",
+            mtu
+        )));
+    }
+    Ok(())
 }
 
 fn is_systemd_resolved_managed_resolv_conf(path: &str) -> bool {
@@ -570,5 +635,49 @@ mod tests {
         let addresses = ["fd7d:76ee:e68f:a993::2/128"];
         assert!(has_ipv6_interface_address(&addresses));
         assert!(!allowed_ips_contains_ipv6_default("0.0.0.0/0"));
+    }
+
+    #[test]
+    fn test_should_install_ipv6_fallback_block_routes_true_without_v6_address() {
+        let params = WgConfigParams {
+            private_key: "private",
+            addresses: &["10.0.0.2/32"],
+            dns_servers: &["10.0.0.1"],
+            mtu: None,
+            server_public_key: "peer",
+            server_ip: "149.102.245.129",
+            server_port: 51820,
+            preshared_key: None,
+            allowed_ips: "0.0.0.0/0, ::/0",
+        };
+
+        assert!(should_install_ipv6_fallback_block_routes(&params));
+    }
+
+    #[test]
+    fn test_should_install_ipv6_fallback_block_routes_false_with_v6_address() {
+        let params = WgConfigParams {
+            private_key: "private",
+            addresses: &["10.0.0.2/32", "fd7d:76ee:e68f:a993::2/128"],
+            dns_servers: &["10.0.0.1"],
+            mtu: None,
+            server_public_key: "peer",
+            server_ip: "149.102.245.129",
+            server_port: 51820,
+            preshared_key: None,
+            allowed_ips: "0.0.0.0/0, ::/0",
+        };
+
+        assert!(!should_install_ipv6_fallback_block_routes(&params));
+    }
+
+    #[test]
+    fn test_validate_mtu_rejects_too_small_values() {
+        assert!(validate_mtu(575).is_err());
+    }
+
+    #[test]
+    fn test_validate_mtu_accepts_reasonable_values() {
+        assert!(validate_mtu(1280).is_ok());
     }
 }

@@ -1,5 +1,5 @@
 use std::cmp::Ordering;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crate::cli::ProtonCommand;
 use crate::config::{self, AppConfig, Provider};
@@ -11,6 +11,7 @@ use crate::shared::crypto;
 use crate::shared::hooks;
 use crate::shared::latency;
 use crate::wireguard;
+use x509_parser::prelude::FromDer;
 
 use super::{api, models};
 
@@ -28,6 +29,7 @@ pub async fn dispatch(command: ProtonCommand, config: &AppConfig) -> anyhow::Res
         ProtonCommand::Login { username } => cmd_login(&username, config).await,
         ProtonCommand::Logout => cmd_logout(config).await,
         ProtonCommand::Info => cmd_info(config),
+        ProtonCommand::Renew => cmd_renew(config).await,
         ProtonCommand::Servers {
             country,
             free,
@@ -44,6 +46,7 @@ pub async fn dispatch(command: ProtonCommand, config: &AppConfig) -> anyhow::Res
                 args.proxy,
                 args.local_proxy,
                 args.disable_ipv6,
+                args.mtu,
                 args.socks_port,
                 args.http_port,
                 args.proxy_access_log,
@@ -133,6 +136,20 @@ fn cmd_info(config: &AppConfig) -> anyhow::Result<()> {
     println!("Tier:        {}", session.max_tier);
     println!("Connections: {}", session.max_connections);
     println!("Fingerprint: {}", &session.fingerprint[..16]);
+    Ok(())
+}
+
+async fn cmd_renew(config: &AppConfig) -> anyhow::Result<()> {
+    let mut session: models::session::Session = config::load_session(PROVIDER, config)?;
+    renew_proton_certificate(&mut session, config)
+        .await
+        .map_err(|err| {
+            anyhow::anyhow!(
+                "could not renew Proton certificate from saved session (token may be expired): {}. run `tunmux proton login <username>`",
+                err
+            )
+        })?;
+    println!("Proton VPN certificate renewed.");
     Ok(())
 }
 
@@ -305,6 +322,7 @@ async fn cmd_connect(
     use_proxy: bool,
     use_local_proxy: bool,
     disable_ipv6: bool,
+    mtu_arg: Option<u16>,
     socks_port_arg: Option<u16>,
     http_port_arg: Option<u16>,
     proxy_access_log_arg: bool,
@@ -345,7 +363,8 @@ async fn cmd_connect(
     let effective_country = country.or_else(|| config.proton.default_country.clone());
     let proxy_access_log = proxy_access_log_arg || config.general.proxy_access_log;
 
-    let session: models::session::Session = config::load_session(PROVIDER, config)?;
+    let mut session: models::session::Session = config::load_session(PROVIDER, config)?;
+    ensure_proton_certificate_ready(&mut session, config).await?;
     let mut servers = load_servers_cached_or_fetch(&session).await?;
 
     // Filter enabled servers with WireGuard support
@@ -428,6 +447,7 @@ async fn cmd_connect(
         private_key: &wg_private_key,
         addresses: &["10.2.0.2/32"],
         dns_servers: &["10.2.0.1"],
+        mtu: mtu_arg,
         server_public_key: server_pubkey,
         server_ip: &physical.entry_ip,
         server_port: 51820,
@@ -458,6 +478,107 @@ async fn cmd_connect(
     }
 
     Ok(())
+}
+
+async fn ensure_proton_certificate_ready(
+    session: &mut models::session::Session,
+    config: &AppConfig,
+) -> anyhow::Result<()> {
+    if session.certificate_pem.trim().is_empty() {
+        tracing::warn!("proton_certificate_missing_attempting_auto_renew");
+        return renew_proton_certificate(session, config)
+            .await
+            .map_err(|err| anyhow::anyhow!("no stored Proton certificate and automatic renewal failed: {}. run `tunmux proton login <username>`", err));
+    }
+
+    let not_after_unix = match proton_certificate_not_after_unix(session) {
+        Some(value) => value,
+        None => {
+            tracing::warn!("proton_certificate_parse_failed_attempting_auto_renew");
+            return renew_proton_certificate(session, config)
+                .await
+                .map_err(|err| anyhow::anyhow!("stored Proton certificate could not be parsed and automatic renewal failed: {}. run `tunmux proton login <username>`", err));
+        }
+    };
+
+    let now_unix = current_unix_timestamp()?;
+    if now_unix < not_after_unix {
+        return Ok(());
+    }
+
+    let expiry = format_unix_utc(not_after_unix);
+    tracing::warn!(
+        expires_at = %expiry,
+        "proton_certificate_expired_attempting_auto_renew"
+    );
+    renew_proton_certificate(session, config).await.map_err(|err| {
+        anyhow::anyhow!(
+            "stored Proton certificate expired at {} UTC and automatic renewal failed: {}. run `tunmux proton login <username>`",
+            expiry,
+            err
+        )
+    })
+}
+
+async fn renew_proton_certificate(
+    session: &mut models::session::Session,
+    config: &AppConfig,
+) -> anyhow::Result<()> {
+    let ed25519_public_key_pem = if session.ed25519_public_key_pem.trim().is_empty() {
+        let keys = crypto::keys::VpnKeys::from_base64(&session.ed25519_private_key)?;
+        let pem = keys.ed25519_pk_pem();
+        session.ed25519_public_key_pem = pem.clone();
+        pem
+    } else {
+        session.ed25519_public_key_pem.clone()
+    };
+
+    let client = api::http::ProtonClient::authenticated(&session.uid, &session.access_token)?;
+    let cert = api::certificate::fetch_certificate(&client, &ed25519_public_key_pem).await?;
+    session.certificate_pem = cert.certificate;
+    config::save_session(PROVIDER, session, config)?;
+    tracing::info!(
+        serial = %cert.serial_number,
+        "proton_certificate_renewed"
+    );
+    Ok(())
+}
+
+fn proton_certificate_not_after_unix(session: &models::session::Session) -> Option<i64> {
+    let (_, pem) = match x509_parser::pem::parse_x509_pem(session.certificate_pem.as_bytes()) {
+        Ok(value) => value,
+        Err(err) => {
+            tracing::warn!(
+                error = %err,
+                "proton_certificate_pem_parse_failed"
+            );
+            return None;
+        }
+    };
+    let (_, cert) = match x509_parser::certificate::X509Certificate::from_der(&pem.contents) {
+        Ok(value) => value,
+        Err(err) => {
+            tracing::warn!(
+                error = %err,
+                "proton_certificate_der_parse_failed"
+            );
+            return None;
+        }
+    };
+    Some(cert.validity().not_after.timestamp())
+}
+
+fn current_unix_timestamp() -> anyhow::Result<i64> {
+    Ok(SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|e| anyhow::anyhow!("system clock before unix epoch: {}", e))?
+        .as_secs() as i64)
+}
+
+fn format_unix_utc(unix_time: i64) -> String {
+    time::OffsetDateTime::from_unix_timestamp(unix_time)
+        .map(|v| v.to_string())
+        .unwrap_or_else(|_| unix_time.to_string())
 }
 
 fn connect_proxy(
@@ -513,7 +634,8 @@ fn connect_proxy(
     }
 
     // Spawn proxy daemon
-    let pid = match proxy::spawn_daemon(&instance, &namespace_name, &proxy_config) {
+    let pid = match proxy::spawn_daemon(&instance, &interface_name, &namespace_name, &proxy_config)
+    {
         Ok(pid) => pid,
         Err(e) => {
             // Clean up on failure
@@ -537,6 +659,7 @@ fn connect_proxy(
         proxy_pid: Some(pid),
         socks_port: Some(proxy_config.socks_port),
         http_port: Some(proxy_config.http_port),
+        dns_servers: params.dns_servers.iter().map(|s| s.to_string()).collect(),
         peer_public_key: None,
         local_public_key: None,
         virtual_ips: vec![],
@@ -614,6 +737,7 @@ fn connect_local_proxy(
         proxy_pid: Some(pid),
         socks_port: Some(proxy_config.socks_port),
         http_port: Some(proxy_config.http_port),
+        dns_servers: params.dns_servers.iter().map(|s| s.to_string()).collect(),
         peer_public_key: Some(params.server_public_key.to_string()),
         local_public_key,
         virtual_ips: params.addresses.iter().map(|s| s.to_string()).collect(),
@@ -670,6 +794,7 @@ fn connect_direct(
                 proxy_pid: None,
                 socks_port: None,
                 http_port: None,
+                dns_servers: params.dns_servers.iter().map(|s| s.to_string()).collect(),
                 peer_public_key: None,
                 local_public_key: None,
                 virtual_ips: vec![],
@@ -695,6 +820,7 @@ fn connect_direct(
                 proxy_pid: None,
                 socks_port: None,
                 http_port: None,
+                dns_servers: params.dns_servers.iter().map(|s| s.to_string()).collect(),
                 peer_public_key: None,
                 local_public_key: None,
                 virtual_ips: vec![],

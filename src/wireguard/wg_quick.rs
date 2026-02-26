@@ -4,6 +4,8 @@ use crate::privileged_api::WgQuickAction;
 use crate::privileged_client::PrivilegedClient;
 use tracing::{debug, info};
 
+use super::handshake;
+
 /// Write the WireGuard config and bring up the interface.
 /// Returns the effective interface name used (may differ from the requested name on macOS,
 /// where TUN interfaces must be named `utunN` and the number is assigned by the kernel).
@@ -28,6 +30,8 @@ pub fn up(
         config_content,
         prefer_userspace,
     )?;
+    let dns_servers = handshake::dns_servers_from_config(config_content);
+    handshake::wait_for_handshake(&effective, &dns_servers)?;
     Ok(effective)
 }
 

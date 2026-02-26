@@ -30,6 +30,8 @@ pub struct AirServer {
     pub ips_entry: Vec<String>,
     pub country_code: String,
     pub location: String,
+    #[serde(default)]
+    pub score_base: i64,
     pub bandwidth: i64,
     pub bandwidth_max: i64,
     pub users: i64,

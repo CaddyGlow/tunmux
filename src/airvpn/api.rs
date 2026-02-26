@@ -1,3 +1,5 @@
+use std::collections::HashMap;
+
 use tracing::warn;
 
 use crate::error::{AppError, Result};
@@ -220,6 +222,18 @@ fn parse_manifest_response(xml: &str) -> Result<AirManifest> {
     let mut servers = Vec::new();
     let mut wg_modes = Vec::new();
     let mut api_urls = Vec::new();
+    let mut server_groups: HashMap<String, roxmltree::NodeId> = HashMap::new();
+
+    for node in root.descendants() {
+        if !node.has_tag_name("servers_group") {
+            continue;
+        }
+        if let Some(group) = node.attribute("group") {
+            if !group.is_empty() {
+                server_groups.insert(group.to_string(), node.id());
+            }
+        }
+    }
 
     for node in root.descendants() {
         if node.has_tag_name("server")
@@ -228,7 +242,12 @@ fn parse_manifest_response(xml: &str) -> Result<AirManifest> {
                 .map(|p| p.has_tag_name("servers"))
                 .unwrap_or(false)
         {
-            let ips_str = node.attribute("ips_entry").unwrap_or("");
+            let group_node = node
+                .attribute("group")
+                .and_then(|group| server_groups.get(group).copied())
+                .and_then(|id| doc.get_node(id));
+
+            let ips_str = server_attr(node, group_node, "ips_entry").unwrap_or_default();
             let ips_entry: Vec<String> = ips_str
                 .split(',')
                 .filter(|s| !s.is_empty())
@@ -236,26 +255,15 @@ fn parse_manifest_response(xml: &str) -> Result<AirManifest> {
                 .collect();
 
             servers.push(AirServer {
-                name: node.attribute("name").unwrap_or("").to_string(),
+                name: server_attr(node, group_node, "name").unwrap_or_default(),
                 ips_entry,
-                country_code: node.attribute("country_code").unwrap_or("").to_string(),
-                location: node.attribute("location").unwrap_or("").to_string(),
-                bandwidth: node
-                    .attribute("bw")
-                    .and_then(|v| v.parse().ok())
-                    .unwrap_or(0),
-                bandwidth_max: node
-                    .attribute("bw_max")
-                    .and_then(|v| v.parse().ok())
-                    .unwrap_or(1),
-                users: node
-                    .attribute("users")
-                    .and_then(|v| v.parse().ok())
-                    .unwrap_or(0),
-                users_max: node
-                    .attribute("users_max")
-                    .and_then(|v| v.parse().ok())
-                    .unwrap_or(100),
+                country_code: server_attr(node, group_node, "country_code").unwrap_or_default(),
+                location: server_attr(node, group_node, "location").unwrap_or_default(),
+                score_base: server_attr_i64(node, group_node, "scorebase").unwrap_or(0),
+                bandwidth: server_attr_i64(node, group_node, "bw").unwrap_or(0),
+                bandwidth_max: server_attr_i64(node, group_node, "bw_max").unwrap_or(1),
+                users: server_attr_i64(node, group_node, "users").unwrap_or(0),
+                users_max: server_attr_i64(node, group_node, "users_max").unwrap_or(100),
                 group: node.attribute("group").unwrap_or("").to_string(),
             });
         }
@@ -297,6 +305,25 @@ fn parse_manifest_response(xml: &str) -> Result<AirManifest> {
     })
 }
 
+fn server_attr<'a, 'input>(
+    server: roxmltree::Node<'a, 'input>,
+    group: Option<roxmltree::Node<'a, 'input>>,
+    key: &str,
+) -> Option<String> {
+    server
+        .attribute(key)
+        .or_else(|| group.and_then(|g| g.attribute(key)))
+        .map(|value| value.to_string())
+}
+
+fn server_attr_i64<'a, 'input>(
+    server: roxmltree::Node<'a, 'input>,
+    group: Option<roxmltree::Node<'a, 'input>>,
+    key: &str,
+) -> Option<i64> {
+    server_attr(server, group, key).and_then(|value| value.parse().ok())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -335,15 +362,22 @@ mod tests {
     fn test_parse_manifest_response() {
         let xml = r#"<manifest time="123">
             <servers>
-                <server name="Castor" ips_entry="1.2.3.4,5.6.7.8"
+                <server name="Castor"
                         country_code="NL" location="Amsterdam"
-                        bw="50000" bw_max="100000"
-                        users="15" users_max="200" group="earth" />
+                        bw="50000"
+                        users="15" group="earth" />
                 <server name="Vega" ips_entry="9.10.11.12"
                         country_code="US" location="New York"
-                        bw="30000" bw_max="100000"
+                        bw="30000" bw_max="100000" scorebase="7"
                         users="50" users_max="200" group="earth" />
             </servers>
+            <servers_groups>
+                <servers_group group="earth"
+                               ips_entry="1.2.3.4,5.6.7.8"
+                               bw_max="100000"
+                               users_max="200"
+                               scorebase="42" />
+            </servers_groups>
             <modes>
                 <mode type="wireguard" protocol="UDP" port="1637" entry_index="0" />
                 <mode type="wireguard" protocol="UDP" port="443" entry_index="0" />
@@ -360,6 +394,10 @@ mod tests {
         assert_eq!(manifest.servers[0].ips_entry, vec!["1.2.3.4", "5.6.7.8"]);
         assert_eq!(manifest.servers[0].country_code, "NL");
         assert_eq!(manifest.servers[0].bandwidth, 50000);
+        assert_eq!(manifest.servers[0].bandwidth_max, 100000);
+        assert_eq!(manifest.servers[0].users_max, 200);
+        assert_eq!(manifest.servers[0].score_base, 42);
+        assert_eq!(manifest.servers[1].score_base, 7);
         assert_eq!(manifest.wg_modes.len(), 2); // only wireguard modes
         assert_eq!(manifest.wg_modes[0].port, 1637);
         assert_eq!(manifest.api_urls, vec!["http://10.0.0.1"]);

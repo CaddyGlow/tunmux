@@ -173,6 +173,7 @@ pub struct WgConfigParams<'a> {
     pub private_key: &'a str,
     pub addresses: &'a [&'a str],
     pub dns_servers: &'a [&'a str],
+    pub mtu: Option<u16>,
     pub server_public_key: &'a str,
     pub server_ip: &'a str,
     pub server_port: u16,
@@ -190,15 +191,18 @@ pub fn generate_config(params: &WgConfigParams<'_>) -> String {
         "[Interface]\n\
          PrivateKey = {private_key}\n\
          Address = {addresses}\n\
-         DNS = {dns}\n\
-         \n\
-         [Peer]\n\
-         PublicKey = {server_public_key}\n",
+         DNS = {dns}\n",
         private_key = params.private_key,
         addresses = addresses,
         dns = dns,
-        server_public_key = params.server_public_key,
     );
+
+    if let Some(mtu) = params.mtu {
+        config.push_str(&format!("MTU = {}\n", mtu));
+    }
+
+    config.push_str("\n[Peer]\n");
+    config.push_str(&format!("PublicKey = {}\n", params.server_public_key));
 
     if let Some(psk) = params.preshared_key {
         config.push_str(&format!("PresharedKey = {}\n", psk));
@@ -225,6 +229,7 @@ mod tests {
             private_key: "cFRzNnhVcGRkSzlCUGRGTUpiUTJtYlZZSUxPbmJJaz0=",
             addresses: &["10.2.0.2/32"],
             dns_servers: &["10.2.0.1"],
+            mtu: None,
             server_public_key: "c2VydmVyLXB1YmxpYy1rZXk=",
             server_ip: "198.51.100.1",
             server_port: 51820,
@@ -251,6 +256,7 @@ mod tests {
             private_key: "cHJpdmtleQ==",
             addresses: &["10.5.0.1/32", "fd7d:76ee:e68f:a993::1/128"],
             dns_servers: &["10.5.0.1", "fd7d:76ee:e68f:a993::1"],
+            mtu: None,
             server_public_key: "cHVia2V5",
             server_ip: "1.2.3.4",
             server_port: 1637,
@@ -266,11 +272,30 @@ mod tests {
     }
 
     #[test]
+    fn test_wg_config_with_mtu() {
+        let params = WgConfigParams {
+            private_key: "priv",
+            addresses: &["10.0.0.2/32"],
+            dns_servers: &["10.0.0.1"],
+            mtu: Some(1280),
+            server_public_key: "pub",
+            server_ip: "1.2.3.4",
+            server_port: 51820,
+            preshared_key: None,
+            allowed_ips: "0.0.0.0/0, ::/0",
+        };
+
+        let config = generate_config(&params);
+        assert!(config.contains("MTU = 1280"));
+    }
+
+    #[test]
     fn test_parse_config_roundtrip() {
         let params = WgConfigParams {
             private_key: "cFRzNnhVcGRkSzlCUGRGTUpiUTJtYlZZSUxPbmJJaz0=",
             addresses: &["10.2.0.2/32"],
             dns_servers: &["10.2.0.1"],
+            mtu: None,
             server_public_key: "c2VydmVyLXB1YmxpYy1rZXk=",
             server_ip: "198.51.100.1",
             server_port: 51820,
@@ -303,6 +328,7 @@ mod tests {
             private_key: "cHJpdmtleQ==",
             addresses: &["10.5.0.1/32", "fd7d:76ee:e68f:a993::1/128"],
             dns_servers: &["10.5.0.1", "fd7d:76ee:e68f:a993::1"],
+            mtu: None,
             server_public_key: "cHVia2V5",
             server_ip: "1.2.3.4",
             server_port: 1637,

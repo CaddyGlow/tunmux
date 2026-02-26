@@ -1,7 +1,7 @@
 use std::collections::HashMap;
-use std::process::Command;
+use std::process::{Command, Stdio};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, Context};
 use rand::{distributions::Alphanumeric, Rng};
@@ -28,6 +28,7 @@ enum BuiltinHook {
 struct HookRuntime {
     http_proxy_url: Option<String>,
     all_proxy_url: Option<String>,
+    vpn_dns_servers: Vec<String>,
 }
 
 impl HookRuntime {
@@ -38,10 +39,17 @@ impl HookRuntime {
         let all_proxy_url = state
             .socks_port
             .map(|port| format!("socks5h://127.0.0.1:{}", port));
+        let vpn_dns_servers = state
+            .dns_servers
+            .iter()
+            .map(|s| normalize_dns_server(s))
+            .filter(|s| !s.is_empty())
+            .collect();
 
         Self {
             http_proxy_url,
             all_proxy_url,
+            vpn_dns_servers,
         }
     }
 
@@ -50,10 +58,18 @@ impl HookRuntime {
             .as_deref()
             .or(self.all_proxy_url.as_deref())
     }
+
+    fn vpn_dns_servers(&self) -> &[String] {
+        &self.vpn_dns_servers
+    }
 }
 
 const DNS_DETECTION_SESSION_LEN: usize = 40;
 const DNS_DETECTION_PROBES: u8 = 10;
+const DNS_DETECTION_HTTP_TIMEOUT_SECS: u64 = 4;
+const DNS_DETECTION_INTER_PROBE_DELAY_MS: u64 = 100;
+const DNS_PTR_LOOKUP_CMD_TIMEOUT_MS: u64 = 1200;
+const DNS_PTR_MAX_LOOKUP_SERVERS: usize = 1;
 const IPINFO_IPV4_URLS: [&str; 2] = ["https://ipinfo.io", "http://ipinfo.io"];
 const IPINFO_IPV6_URLS: [&str; 2] = ["https://v6.ipinfo.io", "http://v6.ipinfo.io"];
 
@@ -195,6 +211,12 @@ fn build_hook_env(
     }
     if let Some(proxy_pid) = state.proxy_pid {
         env.insert("TUNMUX_PROXY_PID".to_string(), proxy_pid.to_string());
+    }
+    if !state.dns_servers.is_empty() {
+        env.insert(
+            "TUNMUX_DNS_SERVERS".to_string(),
+            state.dns_servers.join(","),
+        );
     }
 
     env
@@ -349,35 +371,61 @@ fn ping_ipv6() -> anyhow::Result<()> {
 
 fn run_builtin_external_ip(runtime: Option<&HookRuntime>) -> anyhow::Result<()> {
     let runtime = runtime.cloned();
-    let (ipv4, ipv6) = run_hook_blocking(move || {
+    let (ipv4, ipv4_err, ipv6, ipv6_err) = run_hook_blocking(move || {
         run_with_http_client(
             Duration::from_secs(6),
             runtime.as_ref(),
             "external-ip check",
             |client| {
-                let ipv4 = fetch_ipinfo_summary_with_fallback(client, &IPINFO_IPV4_URLS)
-                    .context("failed external IPv4 check via ipinfo")?;
-                let ipv6 = fetch_ipinfo_summary_with_fallback(client, &IPINFO_IPV6_URLS)
-                    .context("failed external IPv6 check via ipinfo")?;
-                Ok((ipv4, ipv6))
+                let (ipv4, ipv4_err) =
+                    fetch_ipinfo_summary_optional(client, &IPINFO_IPV4_URLS, "IPv4");
+                let (ipv6, ipv6_err) =
+                    fetch_ipinfo_summary_optional(client, &IPINFO_IPV6_URLS, "IPv6");
+
+                if ipv4.is_none() && ipv6.is_none() {
+                    anyhow::bail!(
+                        "external-ip check failed: {} | {}",
+                        ipv4_err
+                            .as_deref()
+                            .unwrap_or("IPv4 lookup failed without details"),
+                        ipv6_err
+                            .as_deref()
+                            .unwrap_or("IPv6 lookup failed without details")
+                    );
+                }
+
+                Ok((ipv4, ipv4_err, ipv6, ipv6_err))
             },
         )
     })?;
 
-    println!(
-        "Hook external-ip ipv4: ip={} country={} city={} org={}",
-        ipv4.ip,
-        summary_country(Some(&ipv4)),
-        summary_city(Some(&ipv4)),
-        summary_org(Some(&ipv4))
-    );
-    println!(
-        "Hook external-ip ipv6: ip={} country={} city={} org={}",
-        ipv6.ip,
-        summary_country(Some(&ipv6)),
-        summary_city(Some(&ipv6)),
-        summary_org(Some(&ipv6))
-    );
+    match ipv4 {
+        Some(ipv4) => println!(
+            "Hook external-ip ipv4: ip={} country={} city={} org={}",
+            ipv4.ip,
+            summary_country(Some(&ipv4)),
+            summary_city(Some(&ipv4)),
+            summary_org(Some(&ipv4))
+        ),
+        None => println!(
+            "Hook external-ip ipv4: unavailable ({})",
+            ipv4_err.as_deref().unwrap_or("request failed")
+        ),
+    }
+    match ipv6 {
+        Some(ipv6) => println!(
+            "Hook external-ip ipv6: ip={} country={} city={} org={}",
+            ipv6.ip,
+            summary_country(Some(&ipv6)),
+            summary_city(Some(&ipv6)),
+            summary_org(Some(&ipv6))
+        ),
+        None => println!(
+            "Hook external-ip ipv6: unavailable ({})",
+            ipv6_err.as_deref().unwrap_or("request failed")
+        ),
+    }
+
     Ok(())
 }
 
@@ -401,7 +449,7 @@ fn run_builtin_dns_detection(runtime: Option<&HookRuntime>) -> anyhow::Result<()
     let runtime = runtime.cloned();
     let resolvers = run_hook_blocking(move || {
         run_with_http_client(
-            Duration::from_secs(8),
+            Duration::from_secs(DNS_DETECTION_HTTP_TIMEOUT_SECS),
             runtime.as_ref(),
             "dns-detection check",
             |client| {
@@ -424,14 +472,19 @@ fn run_builtin_dns_detection(runtime: Option<&HookRuntime>) -> anyhow::Result<()
                     }
 
                     if probe < DNS_DETECTION_PROBES {
-                        thread::sleep(Duration::from_millis(300));
+                        thread::sleep(Duration::from_millis(DNS_DETECTION_INTER_PROBE_DELAY_MS));
                     }
                 }
 
+                let lookup_servers = preferred_lookup_servers(runtime.as_ref(), &aggregate);
+                let allow_system_fallback = runtime
+                    .as_ref()
+                    .and_then(HookRuntime::request_proxy_url)
+                    .is_none();
                 let mut resolvers = Vec::new();
                 for (ip, count) in aggregate {
                     resolvers.push(DnsResolverEntry {
-                        ptr_name: reverse_dns_lookup(&ip),
+                        ptr_name: reverse_dns_lookup(&ip, &lookup_servers, allow_system_fallback),
                         ip,
                         count,
                     });
@@ -460,14 +513,87 @@ fn run_builtin_dns_detection(runtime: Option<&HookRuntime>) -> anyhow::Result<()
     Ok(())
 }
 
-fn reverse_dns_lookup(ip: &str) -> Option<String> {
-    run_lookup_command("nslookup", &[ip])
+fn reverse_dns_lookup(
+    ip: &str,
+    lookup_servers: &[String],
+    allow_system_fallback: bool,
+) -> Option<String> {
+    for resolver in lookup_servers {
+        if let Some(name) =
+            run_lookup_command("nslookup", &["-timeout=1", "-retry=1", ip, resolver])
+                .and_then(|stdout| parse_nslookup_output(&stdout))
+        {
+            return Some(name);
+        }
+    }
+
+    if !allow_system_fallback {
+        return None;
+    }
+
+    run_lookup_command("nslookup", &["-timeout=1", "-retry=1", ip])
         .and_then(|stdout| parse_nslookup_output(&stdout))
-        .or_else(|| run_lookup_command("host", &[ip]).and_then(|stdout| parse_host_output(&stdout)))
+}
+
+fn preferred_lookup_servers(
+    runtime: Option<&HookRuntime>,
+    aggregate: &std::collections::BTreeMap<String, u64>,
+) -> Vec<String> {
+    if let Some(runtime) = runtime {
+        if !runtime.vpn_dns_servers().is_empty() {
+            return runtime
+                .vpn_dns_servers()
+                .iter()
+                .take(DNS_PTR_MAX_LOOKUP_SERVERS)
+                .cloned()
+                .collect();
+        }
+    }
+
+    aggregate
+        .keys()
+        .take(DNS_PTR_MAX_LOOKUP_SERVERS)
+        .cloned()
+        .collect()
+}
+
+fn normalize_dns_server(value: &str) -> String {
+    value
+        .trim()
+        .trim_matches('[')
+        .trim_matches(']')
+        .split('/')
+        .next()
+        .unwrap_or("")
+        .trim()
+        .to_string()
 }
 
 fn run_lookup_command(name: &str, args: &[&str]) -> Option<String> {
-    let output = Command::new(name).args(args).output().ok()?;
+    let mut child = Command::new(name)
+        .args(args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .ok()?;
+
+    let deadline = Instant::now() + Duration::from_millis(DNS_PTR_LOOKUP_CMD_TIMEOUT_MS);
+    loop {
+        match child.try_wait().ok()? {
+            Some(_status) => break,
+            None => {
+                if Instant::now() >= deadline {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return None;
+                }
+                thread::sleep(Duration::from_millis(25));
+            }
+        }
+    }
+
+    let output = child.wait_with_output().ok()?;
     if !output.status.success() {
         return None;
     }
@@ -478,19 +604,6 @@ fn parse_nslookup_output(stdout: &str) -> Option<String> {
     for line in stdout.lines() {
         let trimmed = line.trim();
         if let Some((_, rhs)) = trimmed.split_once("name =") {
-            let value = normalize_dns_name(rhs);
-            if !value.is_empty() {
-                return Some(value);
-            }
-        }
-    }
-    None
-}
-
-fn parse_host_output(stdout: &str) -> Option<String> {
-    for line in stdout.lines() {
-        let trimmed = line.trim();
-        if let Some((_, rhs)) = trimmed.split_once("domain name pointer") {
             let value = normalize_dns_name(rhs);
             if !value.is_empty() {
                 return Some(value);
@@ -626,6 +739,11 @@ where
     match operation(&preferred_client) {
         Ok(value) => Ok(value),
         Err(preferred_err) => {
+            let allow_direct_fallback = runtime.and_then(HookRuntime::request_proxy_url).is_none();
+            if !allow_direct_fallback {
+                return Err(preferred_err);
+            }
+
             if runtime.is_none() {
                 return Err(preferred_err);
             }
@@ -666,6 +784,17 @@ fn fetch_ipinfo_summary_with_fallback(
         "ipinfo request failed for all endpoints: {}",
         errors.join(" | ")
     )
+}
+
+fn fetch_ipinfo_summary_optional(
+    client: &Client,
+    urls: &[&str],
+    label: &str,
+) -> (Option<IpInfoSummary>, Option<String>) {
+    match fetch_ipinfo_summary_with_fallback(client, urls) {
+        Ok(summary) => (Some(summary), None),
+        Err(err) => (None, Some(format!("{}: {}", label, err))),
+    }
 }
 
 fn build_http_client(timeout: Duration, runtime: Option<&HookRuntime>) -> anyhow::Result<Client> {
@@ -818,6 +947,7 @@ mod tests {
             proxy_pid: Some(1234),
             socks_port: Some(1080),
             http_port: Some(8118),
+            dns_servers: vec!["10.2.0.1".to_string()],
             peer_public_key: None,
             local_public_key: None,
             virtual_ips: vec![],
@@ -866,6 +996,7 @@ mod tests {
             proxy_pid: Some(1234),
             socks_port: Some(1080),
             http_port: Some(8118),
+            dns_servers: vec!["10.2.0.1".to_string()],
             peer_public_key: None,
             local_public_key: None,
             virtual_ips: vec![],
@@ -942,13 +1073,6 @@ mod tests {
         let output = "Server: 1.1.1.1\nAddress: 1.1.1.1#53\n\n230.123.185.66.in-addr.arpa\tname = resolver1.example.net.\n";
         let parsed = super::parse_nslookup_output(output);
         assert_eq!(parsed.as_deref(), Some("resolver1.example.net"));
-    }
-
-    #[test]
-    fn parse_host_output_extracts_ptr_name() {
-        let output = "66.185.123.230.in-addr.arpa domain name pointer resolver2.example.net.\n";
-        let parsed = super::parse_host_output(output);
-        assert_eq!(parsed.as_deref(), Some("resolver2.example.net"));
     }
 
     #[test]

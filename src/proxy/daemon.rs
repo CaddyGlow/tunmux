@@ -1,12 +1,14 @@
 #![cfg(all(feature = "proxy", target_os = "linux"))]
 
 use std::fs;
-use std::net::TcpListener;
+use std::net::{IpAddr, SocketAddr, TcpListener, UdpSocket};
 use std::os::unix::fs::PermissionsExt;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
-use tracing::info;
+use tracing::{debug, info};
 
+use super::dns::{build_dns_resolver_from_resolv_conf, DnsResolver};
 use crate::logging;
 use crate::netns;
 
@@ -19,13 +21,16 @@ use super::socks5;
 /// 2. Daemonize
 /// 3. Enter VPN namespace
 /// 4. Run single-threaded tokio runtime accepting connections
+#[allow(clippy::too_many_arguments)]
 pub fn run(
     netns_name: &str,
+    interface_name: &str,
     socks_port: u16,
     http_port: u16,
     proxy_access_log: bool,
     pid_file: &str,
     log_file: &str,
+    startup_status_file: &str,
 ) -> anyhow::Result<()> {
     // 1. Bind listeners in host namespace (before entering netns).
     //    Try both IPv4 and IPv6 loopback; at least one of each pair must succeed.
@@ -74,6 +79,8 @@ pub fn run(
     let pid = std::process::id();
     fs::write(pid_file, pid.to_string())?;
     fs::set_permissions(pid_file, fs::Permissions::from_mode(0o644))?;
+    fs::write(startup_status_file, "starting\n")?;
+    fs::set_permissions(startup_status_file, fs::Permissions::from_mode(0o644))?;
 
     let mut bound = Vec::new();
     if socks4.is_some() {
@@ -134,10 +141,14 @@ pub fn run(
         return Err(e.into());
     }
 
+    let mut dns_resolver: Option<DnsResolver> = None;
+    let mut dns_probe_servers: Vec<IpAddr> = Vec::new();
     let ns_resolv = format!("/etc/netns/{}/resolv.conf", netns_name);
     if std::path::Path::new(&ns_resolv).exists() {
         let dns_content = std::fs::read_to_string(&ns_resolv)
             .map_err(|e| anyhow::anyhow!("failed to read {}: {}", ns_resolv, e))?;
+        dns_resolver = build_dns_resolver_from_resolv_conf(&dns_content);
+        dns_probe_servers = extract_dns_servers(&dns_content);
 
         // On systemd-resolved hosts, /etc/resolv.conf is a symlink to
         // /run/systemd/resolve/stub-resolv.conf.  Bind-mounting over the
@@ -213,6 +224,15 @@ pub fn run(
         }
     }
 
+    if let Err(err) =
+        wait_for_namespace_handshake(interface_name, &dns_probe_servers, Duration::from_secs(12))
+    {
+        let _ = fs::write(startup_status_file, "failed\n");
+        return Err(err);
+    }
+    fs::write(startup_status_file, "ready\n")?;
+    info!(interface = interface_name, "proxy_handshake_established");
+
     // 6. Build single-threaded tokio runtime (critical: setns affects only the calling thread)
     let rt = match tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -275,30 +295,37 @@ pub fn run(
 
         info!("proxy_accept_loop_started");
 
+        let socks_dns_resolver = dns_resolver.clone();
+        let http_dns_resolver = dns_resolver.clone();
+
         loop {
             tokio::select! {
                 result = accept_opt(&socks4) => {
                     let assoc = associations.clone();
                     let relay = udp_relay4.clone();
+                    let dns_resolver = socks_dns_resolver.clone();
                     handle_accept(result, "SOCKS5", move |stream| {
-                        socks5::handle_socks5(stream, assoc, relay, proxy_access_log)
+                        socks5::handle_socks5(stream, assoc, relay, dns_resolver, proxy_access_log)
                     });
                 }
                 result = accept_opt(&socks6) => {
                     let assoc = associations.clone();
                     let relay = udp_relay6.clone();
+                    let dns_resolver = socks_dns_resolver.clone();
                     handle_accept(result, "SOCKS5", move |stream| {
-                        socks5::handle_socks5(stream, assoc, relay, proxy_access_log)
+                        socks5::handle_socks5(stream, assoc, relay, dns_resolver, proxy_access_log)
                     });
                 }
                 result = accept_opt(&http4) => {
+                    let dns_resolver = http_dns_resolver.clone();
                     handle_accept(result, "HTTP", move |stream| {
-                        http::handle_http(stream, proxy_access_log)
+                        http::handle_http(stream, dns_resolver, proxy_access_log)
                     });
                 }
                 result = accept_opt(&http6) => {
+                    let dns_resolver = http_dns_resolver.clone();
                     handle_accept(result, "HTTP", move |stream| {
-                        http::handle_http(stream, proxy_access_log)
+                        http::handle_http(stream, dns_resolver, proxy_access_log)
                     });
                 }
             }
@@ -383,5 +410,88 @@ fn daemonize() -> anyhow::Result<()> {
     nix::unistd::dup2(fd, 1)?; // stdout
     nix::unistd::dup2(fd, 2)?; // stderr
 
+    Ok(())
+}
+
+fn extract_dns_servers(content: &str) -> Vec<IpAddr> {
+    content
+        .lines()
+        .filter_map(|line| {
+            let line = line.trim();
+            if line.is_empty() || line.starts_with('#') {
+                return None;
+            }
+            let mut parts = line.split_whitespace();
+            if parts.next()? != "nameserver" {
+                return None;
+            }
+            parts.next()?.trim().parse::<IpAddr>().ok()
+        })
+        .collect()
+}
+
+fn wait_for_namespace_handshake(
+    interface_name: &str,
+    dns_servers: &[IpAddr],
+    timeout: Duration,
+) -> anyhow::Result<()> {
+    let start = Instant::now();
+    while Instant::now().duration_since(start) < timeout {
+        if namespace_has_handshake(interface_name)? {
+            return Ok(());
+        }
+        nudge_namespace_traffic(dns_servers);
+        std::thread::sleep(Duration::from_millis(250));
+    }
+
+    anyhow::bail!(
+        "timeout waiting for WireGuard handshake on {} within {}s",
+        interface_name,
+        timeout.as_secs()
+    )
+}
+
+fn namespace_has_handshake(interface_name: &str) -> anyhow::Result<bool> {
+    let output = std::process::Command::new("wg")
+        .args(["show", interface_name, "latest-handshakes"])
+        .output()
+        .map_err(|e| anyhow::anyhow!("failed to run wg show latest-handshakes: {}", e))?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        anyhow::bail!("wg show latest-handshakes failed: {}", stderr);
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    Ok(stdout.lines().any(|line| {
+        let mut cols = line.split_whitespace();
+        let _peer = cols.next();
+        cols.next()
+            .and_then(|value| value.parse::<u64>().ok())
+            .is_some_and(|epoch| epoch > 0)
+    }))
+}
+
+fn nudge_namespace_traffic(dns_servers: &[IpAddr]) {
+    let mut nudged = false;
+    for ip in dns_servers {
+        if send_udp_probe(*ip).is_ok() {
+            nudged = true;
+        }
+    }
+    if nudged {
+        return;
+    }
+    let _ = send_udp_probe(IpAddr::V4(std::net::Ipv4Addr::new(1, 1, 1, 1)));
+    let _ = send_udp_probe(IpAddr::V4(std::net::Ipv4Addr::new(8, 8, 8, 8)));
+}
+
+fn send_udp_probe(ip: IpAddr) -> std::io::Result<()> {
+    let bind_addr = match ip {
+        IpAddr::V4(_) => "0.0.0.0:0",
+        IpAddr::V6(_) => "[::]:0",
+    };
+    let sock = UdpSocket::bind(bind_addr)?;
+    let target = SocketAddr::new(ip, 53);
+    let _ = sock.send_to(&[0], target);
+    debug!(target = %target, "proxy_handshake_nudge_sent");
     Ok(())
 }

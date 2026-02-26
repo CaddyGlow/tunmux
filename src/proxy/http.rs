@@ -7,6 +7,8 @@ use tokio::io::{
 use tokio::net::TcpStream;
 use tracing::{debug, info, warn};
 
+use crate::proxy::dns::{resolve_host_port, DnsResolver};
+
 struct UpstreamConnection {
     addr: String,
     stream: BufReader<TcpStream>,
@@ -30,7 +32,11 @@ struct ResponseMeta {
     close_delimited: bool,
 }
 
-pub async fn handle_http(client: TcpStream, access_log: bool) -> anyhow::Result<()> {
+pub async fn handle_http(
+    client: TcpStream,
+    dns_resolver: Option<DnsResolver>,
+    access_log: bool,
+) -> anyhow::Result<()> {
     let peer_addr = client.peer_addr().ok().map(|addr| addr.to_string());
     let mut buf_client = BufReader::new(client);
     let mut upstream: Option<UpstreamConnection> = None;
@@ -65,11 +71,18 @@ pub async fn handle_http(client: TcpStream, access_log: bool) -> anyhow::Result<
         }
 
         if method.eq_ignore_ascii_case("CONNECT") {
-            return handle_connect(buf_client, target).await;
+            return handle_connect(buf_client, target, dns_resolver).await;
         }
 
-        let keep_client =
-            handle_plain_request(&mut buf_client, &mut upstream, method, target, version).await?;
+        let keep_client = handle_plain_request(
+            &mut buf_client,
+            &mut upstream,
+            method,
+            target,
+            version,
+            dns_resolver.as_ref(),
+        )
+        .await?;
         if !keep_client {
             return Ok(());
         }
@@ -77,7 +90,11 @@ pub async fn handle_http(client: TcpStream, access_log: bool) -> anyhow::Result<
 }
 
 /// HTTP CONNECT tunneling (e.g., for HTTPS)
-async fn handle_connect(mut buf_client: BufReader<TcpStream>, target: &str) -> anyhow::Result<()> {
+async fn handle_connect(
+    mut buf_client: BufReader<TcpStream>,
+    target: &str,
+    dns_resolver: Option<DnsResolver>,
+) -> anyhow::Result<()> {
     debug!(target = ?target, "http_connect_start");
 
     // Read and discard remaining headers
@@ -89,13 +106,25 @@ async fn handle_connect(mut buf_client: BufReader<TcpStream>, target: &str) -> a
         }
     }
 
-    let addr = if target.contains(':') {
-        target.to_string()
-    } else {
-        format!("{}:443", target)
-    };
+    let (connect_host, connect_port) = split_host_port(target, 443);
+    let resolved =
+        match resolve_host_port(connect_host.as_str(), connect_port, dns_resolver.as_ref()).await {
+            Ok(addr) => addr,
+            Err(error) => {
+                warn!(
+                    target = ?target,
+                    error = ?error.to_string(),
+                    "http_connect_dns_resolve_failed"
+                );
+                buf_client
+                    .get_mut()
+                    .write_all(b"HTTP/1.1 502 Bad Gateway\r\n\r\n")
+                    .await?;
+                return Ok(());
+            }
+        };
 
-    match TcpStream::connect(&addr).await {
+    match TcpStream::connect(resolved).await {
         Ok(mut remote) => {
             buf_client
                 .get_mut()
@@ -109,7 +138,12 @@ async fn handle_connect(mut buf_client: BufReader<TcpStream>, target: &str) -> a
             }
         }
         Err(e) => {
-            warn!(addr = ?addr, error = ?e.to_string(), "http_connect_failed");
+            warn!(
+                target = ?target,
+                resolved = ?resolved.to_string(),
+                error = ?e.to_string(),
+                "http_connect_failed"
+            );
             buf_client
                 .get_mut()
                 .write_all(b"HTTP/1.1 502 Bad Gateway\r\n\r\n")
@@ -126,6 +160,7 @@ async fn handle_plain_request(
     method: &str,
     target: &str,
     version: &str,
+    dns_resolver: Option<&DnsResolver>,
 ) -> anyhow::Result<bool> {
     debug!(method = ?method, target = ?target, "http_plain_start");
 
@@ -141,11 +176,8 @@ async fn handle_plain_request(
     }
 
     let default_port = default_port_for_target(target);
-    let addr = if host.contains(':') {
-        host.clone()
-    } else {
-        format!("{}:{}", host, default_port)
-    };
+    let (connect_host, connect_port) = split_host_port(host.as_str(), default_port);
+    let upstream_addr = format!("{}:{}", connect_host, connect_port);
 
     let mut has_host = false;
     let mut forwarded_headers = Vec::new();
@@ -164,7 +196,14 @@ async fn handle_plain_request(
         forwarded_headers.push(header.as_str());
     }
 
-    let upstream_stream = ensure_upstream(upstream, &addr).await?;
+    let upstream_stream = ensure_upstream(
+        upstream,
+        &upstream_addr,
+        connect_host.as_str(),
+        connect_port,
+        dns_resolver,
+    )
+    .await?;
 
     let request_line = format!("{} {} {}\r\n", method, path, version);
     upstream_stream
@@ -226,6 +265,9 @@ async fn handle_plain_request(
 async fn ensure_upstream<'a>(
     upstream: &'a mut Option<UpstreamConnection>,
     addr: &str,
+    host: &str,
+    port: u16,
+    dns_resolver: Option<&DnsResolver>,
 ) -> anyhow::Result<&'a mut BufReader<TcpStream>> {
     let needs_new = match upstream {
         Some(conn) => conn.addr != addr,
@@ -233,9 +275,12 @@ async fn ensure_upstream<'a>(
     };
 
     if needs_new {
-        let stream = TcpStream::connect(addr)
+        let resolved = resolve_host_port(host, port, dns_resolver)
             .await
-            .with_context(|| format!("connect upstream {addr}"))?;
+            .with_context(|| format!("resolve upstream {}:{}", host, port))?;
+        let stream = TcpStream::connect(resolved)
+            .await
+            .with_context(|| format!("connect upstream {} (resolved from {})", resolved, addr))?;
         *upstream = Some(UpstreamConnection {
             addr: addr.to_string(),
             stream: BufReader::new(stream),
@@ -359,6 +404,29 @@ fn parse_content_length(headers: &[String]) -> Option<usize> {
         .iter()
         .find_map(|line| header_value(line, "content-length"))
         .and_then(|value| value.parse::<usize>().ok())
+}
+
+fn split_host_port(target: &str, default_port: u16) -> (String, u16) {
+    let trimmed = target.trim();
+    if let Some(rest) = trimmed.strip_prefix('[') {
+        if let Some((host, after_bracket)) = rest.split_once(']') {
+            if let Some(port) = after_bracket.strip_prefix(':').and_then(|v| v.parse().ok()) {
+                return (host.to_string(), port);
+            }
+            return (host.to_string(), default_port);
+        }
+    }
+
+    if let Some((host, port_str)) = trimmed.rsplit_once(':') {
+        if host.contains(':') {
+            return (trimmed.to_string(), default_port);
+        }
+        if let Ok(port) = port_str.parse::<u16>() {
+            return (host.to_string(), port);
+        }
+    }
+
+    (trimmed.to_string(), default_port)
 }
 
 fn header_contains_token(headers: &[String], header_name: &str, token: &str) -> bool {
@@ -644,7 +712,7 @@ mod tests {
 
         tokio::spawn(async move {
             let (stream, _) = proxy_listener.accept().await.unwrap();
-            let _ = handle_http(stream, false).await;
+            let _ = handle_http(stream, None, false).await;
         });
 
         let mut client = TcpStream::connect(proxy_addr).await.unwrap();
@@ -680,7 +748,7 @@ mod tests {
 
         tokio::spawn(async move {
             let (stream, _) = proxy_listener.accept().await.unwrap();
-            let _ = handle_http(stream, false).await;
+            let _ = handle_http(stream, None, false).await;
         });
 
         let mut client = TcpStream::connect(proxy_addr).await.unwrap();
@@ -707,7 +775,7 @@ mod tests {
 
         tokio::spawn(async move {
             let (stream, _) = proxy_listener.accept().await.unwrap();
-            let _ = handle_http(stream, false).await;
+            let _ = handle_http(stream, None, false).await;
         });
 
         let mut client = TcpStream::connect(proxy_addr).await.unwrap();
@@ -732,7 +800,7 @@ mod tests {
 
         tokio::spawn(async move {
             let (stream, _) = proxy_listener.accept().await.unwrap();
-            let _ = handle_http(stream, false).await;
+            let _ = handle_http(stream, None, false).await;
         });
 
         let mut client = TcpStream::connect(proxy_addr).await.unwrap();

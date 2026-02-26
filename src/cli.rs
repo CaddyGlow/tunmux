@@ -85,6 +85,8 @@ pub enum TopCommand {
         #[arg(long)]
         netns: String,
         #[arg(long)]
+        interface: String,
+        #[arg(long)]
         socks_port: u16,
         #[arg(long)]
         http_port: u16,
@@ -94,6 +96,8 @@ pub enum TopCommand {
         pid_file: String,
         #[arg(long)]
         log_file: String,
+        #[arg(long)]
+        startup_status_file: String,
     },
 
     /// Internal: userspace WireGuard local-proxy daemon (hidden)
@@ -235,6 +239,10 @@ pub struct ProtonConnectArgs {
     #[arg(long)]
     pub disable_ipv6: bool,
 
+    /// Set WireGuard interface MTU (direct mode)
+    #[arg(long)]
+    pub mtu: Option<u16>,
+
     /// SOCKS5 proxy port (default: auto-assign from 1080)
     #[arg(long)]
     pub socks_port: Option<u16>,
@@ -262,7 +270,7 @@ pub struct AirVpnConnectArgs {
     pub key: Option<String>,
 
     /// Server selection order when auto-selecting
-    #[arg(short = 's', long, default_value = "load", value_parser = ["load", "name", "latency"])]
+    #[arg(short = 's', long, default_value = "score", value_parser = ["score", "load", "name", "latency"])]
     pub sort: String,
 
     /// WireGuard backend: wg-quick, userspace, kernel
@@ -280,6 +288,10 @@ pub struct AirVpnConnectArgs {
     /// Disable host IPv6 egress while connected (direct kernel mode, IPv4-only profile)
     #[arg(long)]
     pub disable_ipv6: bool,
+
+    /// Set WireGuard interface MTU (direct mode)
+    #[arg(long)]
+    pub mtu: Option<u16>,
 
     /// SOCKS5 proxy port (default: auto-assign from 1080)
     #[arg(long)]
@@ -323,6 +335,10 @@ pub struct MullvadConnectArgs {
     #[arg(long)]
     pub disable_ipv6: bool,
 
+    /// Set WireGuard interface MTU (direct mode)
+    #[arg(long)]
+    pub mtu: Option<u16>,
+
     /// SOCKS5 proxy port (default: auto-assign from 1080)
     #[arg(long)]
     pub socks_port: Option<u16>,
@@ -364,6 +380,10 @@ pub struct IvpnConnectArgs {
     /// Disable host IPv6 egress while connected (direct kernel mode, IPv4-only profile)
     #[arg(long)]
     pub disable_ipv6: bool,
+
+    /// Set WireGuard interface MTU (direct mode)
+    #[arg(long)]
+    pub mtu: Option<u16>,
 
     /// SOCKS5 proxy port (default: auto-assign from 1080)
     #[arg(long)]
@@ -407,6 +427,10 @@ pub struct WgconfConnectArgs {
     /// Disable host IPv6 egress while connected (only valid for direct kernel mode with IPv4-only config)
     #[arg(long)]
     pub disable_ipv6: bool,
+
+    /// Set WireGuard interface MTU (direct kernel mode)
+    #[arg(long)]
+    pub mtu: Option<u16>,
 }
 
 #[derive(Subcommand)]
@@ -422,6 +446,9 @@ pub enum ProtonCommand {
 
     /// Display account information
     Info,
+
+    /// Renew VPN certificate using saved session credentials
+    Renew,
 
     /// List available VPN servers
     Servers {
@@ -482,7 +509,7 @@ pub enum AirVpnCommand {
         tag: Vec<String>,
 
         /// Sort order for server listing
-        #[arg(short = 's', long, default_value = "name", value_parser = ["name", "load", "latency"])]
+        #[arg(short = 's', long, default_value = "name", value_parser = ["name", "score", "load", "latency"])]
         sort: String,
     },
 
@@ -881,8 +908,8 @@ pub enum ApiKeyAction {
 #[cfg(test)]
 mod tests {
     use super::{
-        Cli, ConnectProviderCommand, HookBuiltinArg, HookCommand, ProviderArg, TopCommand,
-        WgconfCommand,
+        AirVpnCommand, Cli, ConnectProviderCommand, HookBuiltinArg, HookCommand, ProtonCommand,
+        ProviderArg, TopCommand, WgconfCommand,
     };
     use clap::Parser;
 
@@ -1007,6 +1034,71 @@ mod tests {
                 provider: ConnectProviderCommand::Ivpn(args),
             } => assert!(args.disable_ipv6),
             _ => panic!("expected ivpn connect provider"),
+        }
+    }
+
+    #[test]
+    fn parse_mtu_for_connect_commands() {
+        let proton = Cli::try_parse_from(["tunmux", "connect", "proton", "--mtu", "1280"])
+            .expect("parse proton mtu");
+        match proton.command {
+            TopCommand::Connect {
+                provider: ConnectProviderCommand::Proton(args),
+            } => assert_eq!(args.mtu, Some(1280)),
+            _ => panic!("expected proton connect provider"),
+        }
+
+        let wgconf = Cli::try_parse_from([
+            "tunmux",
+            "connect",
+            "wgconf",
+            "--file",
+            "/tmp/test.conf",
+            "--backend",
+            "kernel",
+            "--mtu",
+            "1360",
+        ])
+        .expect("parse wgconf mtu");
+        match wgconf.command {
+            TopCommand::Connect {
+                provider: ConnectProviderCommand::Wgconf(args),
+            } => assert_eq!(args.mtu, Some(1360)),
+            _ => panic!("expected wgconf connect provider"),
+        }
+    }
+
+    #[test]
+    fn parse_proton_renew_command() {
+        let cli = Cli::try_parse_from(["tunmux", "proton", "renew"]).expect("parse proton renew");
+        match cli.command {
+            TopCommand::Proton {
+                command: ProtonCommand::Renew,
+            } => {}
+            _ => panic!("expected proton renew command"),
+        }
+    }
+
+    #[test]
+    fn parse_airvpn_connect_default_sort_score() {
+        let cli = Cli::try_parse_from(["tunmux", "connect", "airvpn"]).expect("parse airvpn");
+        match cli.command {
+            TopCommand::Connect {
+                provider: ConnectProviderCommand::Airvpn(args),
+            } => assert_eq!(args.sort, "score"),
+            _ => panic!("expected airvpn connect provider"),
+        }
+    }
+
+    #[test]
+    fn parse_airvpn_servers_sort_score() {
+        let cli = Cli::try_parse_from(["tunmux", "airvpn", "servers", "--sort", "score"])
+            .expect("parse airvpn servers score");
+        match cli.command {
+            TopCommand::Airvpn {
+                command: AirVpnCommand::Servers { sort, .. },
+            } => assert_eq!(sort, "score"),
+            _ => panic!("expected airvpn servers command"),
         }
     }
 
