@@ -8,9 +8,6 @@ use anyhow::Context;
 
 use crate::cli::{WgconfCommand, WgconfConnectArgs};
 use crate::config::{self, AppConfig, Provider};
-use crate::local_proxy;
-use crate::netns;
-use crate::proxy;
 use crate::shared::connection_ops;
 use crate::shared::hooks;
 use crate::wireguard;
@@ -281,27 +278,15 @@ fn connect_proxy(
     mtu: Option<u16>,
     config: &AppConfig,
 ) -> anyhow::Result<()> {
-    let instance = proxy::instance_name(&source.instance_seed);
-    if instance.is_empty() {
-        anyhow::bail!(
-            "unable to derive instance name from source {}",
-            source.display_name
-        );
-    }
+    let instance = connection_ops::derive_instance_name(
+        &source.instance_seed,
+        "source",
+        &source.display_name,
+    )?;
+    connection_ops::ensure_instance_available(&instance, "source", &source.display_name)?;
 
-    if wireguard::connection::ConnectionState::exists(&instance) {
-        anyhow::bail!(
-            "instance {:?} already exists (source {} already connected). Disconnect first or choose a different source.",
-            instance,
-            source.display_name
-        );
-    }
-
-    let interface_name = format!("wg-{}", instance);
-    let namespace_name = format!("tunmux_{}", instance);
-
-    let mut proxy_config = proxy::next_available_ports()?;
-    proxy_config.access_log = config.general.proxy_access_log;
+    let proxy_config =
+        connection_ops::resolve_proxy_config(None, None, config.general.proxy_access_log)?;
 
     let (addresses, dns_servers) = routed_param_refs(routed);
     let params = wireguard::config::WgConfigParams {
@@ -316,57 +301,18 @@ fn connect_proxy(
         allowed_ips: &routed.allowed_ips,
     };
 
-    println!(
-        "Connecting to {} ({})...",
-        source.display_name,
-        format_endpoint(&routed.server_ip, routed.server_port)
-    );
-
-    netns::create(&namespace_name)?;
-
-    if let Err(e) = wireguard::kernel::up_in_netns(&params, &interface_name, &namespace_name) {
-        netns::delete(&namespace_name)?;
-        return Err(e.into());
-    }
-
-    let pid = match proxy::spawn_daemon(&instance, &interface_name, &namespace_name, &proxy_config)
-    {
-        Ok(pid) => pid,
-        Err(e) => {
-            netns::delete(&namespace_name)?;
-            return Err(e);
-        }
-    };
-
-    let state = wireguard::connection::ConnectionState {
-        instance_name: instance.clone(),
-        provider: PROVIDER.dir_name().to_string(),
-        interface_name,
-        backend: wireguard::backend::WgBackend::Kernel,
-        server_endpoint: format_endpoint(&routed.server_ip, routed.server_port),
-        server_display_name: source.display_name.clone(),
-        original_gateway_ip: None,
-        original_gateway_iface: None,
-        original_resolv_conf: None,
-        namespace_name: Some(namespace_name),
-        proxy_pid: Some(pid),
-        socks_port: Some(proxy_config.socks_port),
-        http_port: Some(proxy_config.http_port),
-        dns_servers: routed.dns_servers.clone(),
-        peer_public_key: None,
-        local_public_key: None,
-        virtual_ips: vec![],
-        keepalive_secs: None,
-    };
-    state.save()?;
-    hooks::run_ifup(config, PROVIDER, &state);
-
-    println!(
-        "Connected {} ({}) -- SOCKS5 127.0.0.1:{}, HTTP 127.0.0.1:{}",
-        instance, source.display_name, proxy_config.socks_port, proxy_config.http_port
-    );
-
-    Ok(())
+    let endpoint = format_endpoint(&routed.server_ip, routed.server_port);
+    connection_ops::connect_proxy_via_netns(
+        PROVIDER,
+        &instance,
+        &source.display_name,
+        &endpoint,
+        &endpoint,
+        routed.dns_servers.clone(),
+        &params,
+        &proxy_config,
+        config,
+    )
 }
 
 fn connect_local_proxy(
@@ -375,24 +321,15 @@ fn connect_local_proxy(
     mtu: Option<u16>,
     config: &AppConfig,
 ) -> anyhow::Result<()> {
-    let instance = proxy::instance_name(&source.instance_seed);
-    if instance.is_empty() {
-        anyhow::bail!(
-            "unable to derive instance name from source {}",
-            source.display_name
-        );
-    }
+    let instance = connection_ops::derive_instance_name(
+        &source.instance_seed,
+        "source",
+        &source.display_name,
+    )?;
+    connection_ops::ensure_instance_available(&instance, "source", &source.display_name)?;
 
-    if wireguard::connection::ConnectionState::exists(&instance) {
-        anyhow::bail!(
-            "instance {:?} already exists (source {} already connected). Disconnect first or choose a different source.",
-            instance,
-            source.display_name
-        );
-    }
-
-    let mut proxy_config = proxy::next_available_ports()?;
-    proxy_config.access_log = config.general.proxy_access_log;
+    let proxy_config =
+        connection_ops::resolve_proxy_config(None, None, config.general.proxy_access_log)?;
 
     let (addresses, dns_servers) = routed_param_refs(routed);
     let params = wireguard::config::WgConfigParams {
@@ -407,51 +344,20 @@ fn connect_local_proxy(
         allowed_ips: &routed.allowed_ips,
     };
 
-    let cfg = local_proxy::local_proxy_config_from_params(
+    let endpoint = format_endpoint(&routed.server_ip, routed.server_port);
+    connection_ops::connect_local_proxy_instance(
+        PROVIDER,
+        &instance,
+        &source.display_name,
+        &endpoint,
+        &endpoint,
+        routed.dns_servers.clone(),
+        routed.addresses.clone(),
+        &routed.server_public_key,
         &params,
-        Some(25),
-        proxy_config.socks_port,
-        proxy_config.http_port,
-    )?;
-    let local_public_key = local_proxy::derive_public_key_b64(params.private_key).ok();
-
-    println!(
-        "Connecting to {} ({})...",
-        source.display_name,
-        format_endpoint(&routed.server_ip, routed.server_port)
-    );
-
-    let pid = local_proxy::spawn_daemon(&instance, &cfg, proxy_config.access_log)?;
-
-    let state = wireguard::connection::ConnectionState {
-        instance_name: instance.clone(),
-        provider: PROVIDER.dir_name().to_string(),
-        interface_name: String::new(),
-        backend: wireguard::backend::WgBackend::LocalProxy,
-        server_endpoint: format_endpoint(&routed.server_ip, routed.server_port),
-        server_display_name: source.display_name.clone(),
-        original_gateway_ip: None,
-        original_gateway_iface: None,
-        original_resolv_conf: None,
-        namespace_name: None,
-        proxy_pid: Some(pid),
-        socks_port: Some(proxy_config.socks_port),
-        http_port: Some(proxy_config.http_port),
-        dns_servers: routed.dns_servers.clone(),
-        peer_public_key: Some(routed.server_public_key.clone()),
-        local_public_key,
-        virtual_ips: routed.addresses.clone(),
-        keepalive_secs: cfg.keepalive,
-    };
-    state.save()?;
-    hooks::run_ifup(config, PROVIDER, &state);
-
-    println!(
-        "Connected {} ({}) -- SOCKS5 127.0.0.1:{}, HTTP 127.0.0.1:{}",
-        instance, source.display_name, proxy_config.socks_port, proxy_config.http_port
-    );
-
-    Ok(())
+        &proxy_config,
+        config,
+    )
 }
 
 fn cmd_disconnect(instance: Option<String>, all: bool, config: &AppConfig) -> anyhow::Result<()> {
@@ -464,47 +370,7 @@ fn disconnect_one(
     state: &wireguard::connection::ConnectionState,
     config: &AppConfig,
 ) -> anyhow::Result<()> {
-    if state.backend == wireguard::backend::WgBackend::LocalProxy {
-        local_proxy::disconnect(state, &state.instance_name)?;
-        hooks::run_ifdown(config, PROVIDER, state);
-        return Ok(());
-    }
-
-    if let Some(pid) = state.proxy_pid {
-        proxy::stop_daemon(pid)?;
-    }
-
-    let pid_path = proxy::pid_file(&state.instance_name);
-    let log_path = proxy::log_file(&state.instance_name);
-    let _ = fs::remove_file(&pid_path);
-    let _ = fs::remove_file(&log_path);
-
-    if let Some(ref ns) = state.namespace_name {
-        netns::delete(ns)?;
-        let _ = netns::remove_namespace_dir(ns);
-    }
-
-    if state.namespace_name.is_some() {
-        wireguard::connection::ConnectionState::remove(&state.instance_name)?;
-    } else {
-        match state.backend {
-            wireguard::backend::WgBackend::Kernel => {
-                wireguard::kernel::down(state)?;
-            }
-            wireguard::backend::WgBackend::WgQuick => {
-                wireguard::wg_quick::down(&state.interface_name, PROVIDER)?;
-                wireguard::connection::ConnectionState::remove(&state.instance_name)?;
-            }
-            wireguard::backend::WgBackend::Userspace => {
-                wireguard::userspace::down(&state.interface_name)?;
-                wireguard::connection::ConnectionState::remove(&state.instance_name)?;
-            }
-            wireguard::backend::WgBackend::LocalProxy => unreachable!(),
-        }
-    }
-
-    hooks::run_ifdown(config, PROVIDER, state);
-    Ok(())
+    connection_ops::disconnect_one_provider_connection(state, PROVIDER, config, false)
 }
 
 fn resolve_source(file: Option<&str>, profile: Option<&str>) -> anyhow::Result<ConfigSource> {
