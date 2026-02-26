@@ -10,6 +10,7 @@ use crate::error;
 use crate::local_proxy;
 use crate::netns;
 use crate::proxy;
+use crate::shared::connection_ops;
 use crate::shared::crypto;
 use crate::shared::hooks;
 use crate::shared::latency;
@@ -602,33 +603,18 @@ async fn cmd_connect(
     proxy_access_log_arg: bool,
     config: &AppConfig,
 ) -> anyhow::Result<()> {
-    let backend_str = backend_arg.as_deref().unwrap_or(&config.general.backend);
-
-    #[cfg(not(target_os = "linux"))]
-    if use_proxy {
-        anyhow::bail!("--proxy is available only on Linux");
-    }
-
-    if use_proxy && matches!(backend_str, "wg-quick" | "userspace") {
-        anyhow::bail!(
-            "--proxy requires kernel backend (incompatible with --backend {})",
-            backend_str
-        );
-    }
-
-    let backend = if use_proxy {
-        wireguard::backend::WgBackend::Kernel
-    } else {
-        wireguard::backend::WgBackend::from_str_arg(backend_str)?
-    };
-
-    if disable_ipv6
-        && (use_proxy || use_local_proxy || backend != wireguard::backend::WgBackend::Kernel)
-    {
-        anyhow::bail!(
-            "--disable-ipv6 is supported only for direct kernel mode (no --proxy/--local-proxy)"
-        );
-    }
+    let backend = connection_ops::resolve_connect_backend(
+        backend_arg.as_deref(),
+        &config.general.backend,
+        use_proxy,
+        use_local_proxy,
+    )?;
+    connection_ops::validate_disable_ipv6_direct_kernel(
+        disable_ipv6,
+        use_proxy,
+        use_local_proxy,
+        backend,
+    )?;
 
     let effective_country = country.or_else(|| config.ivpn.default_country.clone());
     let proxy_access_log = proxy_access_log_arg || config.general.proxy_access_log;
@@ -1010,73 +996,9 @@ fn connect_direct(
 }
 
 fn cmd_disconnect(instance: Option<String>, all: bool, config: &AppConfig) -> anyhow::Result<()> {
-    let provider_name = PROVIDER.dir_name();
-
-    if all {
-        let connections = wireguard::connection::ConnectionState::load_all()?;
-        let mine: Vec<_> = connections
-            .into_iter()
-            .filter(|c| c.provider == provider_name)
-            .collect();
-        if mine.is_empty() {
-            println!("No active ivpn connections.");
-            return Ok(());
-        }
-        for conn in mine {
-            disconnect_one(&conn, config)?;
-            println!("Disconnected {}", conn.instance_name);
-        }
-        return Ok(());
-    }
-
-    if let Some(ref name) = instance {
-        let conn = wireguard::connection::ConnectionState::load(name)?
-            .ok_or_else(|| anyhow::anyhow!("no connection with instance {:?}", name))?;
-        if conn.provider != provider_name {
-            anyhow::bail!(
-                "instance {:?} belongs to provider {:?}, not ivpn",
-                name,
-                conn.provider
-            );
-        }
-        disconnect_one(&conn, config)?;
-        println!("Disconnected {}", name);
-        return Ok(());
-    }
-
-    let connections = wireguard::connection::ConnectionState::load_all()?;
-    let mine: Vec<_> = connections
-        .into_iter()
-        .filter(|c| c.provider == provider_name)
-        .collect();
-
-    match mine.len() {
-        0 => {
-            println!("Not connected.");
-        }
-        1 => {
-            let conn = &mine[0];
-            disconnect_one(conn, config)?;
-            println!("Disconnected {}", conn.instance_name);
-        }
-        _ => {
-            println!("Multiple active connections. Specify which to disconnect:\n");
-            for conn in &mine {
-                let ports = match (conn.socks_port, conn.http_port) {
-                    (Some(s), Some(h)) => format!("SOCKS5 :{}, HTTP :{}", s, h),
-                    _ => "-".to_string(),
-                };
-                println!(
-                    "  {}  {}  {}",
-                    conn.instance_name, conn.server_display_name, ports
-                );
-            }
-            println!("\nUsage: tunmux disconnect <instance>");
-            println!("       tunmux disconnect --provider ivpn --all");
-        }
-    }
-
-    Ok(())
+    connection_ops::disconnect_provider_connections(PROVIDER.dir_name(), instance, all, |conn| {
+        disconnect_one(conn, config)
+    })
 }
 
 fn disconnect_one(

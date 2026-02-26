@@ -178,10 +178,40 @@ tunmux proton servers --country US --free
 tunmux proton servers --country CH --tag p2p --sort latency
 tunmux connect proton US#1
 tunmux connect proton --country CH --p2p
+tunmux connect proton --country CH --p2p --port-forwarding
 tunmux connect proton --country CH --sort latency
 tunmux connect proton FR#183 --mtu 1280
+tunmux proton ports request --protocol both
+tunmux proton ports request --protocol both --no-daemon
+tunmux proton ports list
+tunmux proton ports list --current
+tunmux proton ports list --current --json
+tunmux proton ports renew --lifetime 60
+tunmux proton ports daemon --protocol both --lifetime 60 --renew-every 45
+tunmux proton ports release
 tunmux disconnect --provider proton --all
 tunmux proton logout
+```
+
+Proton NAT-PMP notes:
+- `tunmux proton ports request ...` now starts the background renew daemon by default.
+- Use `--no-daemon` for a one-shot mapping request.
+- Default daemon renew interval is `lifetime - 15s` (minimum `1s`).
+- `tunmux proton ports list` shows saved mappings (including expired ones).
+- `tunmux proton ports list --current` shows only active mappings for the current direct Proton connection.
+- `tunmux proton ports list --current --json` returns the same filtered view as JSON.
+- `tunmux proton ports release` stops the renew daemon and sends NAT-PMP unmap (lifetime `0`) for saved mappings on the active direct connection.
+- Daemon state files:
+  - PID: `~/.config/tunmux/proton/port_forward_daemon.pid`
+  - Log: `~/.config/tunmux/proton/port_forward_daemon.log`
+
+Typical lifecycle:
+
+```bash
+tunmux connect proton --country DE --port-forwarding
+tunmux proton ports request --protocol both   # request + auto-start renew daemon
+tunmux proton ports list --current --json     # inspect currently active mapping(s)
+tunmux proton ports release                   # stop daemon + release mapping(s)
 ```
 
 ### AirVPN

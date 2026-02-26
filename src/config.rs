@@ -27,9 +27,6 @@ pub struct AppConfig {
 pub struct GeneralConfig {
     pub backend: String,
     pub credential_store: CredentialStore,
-    pub proxy: bool,
-    pub socks_port: Option<u16>,
-    pub http_port: Option<u16>,
     pub proxy_access_log: bool,
     pub privileged_transport: PrivilegedTransport,
     pub privileged_autostart: bool,
@@ -45,9 +42,6 @@ impl Default for GeneralConfig {
         Self {
             backend: default_backend().to_string(),
             credential_store: default_credential_store(),
-            proxy: false,
-            socks_port: None,
-            http_port: None,
             proxy_access_log: false,
             privileged_transport: PrivilegedTransport::Socket,
             privileged_autostart: true,

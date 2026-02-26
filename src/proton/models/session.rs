@@ -28,6 +28,9 @@ pub struct Session {
     /// PEM certificate from API
     #[serde(default)]
     pub certificate_pem: String,
+    /// Whether the current certificate was provisioned with PortForwarding=true.
+    #[serde(default)]
+    pub certificate_port_forwarding: bool,
 }
 
 /// API response from POST /auth/v4/info
@@ -134,6 +137,7 @@ mod tests {
             fingerprint: "DDDD".to_string(),
             certificate_pem: "-----BEGIN CERTIFICATE-----\nAAAA\n-----END CERTIFICATE-----\n"
                 .to_string(),
+            certificate_port_forwarding: false,
         };
 
         let json = serde_json::to_string_pretty(&session).unwrap();
@@ -145,5 +149,9 @@ mod tests {
         assert_eq!(session.wg_private_key, restored.wg_private_key);
         assert_eq!(session.fingerprint, restored.fingerprint);
         assert_eq!(session.certificate_pem, restored.certificate_pem);
+        assert_eq!(
+            session.certificate_port_forwarding,
+            restored.certificate_port_forwarding
+        );
     }
 }

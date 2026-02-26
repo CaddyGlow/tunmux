@@ -219,6 +219,10 @@ pub struct ProtonConnectArgs {
     #[arg(long)]
     pub p2p: bool,
 
+    /// Prefer port-forwarding-capable servers and enable PF certificate features
+    #[arg(long)]
+    pub port_forwarding: bool,
+
     /// Server selection order when auto-selecting
     #[arg(short = 's', long, default_value = "score", value_parser = ["score", "load", "name", "latency"])]
     pub sort: String,
@@ -228,11 +232,11 @@ pub struct ProtonConnectArgs {
     pub backend: Option<String>,
 
     /// Start a SOCKS5/HTTP proxy (Linux only; VPN traffic isolated in network namespace)
-    #[arg(long)]
+    #[arg(long, conflicts_with = "local_proxy")]
     pub proxy: bool,
 
     /// Start a userspace SOCKS5/HTTP proxy without root or VpnService
-    #[arg(long)]
+    #[arg(long, conflicts_with = "proxy")]
     pub local_proxy: bool,
 
     /// Disable host IPv6 egress while connected (direct kernel mode, IPv4-only profile)
@@ -278,11 +282,11 @@ pub struct AirVpnConnectArgs {
     pub backend: Option<String>,
 
     /// Start a SOCKS5/HTTP proxy (Linux only; VPN traffic isolated in network namespace)
-    #[arg(long)]
+    #[arg(long, conflicts_with = "local_proxy")]
     pub proxy: bool,
 
     /// Start a userspace SOCKS5/HTTP proxy without root or VpnService
-    #[arg(long)]
+    #[arg(long, conflicts_with = "proxy")]
     pub local_proxy: bool,
 
     /// Disable host IPv6 egress while connected (direct kernel mode, IPv4-only profile)
@@ -324,11 +328,11 @@ pub struct MullvadConnectArgs {
     pub backend: Option<String>,
 
     /// Start a SOCKS5/HTTP proxy (Linux only; VPN traffic isolated in network namespace)
-    #[arg(long)]
+    #[arg(long, conflicts_with = "local_proxy")]
     pub proxy: bool,
 
     /// Start a userspace SOCKS5/HTTP proxy without root or VpnService
-    #[arg(long)]
+    #[arg(long, conflicts_with = "proxy")]
     pub local_proxy: bool,
 
     /// Disable host IPv6 egress while connected (direct kernel mode, IPv4-only profile)
@@ -370,11 +374,11 @@ pub struct IvpnConnectArgs {
     pub backend: Option<String>,
 
     /// Start a SOCKS5/HTTP proxy (Linux only; VPN traffic isolated in network namespace)
-    #[arg(long)]
+    #[arg(long, conflicts_with = "local_proxy")]
     pub proxy: bool,
 
     /// Start a userspace SOCKS5/HTTP proxy without root or VpnService
-    #[arg(long)]
+    #[arg(long, conflicts_with = "proxy")]
     pub local_proxy: bool,
 
     /// Disable host IPv6 egress while connected (direct kernel mode, IPv4-only profile)
@@ -472,6 +476,12 @@ pub enum ProtonCommand {
     /// Connect to a VPN server
     Connect(ProtonConnectArgs),
 
+    /// Manage Proton NAT-PMP port forwarding
+    Ports {
+        #[command(subcommand)]
+        action: ProtonPortAction,
+    },
+
     /// Disconnect from VPN
     Disconnect {
         /// Instance name to disconnect (from `tunmux status`). If omitted,
@@ -479,8 +489,82 @@ pub enum ProtonCommand {
         instance: Option<String>,
 
         /// Disconnect all active connections for this provider
-        #[arg(short = 'a', long)]
+        #[arg(short = 'a', long, conflicts_with = "instance")]
         all: bool,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum ProtonPortAction {
+    /// Request a Proton NAT-PMP forwarded port
+    Request {
+        /// Protocol: both, tcp, udp
+        #[arg(long, default_value = "both", value_parser = ["both", "tcp", "udp"])]
+        protocol: String,
+
+        /// Requested public port (0 = auto-assign)
+        #[arg(short = 'p', long, default_value_t = 0)]
+        public_port: u16,
+
+        /// Internal/local port value in NAT-PMP request
+        #[arg(short = 'l', long, default_value_t = 1)]
+        local_port: u16,
+
+        /// Port mapping lifetime in seconds
+        #[arg(long, default_value_t = 60)]
+        lifetime: u32,
+
+        /// Do not auto-start the background renew daemon
+        #[arg(long)]
+        no_daemon: bool,
+    },
+
+    /// List saved Proton NAT-PMP forwarded ports
+    List {
+        /// Show only active mappings for the current direct Proton connection
+        #[arg(long)]
+        current: bool,
+
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Renew saved Proton NAT-PMP forwarded ports
+    Renew {
+        /// Port mapping lifetime in seconds
+        #[arg(long, default_value_t = 60)]
+        lifetime: u32,
+    },
+
+    /// Stop renew daemon and release saved Proton forwarded ports
+    Release,
+
+    /// Keep Proton NAT-PMP mappings alive (runs until interrupted)
+    Daemon {
+        /// Protocol: both, tcp, udp
+        #[arg(long, default_value = "both", value_parser = ["both", "tcp", "udp"])]
+        protocol: String,
+
+        /// Requested public port (0 = auto-assign)
+        #[arg(short = 'p', long, default_value_t = 0)]
+        public_port: u16,
+
+        /// Internal/local port value in NAT-PMP request
+        #[arg(short = 'l', long, default_value_t = 1)]
+        local_port: u16,
+
+        /// Port mapping lifetime in seconds
+        #[arg(long, default_value_t = 60)]
+        lifetime: u32,
+
+        /// Renew interval in seconds
+        #[arg(long, default_value_t = 45)]
+        renew_every: u64,
+
+        /// Internal: skip initial request and only run renew loop
+        #[arg(long, hide = true)]
+        no_initial_request: bool,
     },
 }
 
@@ -523,7 +607,7 @@ pub enum AirVpnCommand {
         instance: Option<String>,
 
         /// Disconnect all active connections for this provider
-        #[arg(short = 'a', long)]
+        #[arg(short = 'a', long, conflicts_with = "instance")]
         all: bool,
     },
 
@@ -654,7 +738,7 @@ pub enum MullvadCommand {
         instance: Option<String>,
 
         /// Disconnect all active connections for this provider
-        #[arg(short = 'a', long)]
+        #[arg(short = 'a', long, conflicts_with = "instance")]
         all: bool,
     },
 }
@@ -719,7 +803,7 @@ pub enum IvpnCommand {
         instance: Option<String>,
 
         /// Disconnect all active connections for this provider
-        #[arg(short = 'a', long)]
+        #[arg(short = 'a', long, conflicts_with = "instance")]
         all: bool,
     },
 }
@@ -736,7 +820,7 @@ pub enum WgconfCommand {
         instance: Option<String>,
 
         /// Disconnect all active connections for this provider
-        #[arg(short = 'a', long)]
+        #[arg(short = 'a', long, conflicts_with = "instance")]
         all: bool,
     },
 
@@ -909,7 +993,7 @@ pub enum ApiKeyAction {
 mod tests {
     use super::{
         AirVpnCommand, Cli, ConnectProviderCommand, HookBuiltinArg, HookCommand, ProtonCommand,
-        ProviderArg, TopCommand, WgconfCommand,
+        ProtonPortAction, ProviderArg, TopCommand, WgconfCommand,
     };
     use clap::Parser;
 
@@ -1080,6 +1164,140 @@ mod tests {
     }
 
     #[test]
+    fn parse_proton_ports_request_command() {
+        let cli = Cli::try_parse_from([
+            "tunmux",
+            "proton",
+            "ports",
+            "request",
+            "--protocol",
+            "udp",
+            "--public-port",
+            "0",
+            "--local-port",
+            "1",
+            "--lifetime",
+            "90",
+        ])
+        .expect("parse proton ports request");
+        match cli.command {
+            TopCommand::Proton {
+                command:
+                    ProtonCommand::Ports {
+                        action:
+                            ProtonPortAction::Request {
+                                protocol,
+                                public_port,
+                                local_port,
+                                lifetime,
+                                no_daemon,
+                            },
+                    },
+            } => {
+                assert_eq!(protocol, "udp");
+                assert_eq!(public_port, 0);
+                assert_eq!(local_port, 1);
+                assert_eq!(lifetime, 90);
+                assert!(!no_daemon);
+            }
+            _ => panic!("expected proton ports request command"),
+        }
+    }
+
+    #[test]
+    fn parse_proton_ports_renew_command() {
+        let cli = Cli::try_parse_from(["tunmux", "proton", "ports", "renew", "--lifetime", "120"])
+            .expect("parse proton ports renew");
+        match cli.command {
+            TopCommand::Proton {
+                command:
+                    ProtonCommand::Ports {
+                        action: ProtonPortAction::Renew { lifetime },
+                    },
+            } => assert_eq!(lifetime, 120),
+            _ => panic!("expected proton ports renew command"),
+        }
+    }
+
+    #[test]
+    fn parse_proton_ports_list_current_json_command() {
+        let cli = Cli::try_parse_from(["tunmux", "proton", "ports", "list", "--current", "--json"])
+            .expect("parse proton ports list --current --json");
+        match cli.command {
+            TopCommand::Proton {
+                command:
+                    ProtonCommand::Ports {
+                        action: ProtonPortAction::List { current, json },
+                    },
+            } => {
+                assert!(current);
+                assert!(json);
+            }
+            _ => panic!("expected proton ports list command"),
+        }
+    }
+
+    #[test]
+    fn parse_proton_ports_daemon_command() {
+        let cli = Cli::try_parse_from([
+            "tunmux",
+            "proton",
+            "ports",
+            "daemon",
+            "--protocol",
+            "both",
+            "--public-port",
+            "0",
+            "--local-port",
+            "1",
+            "--lifetime",
+            "60",
+            "--renew-every",
+            "45",
+        ])
+        .expect("parse proton ports daemon");
+        match cli.command {
+            TopCommand::Proton {
+                command:
+                    ProtonCommand::Ports {
+                        action:
+                            ProtonPortAction::Daemon {
+                                protocol,
+                                public_port,
+                                local_port,
+                                lifetime,
+                                renew_every,
+                                no_initial_request,
+                            },
+                    },
+            } => {
+                assert_eq!(protocol, "both");
+                assert_eq!(public_port, 0);
+                assert_eq!(local_port, 1);
+                assert_eq!(lifetime, 60);
+                assert_eq!(renew_every, 45);
+                assert!(!no_initial_request);
+            }
+            _ => panic!("expected proton ports daemon command"),
+        }
+    }
+
+    #[test]
+    fn parse_proton_ports_release_command() {
+        let cli =
+            Cli::try_parse_from(["tunmux", "proton", "ports", "release"]).expect("parse release");
+        match cli.command {
+            TopCommand::Proton {
+                command:
+                    ProtonCommand::Ports {
+                        action: ProtonPortAction::Release,
+                    },
+            } => {}
+            _ => panic!("expected proton ports release command"),
+        }
+    }
+
+    #[test]
     fn parse_airvpn_connect_default_sort_score() {
         let cli = Cli::try_parse_from(["tunmux", "connect", "airvpn"]).expect("parse airvpn");
         match cli.command {
@@ -1149,5 +1367,46 @@ mod tests {
             } => assert_eq!(builtin, HookBuiltinArg::DnsDetection),
             _ => panic!("expected hook run command"),
         }
+    }
+
+    #[test]
+    fn parse_connect_proxy_flags_are_mutually_exclusive() {
+        for provider in ["proton", "airvpn", "mullvad", "ivpn"] {
+            let parsed =
+                Cli::try_parse_from(["tunmux", "connect", provider, "--proxy", "--local-proxy"]);
+            assert!(
+                parsed.is_err(),
+                "expected conflict parse error for {provider}"
+            );
+        }
+
+        let parsed = Cli::try_parse_from([
+            "tunmux",
+            "connect",
+            "wgconf",
+            "--file",
+            "/tmp/test.conf",
+            "--proxy",
+            "--local-proxy",
+        ]);
+        assert!(parsed.is_err(), "expected conflict parse error for wgconf");
+    }
+
+    #[test]
+    fn parse_provider_disconnect_rejects_instance_with_all() {
+        let proton = Cli::try_parse_from(["tunmux", "proton", "disconnect", "x", "--all"]);
+        assert!(proton.is_err());
+
+        let airvpn = Cli::try_parse_from(["tunmux", "airvpn", "disconnect", "x", "--all"]);
+        assert!(airvpn.is_err());
+
+        let mullvad = Cli::try_parse_from(["tunmux", "mullvad", "disconnect", "x", "--all"]);
+        assert!(mullvad.is_err());
+
+        let ivpn = Cli::try_parse_from(["tunmux", "ivpn", "disconnect", "x", "--all"]);
+        assert!(ivpn.is_err());
+
+        let wgconf = Cli::try_parse_from(["tunmux", "wgconf", "disconnect", "x", "--all"]);
+        assert!(wgconf.is_err());
     }
 }

@@ -9,5 +9,6 @@ in
     pkgs.git
     pkgs.gcc
     pkgs.gnumake
+    pkgs.libnatpmp
   ];
 }

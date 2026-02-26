@@ -13,12 +13,18 @@ const CERT_DURATION_MIN: i64 = 7 * 24 * 60;
 pub async fn fetch_certificate(
     client: &ProtonClient,
     ed25519_pubkey_pem: &str,
+    enable_port_forwarding: bool,
 ) -> Result<CertificateResponse> {
     info!("fetching_vpn_certificate");
-    let body = json!({
+    let mut body = json!({
         "ClientPublicKey": ed25519_pubkey_pem,
         "Duration": format!("{} min", CERT_DURATION_MIN),
     });
+    if enable_port_forwarding {
+        body["Features"] = json!({
+            "PortForwarding": true
+        });
+    }
 
     let resp = client
         .post("/vpn/v1/certificate")

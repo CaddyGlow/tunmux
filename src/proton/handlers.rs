@@ -1,12 +1,15 @@
 use std::cmp::Ordering;
+use std::fs;
+use std::net::Ipv4Addr;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use crate::cli::ProtonCommand;
+use crate::cli::{ProtonCommand, ProtonPortAction};
 use crate::config::{self, AppConfig, Provider};
 use crate::error;
 use crate::local_proxy;
 use crate::netns;
 use crate::proxy;
+use crate::shared::connection_ops;
 use crate::shared::crypto;
 use crate::shared::hooks;
 use crate::shared::latency;
@@ -18,6 +21,11 @@ use super::{api, models};
 const PROVIDER: Provider = Provider::Proton;
 const INTERFACE_NAME: &str = "proton0";
 const MANIFEST_FILE: &str = "manifest.json";
+const PORT_FORWARD_FILE: &str = "port_forwards.json";
+const PORT_FORWARD_DAEMON_PID_FILE: &str = "port_forward_daemon.pid";
+const PORT_FORWARD_DAEMON_LOG_FILE: &str = "port_forward_daemon.log";
+const NAT_PMP_PORT: u16 = 5351;
+const NAT_PMP_DEFAULT_GATEWAY: &str = "10.2.0.1";
 
 #[derive(serde::Deserialize, serde::Serialize)]
 struct ProtonManifest {
@@ -41,6 +49,7 @@ pub async fn dispatch(command: ProtonCommand, config: &AppConfig) -> anyhow::Res
                 args.server,
                 args.country,
                 args.p2p,
+                args.port_forwarding,
                 args.sort,
                 args.backend,
                 args.proxy,
@@ -54,6 +63,7 @@ pub async fn dispatch(command: ProtonCommand, config: &AppConfig) -> anyhow::Res
             )
             .await
         }
+        ProtonCommand::Ports { action } => cmd_ports(action, config).await,
         ProtonCommand::Disconnect { instance, all } => cmd_disconnect(instance, all, config),
     }
 }
@@ -79,7 +89,7 @@ async fn cmd_login(username: &str, config: &AppConfig) -> anyhow::Result<()> {
     let keys = crypto::keys::VpnKeys::generate()?;
 
     // Fetch VPN certificate
-    let cert = api::certificate::fetch_certificate(&client, &keys.ed25519_pk_pem()).await?;
+    let cert = api::certificate::fetch_certificate(&client, &keys.ed25519_pk_pem(), false).await?;
 
     // Build and save session
     let session = models::session::Session {
@@ -98,6 +108,7 @@ async fn cmd_login(username: &str, config: &AppConfig) -> anyhow::Result<()> {
         wg_public_key: keys.wg_public_key(),
         fingerprint: keys.fingerprint(),
         certificate_pem: cert.certificate,
+        certificate_port_forwarding: false,
     };
 
     config::save_session(PROVIDER, &session, config)?;
@@ -106,6 +117,9 @@ async fn cmd_login(username: &str, config: &AppConfig) -> anyhow::Result<()> {
 }
 
 async fn cmd_logout(config: &AppConfig) -> anyhow::Result<()> {
+    stop_proton_ports_daemon()?;
+    clear_proton_ports_daemon_log_file()?;
+
     // Disconnect if active
     if wireguard::wg_quick::is_interface_active(INTERFACE_NAME)
         || wireguard::userspace::is_interface_active(INTERFACE_NAME)
@@ -115,6 +129,7 @@ async fn cmd_logout(config: &AppConfig) -> anyhow::Result<()> {
     }
 
     config::delete_session(PROVIDER, config)?;
+    clear_proton_port_forward_state_file()?;
 
     // Also remove cached server list
     let manifest_path = config::config_dir(PROVIDER).join(MANIFEST_FILE);
@@ -141,7 +156,8 @@ fn cmd_info(config: &AppConfig) -> anyhow::Result<()> {
 
 async fn cmd_renew(config: &AppConfig) -> anyhow::Result<()> {
     let mut session: models::session::Session = config::load_session(PROVIDER, config)?;
-    renew_proton_certificate(&mut session, config)
+    let keep_port_forwarding = session.certificate_port_forwarding;
+    renew_proton_certificate(&mut session, config, keep_port_forwarding)
         .await
         .map_err(|err| {
             anyhow::anyhow!(
@@ -150,6 +166,709 @@ async fn cmd_renew(config: &AppConfig) -> anyhow::Result<()> {
             )
         })?;
     println!("Proton VPN certificate renewed.");
+    Ok(())
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+enum ProtonNatPmpProtocol {
+    Tcp,
+    Udp,
+}
+
+impl ProtonNatPmpProtocol {
+    fn opcode(self) -> u8 {
+        match self {
+            Self::Udp => 1,
+            Self::Tcp => 2,
+        }
+    }
+}
+
+impl std::fmt::Display for ProtonNatPmpProtocol {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Tcp => write!(f, "tcp"),
+            Self::Udp => write!(f, "udp"),
+        }
+    }
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct ProtonPortForwardRecord {
+    protocol: ProtonNatPmpProtocol,
+    public_port: u16,
+    local_port: u16,
+    lifetime_secs: u32,
+    expires_at_unix: u64,
+    gateway: String,
+    instance_name: String,
+    interface_name: String,
+}
+
+#[derive(Debug, Default, serde::Serialize, serde::Deserialize)]
+struct ProtonPortForwardState {
+    #[serde(default)]
+    mappings: Vec<ProtonPortForwardRecord>,
+}
+
+#[derive(Debug)]
+struct ProtonNatPmpMapResponse {
+    public_port: u16,
+    lifetime_secs: u32,
+}
+
+async fn cmd_ports(action: ProtonPortAction, config: &AppConfig) -> anyhow::Result<()> {
+    match action {
+        ProtonPortAction::List { current, json } => cmd_ports_list(current, json),
+        ProtonPortAction::Request {
+            protocol,
+            public_port,
+            local_port,
+            lifetime,
+            no_daemon,
+        } => {
+            cmd_ports_request(
+                &protocol,
+                public_port,
+                local_port,
+                lifetime,
+                no_daemon,
+                config,
+            )
+            .await
+        }
+        ProtonPortAction::Renew { lifetime } => cmd_ports_renew(lifetime, config).await,
+        ProtonPortAction::Release => cmd_ports_release(config).await,
+        ProtonPortAction::Daemon {
+            protocol,
+            public_port,
+            local_port,
+            lifetime,
+            renew_every,
+            no_initial_request,
+        } => {
+            cmd_ports_daemon(
+                &protocol,
+                public_port,
+                local_port,
+                lifetime,
+                renew_every,
+                no_initial_request,
+                config,
+            )
+            .await
+        }
+    }
+}
+
+fn cmd_ports_list(current_only: bool, json_output: bool) -> anyhow::Result<()> {
+    let mut state = load_proton_port_forward_state()?;
+
+    let now = current_unix_timestamp()? as u64;
+    if current_only {
+        let conn = require_active_proton_direct_connection()?;
+        state.mappings.retain(|mapping| {
+            mapping.instance_name == conn.instance_name
+                && mapping.interface_name == conn.interface_name
+                && mapping.expires_at_unix > now
+        });
+    }
+
+    if json_output {
+        println!("{}", serde_json::to_string_pretty(&state.mappings)?);
+        return Ok(());
+    }
+
+    if state.mappings.is_empty() {
+        if current_only {
+            println!("No current Proton forwarded ports.");
+        } else {
+            println!("No saved Proton forwarded ports.");
+        }
+        return Ok(());
+    }
+
+    state.mappings.sort_by(|a, b| {
+        a.instance_name
+            .cmp(&b.instance_name)
+            .then_with(|| a.protocol.to_string().cmp(&b.protocol.to_string()))
+            .then_with(|| a.public_port.cmp(&b.public_port))
+    });
+
+    println!(
+        "{:<8} {:<8} {:<8} {:<10} {:<12} {:<10} Gateway",
+        "Proto", "Public", "Local", "Lifetime", "ExpiresIn", "Instance"
+    );
+    println!("{}", "-".repeat(80));
+    for mapping in &state.mappings {
+        let expires_in = if mapping.expires_at_unix > now {
+            format!("{}s", mapping.expires_at_unix - now)
+        } else {
+            "expired".to_string()
+        };
+        println!(
+            "{:<8} {:<8} {:<8} {:<10} {:<12} {:<10} {}",
+            mapping.protocol,
+            mapping.public_port,
+            mapping.local_port,
+            mapping.lifetime_secs,
+            expires_in,
+            mapping.instance_name,
+            mapping.gateway
+        );
+    }
+    println!("\n{} mapping(s) saved", state.mappings.len());
+    Ok(())
+}
+
+async fn cmd_ports_request(
+    protocol: &str,
+    public_port: u16,
+    local_port: u16,
+    lifetime: u32,
+    no_daemon: bool,
+    config: &AppConfig,
+) -> anyhow::Result<()> {
+    cmd_ports_request_once(protocol, public_port, local_port, lifetime, config).await?;
+    if no_daemon {
+        return Ok(());
+    }
+
+    stop_proton_ports_daemon()?;
+    let renew_every = default_proton_ports_renew_every(lifetime);
+    let pid = spawn_proton_ports_daemon(protocol, public_port, local_port, lifetime, renew_every)?;
+    println!(
+        "Started Proton port-forward daemon (pid {}, renew every {}s)",
+        pid, renew_every
+    );
+    Ok(())
+}
+
+async fn cmd_ports_request_once(
+    protocol: &str,
+    public_port: u16,
+    local_port: u16,
+    lifetime: u32,
+    config: &AppConfig,
+) -> anyhow::Result<()> {
+    if lifetime == 0 {
+        anyhow::bail!("lifetime must be greater than 0");
+    }
+
+    let mut session: models::session::Session = config::load_session(PROVIDER, config)?;
+    ensure_proton_port_forwarding_certificate_ready(&mut session, config).await?;
+
+    let conn = require_active_proton_direct_connection()?;
+    let gateway = proton_nat_pmp_gateway_for_state(&conn);
+    let protocols = parse_proton_nat_pmp_protocols(protocol)?;
+    let mut requested_public_port = public_port;
+    let now = current_unix_timestamp()? as u64;
+
+    let mut new_mappings = Vec::new();
+    for (index, proto) in protocols.iter().enumerate() {
+        let response = nat_pmp_map_request(
+            &gateway,
+            *proto,
+            local_port,
+            requested_public_port,
+            lifetime,
+        )
+        .await?;
+        if index == 0 && public_port == 0 && protocols.len() > 1 {
+            requested_public_port = response.public_port;
+        }
+
+        let record = ProtonPortForwardRecord {
+            protocol: *proto,
+            public_port: response.public_port,
+            local_port,
+            lifetime_secs: response.lifetime_secs,
+            expires_at_unix: now.saturating_add(response.lifetime_secs as u64),
+            gateway: gateway.clone(),
+            instance_name: conn.instance_name.clone(),
+            interface_name: conn.interface_name.clone(),
+        };
+        new_mappings.push(record);
+    }
+
+    let mut state = load_proton_port_forward_state()?;
+    state.mappings.retain(|mapping| {
+        !(mapping.instance_name == conn.instance_name && protocols.contains(&mapping.protocol))
+    });
+    state.mappings.extend(new_mappings.iter().cloned());
+    save_proton_port_forward_state(&state)?;
+
+    for mapping in &new_mappings {
+        println!(
+            "Forwarded {} public {} (local {}, lifetime {}s)",
+            mapping.protocol, mapping.public_port, mapping.local_port, mapping.lifetime_secs
+        );
+    }
+    Ok(())
+}
+
+async fn cmd_ports_renew(lifetime: u32, config: &AppConfig) -> anyhow::Result<()> {
+    if lifetime == 0 {
+        anyhow::bail!("lifetime must be greater than 0");
+    }
+
+    let mut session: models::session::Session = config::load_session(PROVIDER, config)?;
+    ensure_proton_port_forwarding_certificate_ready(&mut session, config).await?;
+
+    let conn = require_active_proton_direct_connection()?;
+    let gateway = proton_nat_pmp_gateway_for_state(&conn);
+    let now = current_unix_timestamp()? as u64;
+
+    let mut state = load_proton_port_forward_state()?;
+    let mut renewed = 0usize;
+    for mapping in state.mappings.iter_mut().filter(|mapping| {
+        mapping.instance_name == conn.instance_name && mapping.interface_name == conn.interface_name
+    }) {
+        let response = nat_pmp_map_request(
+            &gateway,
+            mapping.protocol,
+            mapping.local_port,
+            mapping.public_port,
+            lifetime,
+        )
+        .await?;
+        mapping.public_port = response.public_port;
+        mapping.lifetime_secs = response.lifetime_secs;
+        mapping.expires_at_unix = now.saturating_add(response.lifetime_secs as u64);
+        mapping.gateway = gateway.clone();
+        renewed = renewed.saturating_add(1);
+        println!(
+            "Renewed {} public {} (lifetime {}s)",
+            mapping.protocol, mapping.public_port, mapping.lifetime_secs
+        );
+    }
+
+    if renewed == 0 {
+        anyhow::bail!("no saved Proton mappings for the active connection. Run `tunmux proton ports request` first");
+    }
+
+    save_proton_port_forward_state(&state)?;
+    Ok(())
+}
+
+async fn cmd_ports_daemon(
+    protocol: &str,
+    public_port: u16,
+    local_port: u16,
+    lifetime: u32,
+    renew_every: u64,
+    no_initial_request: bool,
+    config: &AppConfig,
+) -> anyhow::Result<()> {
+    if lifetime == 0 {
+        anyhow::bail!("lifetime must be greater than 0");
+    }
+    if renew_every == 0 {
+        anyhow::bail!("renew interval must be greater than 0");
+    }
+    if renew_every >= u64::from(lifetime) {
+        tracing::warn!(
+            renew_every,
+            lifetime,
+            "proton_ports_daemon_interval_not_less_than_lifetime"
+        );
+    }
+
+    write_proton_ports_daemon_pid_file(std::process::id())?;
+    let result = async {
+        if !no_initial_request {
+            cmd_ports_request_once(protocol, public_port, local_port, lifetime, config).await?;
+        }
+        println!(
+            "Keeping Proton mappings alive (renew every {}s, Ctrl-C to stop)",
+            renew_every
+        );
+
+        loop {
+            tokio::select! {
+                _ = tokio::signal::ctrl_c() => {
+                    println!("Stopping Proton port forwarding daemon.");
+                    return Ok(());
+                }
+                _ = tokio::time::sleep(Duration::from_secs(renew_every)) => {
+                    if let Err(err) = cmd_ports_renew(lifetime, config).await {
+                        tracing::warn!(
+                            error = %err,
+                            "proton_ports_daemon_renew_failed_retrying_request"
+                        );
+                        eprintln!("Renew failed: {}. Requesting a fresh mapping...", err);
+                        cmd_ports_request_once(protocol, public_port, local_port, lifetime, config).await?;
+                    }
+                }
+            }
+        }
+    }
+    .await;
+    let _ = clear_proton_ports_daemon_pid_file();
+    result
+}
+
+async fn cmd_ports_release(_config: &AppConfig) -> anyhow::Result<()> {
+    stop_proton_ports_daemon()?;
+
+    let conn = require_active_proton_direct_connection()?;
+    let mut state = load_proton_port_forward_state()?;
+    let target_indexes: Vec<usize> = state
+        .mappings
+        .iter()
+        .enumerate()
+        .filter(|(_, mapping)| {
+            mapping.instance_name == conn.instance_name
+                && mapping.interface_name == conn.interface_name
+        })
+        .map(|(idx, _)| idx)
+        .collect();
+
+    if target_indexes.is_empty() {
+        println!("No saved Proton mappings for active connection.");
+        return Ok(());
+    }
+
+    let mut released = Vec::new();
+    for index in target_indexes {
+        let mapping = state
+            .mappings
+            .get(index)
+            .cloned()
+            .expect("mapping index must exist");
+        nat_pmp_map_request(
+            &mapping.gateway,
+            mapping.protocol,
+            mapping.local_port,
+            mapping.public_port,
+            0,
+        )
+        .await?;
+        println!(
+            "Released {} public {} (local {})",
+            mapping.protocol, mapping.public_port, mapping.local_port
+        );
+        released.push(mapping);
+    }
+
+    state.mappings.retain(|mapping| {
+        !released.iter().any(|released_mapping| {
+            mapping.instance_name == released_mapping.instance_name
+                && mapping.interface_name == released_mapping.interface_name
+                && mapping.protocol == released_mapping.protocol
+                && mapping.local_port == released_mapping.local_port
+                && mapping.public_port == released_mapping.public_port
+        })
+    });
+    save_proton_port_forward_state(&state)?;
+    Ok(())
+}
+
+fn default_proton_ports_renew_every(lifetime: u32) -> u64 {
+    let lifetime_u64 = u64::from(lifetime);
+    if lifetime_u64 <= 5 {
+        return 1;
+    }
+    lifetime_u64.saturating_sub(15).max(1)
+}
+
+fn proton_ports_daemon_pid_path() -> std::path::PathBuf {
+    config::config_dir(PROVIDER).join(PORT_FORWARD_DAEMON_PID_FILE)
+}
+
+fn proton_ports_daemon_log_path() -> std::path::PathBuf {
+    config::config_dir(PROVIDER).join(PORT_FORWARD_DAEMON_LOG_FILE)
+}
+
+fn write_proton_ports_daemon_pid_file(pid: u32) -> anyhow::Result<()> {
+    let path = proton_ports_daemon_pid_path();
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::write(path, format!("{}\n", pid))?;
+    Ok(())
+}
+
+fn clear_proton_ports_daemon_pid_file() -> anyhow::Result<()> {
+    let path = proton_ports_daemon_pid_path();
+    if path.exists() {
+        std::fs::remove_file(path)?;
+    }
+    Ok(())
+}
+
+fn clear_proton_ports_daemon_log_file() -> anyhow::Result<()> {
+    let path = proton_ports_daemon_log_path();
+    if path.exists() {
+        std::fs::remove_file(path)?;
+    }
+    Ok(())
+}
+
+fn read_proton_ports_daemon_pid() -> anyhow::Result<Option<u32>> {
+    let path = proton_ports_daemon_pid_path();
+    if !path.exists() {
+        return Ok(None);
+    }
+    let pid = std::fs::read_to_string(path)?
+        .trim()
+        .parse::<u32>()
+        .map_err(|e| anyhow::anyhow!("invalid Proton port daemon pid file: {}", e))?;
+    Ok(Some(pid))
+}
+
+fn spawn_proton_ports_daemon(
+    protocol: &str,
+    public_port: u16,
+    local_port: u16,
+    lifetime: u32,
+    renew_every: u64,
+) -> anyhow::Result<u32> {
+    let exe =
+        std::env::current_exe().unwrap_or_else(|_| std::path::PathBuf::from("/proc/self/exe"));
+    let log_path = proton_ports_daemon_log_path();
+    if let Some(parent) = log_path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let log = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&log_path)?;
+    let log_err = log.try_clone()?;
+
+    let mut cmd = std::process::Command::new(exe);
+    cmd.args([
+        "proton",
+        "ports",
+        "daemon",
+        "--protocol",
+        protocol,
+        "--public-port",
+        &public_port.to_string(),
+        "--local-port",
+        &local_port.to_string(),
+        "--lifetime",
+        &lifetime.to_string(),
+        "--renew-every",
+        &renew_every.to_string(),
+        "--no-initial-request",
+    ])
+    .stdin(std::process::Stdio::null())
+    .stdout(std::process::Stdio::from(log))
+    .stderr(std::process::Stdio::from(log_err));
+
+    let child = cmd
+        .spawn()
+        .map_err(|e| anyhow::anyhow!("failed to spawn Proton port daemon: {}", e))?;
+    write_proton_ports_daemon_pid_file(child.id())?;
+    Ok(child.id())
+}
+
+fn process_alive(pid: u32) -> bool {
+    #[cfg(unix)]
+    {
+        use nix::sys::signal::kill;
+        use nix::unistd::Pid;
+        kill(Pid::from_raw(pid as i32), None).is_ok()
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = pid;
+        false
+    }
+}
+
+fn stop_proton_ports_daemon() -> anyhow::Result<()> {
+    let Some(pid) = read_proton_ports_daemon_pid()? else {
+        return Ok(());
+    };
+    if !process_alive(pid) {
+        clear_proton_ports_daemon_pid_file()?;
+        return Ok(());
+    }
+
+    #[cfg(unix)]
+    {
+        use nix::sys::signal::{kill, Signal};
+        use nix::unistd::Pid;
+
+        let _ = kill(Pid::from_raw(pid as i32), Signal::SIGTERM);
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while std::time::Instant::now() < deadline {
+            if !process_alive(pid) {
+                clear_proton_ports_daemon_pid_file()?;
+                return Ok(());
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+
+        let _ = kill(Pid::from_raw(pid as i32), Signal::SIGKILL);
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while std::time::Instant::now() < deadline {
+            if !process_alive(pid) {
+                clear_proton_ports_daemon_pid_file()?;
+                return Ok(());
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+
+        anyhow::bail!("failed to stop Proton port daemon pid {}", pid);
+    }
+    #[cfg(not(unix))]
+    {
+        clear_proton_ports_daemon_pid_file()?;
+        Ok(())
+    }
+}
+
+fn parse_proton_nat_pmp_protocols(protocol: &str) -> anyhow::Result<Vec<ProtonNatPmpProtocol>> {
+    match protocol {
+        "both" => Ok(vec![ProtonNatPmpProtocol::Tcp, ProtonNatPmpProtocol::Udp]),
+        "tcp" => Ok(vec![ProtonNatPmpProtocol::Tcp]),
+        "udp" => Ok(vec![ProtonNatPmpProtocol::Udp]),
+        other => anyhow::bail!(
+            "unsupported protocol {:?}; expected one of: both, tcp, udp",
+            other
+        ),
+    }
+}
+
+fn require_active_proton_direct_connection(
+) -> anyhow::Result<wireguard::connection::ConnectionState> {
+    use wireguard::connection::{ConnectionState, DIRECT_INSTANCE};
+
+    if let Some(state) = ConnectionState::load(DIRECT_INSTANCE)?
+        .filter(|state| state.provider == PROVIDER.dir_name() && state.namespace_name.is_none())
+    {
+        return Ok(state);
+    }
+
+    let candidates: Vec<ConnectionState> = ConnectionState::load_all()?
+        .into_iter()
+        .filter(|state| {
+            state.provider == PROVIDER.dir_name()
+                && state.namespace_name.is_none()
+                && state.interface_name == INTERFACE_NAME
+        })
+        .collect();
+
+    match candidates.len() {
+        0 => anyhow::bail!(
+            "no active direct Proton connection. Connect first with `tunmux proton connect ...`"
+        ),
+        1 => Ok(candidates.into_iter().next().expect("single element")),
+        _ => {
+            let names: Vec<String> = candidates
+                .into_iter()
+                .map(|state| state.instance_name)
+                .collect();
+            anyhow::bail!(
+                "multiple direct Proton connections found ({}). Disconnect extras or use the direct instance",
+                names.join(", ")
+            )
+        }
+    }
+}
+
+fn proton_nat_pmp_gateway_for_state(state: &wireguard::connection::ConnectionState) -> String {
+    state
+        .dns_servers
+        .iter()
+        .find_map(|value| value.parse::<Ipv4Addr>().ok())
+        .map(|value| value.to_string())
+        .unwrap_or_else(|| NAT_PMP_DEFAULT_GATEWAY.to_string())
+}
+
+async fn nat_pmp_map_request(
+    gateway: &str,
+    protocol: ProtonNatPmpProtocol,
+    local_port: u16,
+    public_port: u16,
+    lifetime: u32,
+) -> anyhow::Result<ProtonNatPmpMapResponse> {
+    let socket = tokio::net::UdpSocket::bind("0.0.0.0:0").await?;
+    let target = format!("{}:{}", gateway, NAT_PMP_PORT);
+
+    let mut request = [0_u8; 12];
+    request[0] = 0;
+    request[1] = protocol.opcode();
+    request[4..6].copy_from_slice(&local_port.to_be_bytes());
+    request[6..8].copy_from_slice(&public_port.to_be_bytes());
+    request[8..12].copy_from_slice(&lifetime.to_be_bytes());
+
+    socket.send_to(&request, &target).await?;
+
+    let mut response = [0_u8; 64];
+    let (size, _) = tokio::time::timeout(Duration::from_secs(3), socket.recv_from(&mut response))
+        .await
+        .map_err(|_| anyhow::anyhow!("timeout waiting for NAT-PMP reply from {}", target))??;
+    if size < 16 {
+        anyhow::bail!("NAT-PMP reply too short: {} bytes", size);
+    }
+
+    if response[0] != 0 {
+        anyhow::bail!("unexpected NAT-PMP version {}", response[0]);
+    }
+    let expected_opcode = protocol.opcode().saturating_add(128);
+    if response[1] != expected_opcode {
+        anyhow::bail!(
+            "unexpected NAT-PMP opcode {} (expected {})",
+            response[1],
+            expected_opcode
+        );
+    }
+
+    let result_code = u16::from_be_bytes([response[2], response[3]]);
+    if result_code != 0 {
+        anyhow::bail!(
+            "NAT-PMP request failed with code {} ({})",
+            result_code,
+            nat_pmp_result_code_desc(result_code)
+        );
+    }
+
+    let mapped_public_port = u16::from_be_bytes([response[10], response[11]]);
+    let mapped_lifetime_secs =
+        u32::from_be_bytes([response[12], response[13], response[14], response[15]]);
+    Ok(ProtonNatPmpMapResponse {
+        public_port: mapped_public_port,
+        lifetime_secs: mapped_lifetime_secs,
+    })
+}
+
+fn nat_pmp_result_code_desc(result_code: u16) -> &'static str {
+    match result_code {
+        0 => "success",
+        1 => "unsupported NAT-PMP version",
+        2 => "not authorized/refused",
+        3 => "network failure",
+        4 => "out of resources",
+        5 => "unsupported opcode",
+        _ => "unknown error",
+    }
+}
+
+fn load_proton_port_forward_state() -> anyhow::Result<ProtonPortForwardState> {
+    let data = match config::load_provider_file(PROVIDER, PORT_FORWARD_FILE)? {
+        Some(data) => data,
+        None => return Ok(ProtonPortForwardState::default()),
+    };
+    let state: ProtonPortForwardState = serde_json::from_slice(&data)?;
+    Ok(state)
+}
+
+fn save_proton_port_forward_state(state: &ProtonPortForwardState) -> anyhow::Result<()> {
+    let json = serde_json::to_string_pretty(state)?;
+    config::save_provider_file(PROVIDER, PORT_FORWARD_FILE, json.as_bytes())?;
+    Ok(())
+}
+
+fn clear_proton_port_forward_state_file() -> anyhow::Result<()> {
+    let path = config::config_dir(PROVIDER).join(PORT_FORWARD_FILE);
+    if path.exists() {
+        fs::remove_file(path)?;
+    }
     Ok(())
 }
 
@@ -178,9 +897,7 @@ async fn cmd_servers(
     }
 
     let requested_tags = parse_proton_feature_tags(&tags)?;
-    if !requested_tags.is_empty() {
-        servers.retain(|s| requested_tags.iter().all(|feature| s.has_feature(*feature)));
-    }
+    apply_proton_feature_filters(&mut servers, &requested_tags);
 
     let sort_by_latency = sort == "latency";
 
@@ -296,6 +1013,23 @@ fn parse_proton_feature_tags(
     Ok(parsed)
 }
 
+fn apply_proton_feature_filters(
+    servers: &mut Vec<models::server::LogicalServer>,
+    requested_features: &[models::server::ServerFeature],
+) {
+    let request_mask = requested_features
+        .iter()
+        .fold(0_i32, |mask, feature| mask | (*feature as i32));
+    let default_exclude_mask = (models::server::ServerFeature::SecureCore as i32)
+        | (models::server::ServerFeature::Tor as i32);
+    // Match Proton's default selection policy: avoid Secure Core and Tor unless requested.
+    let exclude_mask = default_exclude_mask & !request_mask;
+
+    servers.retain(|server| {
+        (server.features & exclude_mask) == 0 && (server.features & request_mask) == request_mask
+    });
+}
+
 fn latency_order(a: &Option<Duration>, b: &Option<Duration>) -> Ordering {
     match (a, b) {
         (Some(a), Some(b)) => a.cmp(b),
@@ -317,6 +1051,7 @@ async fn cmd_connect(
     server_name: Option<String>,
     country: Option<String>,
     p2p: bool,
+    port_forwarding: bool,
     sort: String,
     backend_arg: Option<String>,
     use_proxy: bool,
@@ -328,43 +1063,29 @@ async fn cmd_connect(
     proxy_access_log_arg: bool,
     config: &AppConfig,
 ) -> anyhow::Result<()> {
-    let backend_str = backend_arg.as_deref().unwrap_or(&config.general.backend);
-
-    #[cfg(not(target_os = "linux"))]
-    if use_proxy {
-        anyhow::bail!("--proxy is available only on Linux");
-    }
-
-    if use_proxy {
-        // Proxy mode requires kernel backend
-        if matches!(backend_str, "wg-quick" | "userspace") {
-            anyhow::bail!(
-                "--proxy requires kernel backend (incompatible with --backend {})",
-                backend_str
-            );
-        }
-    }
-
-    let backend = if use_proxy {
-        wireguard::backend::WgBackend::Kernel
-    } else {
-        wireguard::backend::WgBackend::from_str_arg(backend_str)?
-    };
-
-    if disable_ipv6
-        && (use_proxy || use_local_proxy || backend != wireguard::backend::WgBackend::Kernel)
-    {
-        anyhow::bail!(
-            "--disable-ipv6 is supported only for direct kernel mode (no --proxy/--local-proxy)"
-        );
-    }
+    let backend = connection_ops::resolve_connect_backend(
+        backend_arg.as_deref(),
+        &config.general.backend,
+        use_proxy,
+        use_local_proxy,
+    )?;
+    connection_ops::validate_disable_ipv6_direct_kernel(
+        disable_ipv6,
+        use_proxy,
+        use_local_proxy,
+        backend,
+    )?;
 
     // Apply config defaults -- CLI flags override config
     let effective_country = country.or_else(|| config.proton.default_country.clone());
     let proxy_access_log = proxy_access_log_arg || config.general.proxy_access_log;
 
     let mut session: models::session::Session = config::load_session(PROVIDER, config)?;
-    ensure_proton_certificate_ready(&mut session, config).await?;
+    if port_forwarding {
+        ensure_proton_port_forwarding_certificate_ready(&mut session, config).await?;
+    } else {
+        ensure_proton_certificate_ready(&mut session, config).await?;
+    }
     let mut servers = load_servers_cached_or_fetch(&session).await?;
 
     // Filter enabled servers with WireGuard support
@@ -385,9 +1106,11 @@ async fn cmd_connect(
             let cc_upper = cc.to_uppercase();
             servers.retain(|s| s.exit_country == cc_upper);
         }
-        if p2p {
-            servers.retain(|s| s.has_feature(models::server::ServerFeature::P2P));
+        let mut requested_features = Vec::new();
+        if p2p || port_forwarding {
+            requested_features.push(models::server::ServerFeature::P2P);
         }
+        apply_proton_feature_filters(&mut servers, &requested_features);
 
         if sort == "latency" {
             let targets: Vec<(String, u16)> = servers
@@ -486,7 +1209,7 @@ async fn ensure_proton_certificate_ready(
 ) -> anyhow::Result<()> {
     if session.certificate_pem.trim().is_empty() {
         tracing::warn!("proton_certificate_missing_attempting_auto_renew");
-        return renew_proton_certificate(session, config)
+        return renew_proton_certificate(session, config, session.certificate_port_forwarding)
             .await
             .map_err(|err| anyhow::anyhow!("no stored Proton certificate and automatic renewal failed: {}. run `tunmux proton login <username>`", err));
     }
@@ -495,7 +1218,7 @@ async fn ensure_proton_certificate_ready(
         Some(value) => value,
         None => {
             tracing::warn!("proton_certificate_parse_failed_attempting_auto_renew");
-            return renew_proton_certificate(session, config)
+            return renew_proton_certificate(session, config, session.certificate_port_forwarding)
                 .await
                 .map_err(|err| anyhow::anyhow!("stored Proton certificate could not be parsed and automatic renewal failed: {}. run `tunmux proton login <username>`", err));
         }
@@ -511,7 +1234,8 @@ async fn ensure_proton_certificate_ready(
         expires_at = %expiry,
         "proton_certificate_expired_attempting_auto_renew"
     );
-    renew_proton_certificate(session, config).await.map_err(|err| {
+    renew_proton_certificate(session, config, session.certificate_port_forwarding).await.map_err(
+        |err| {
         anyhow::anyhow!(
             "stored Proton certificate expired at {} UTC and automatic renewal failed: {}. run `tunmux proton login <username>`",
             expiry,
@@ -520,9 +1244,27 @@ async fn ensure_proton_certificate_ready(
     })
 }
 
+async fn ensure_proton_port_forwarding_certificate_ready(
+    session: &mut models::session::Session,
+    config: &AppConfig,
+) -> anyhow::Result<()> {
+    if session.certificate_port_forwarding {
+        return ensure_proton_certificate_ready(session, config).await;
+    }
+
+    tracing::info!("proton_port_forwarding_not_enabled_refreshing_certificate");
+    renew_proton_certificate(session, config, true).await.map_err(|err| {
+        anyhow::anyhow!(
+            "failed to enable Proton port-forwarding certificate features: {}. run `tunmux proton login <username>`",
+            err
+        )
+    })
+}
+
 async fn renew_proton_certificate(
     session: &mut models::session::Session,
     config: &AppConfig,
+    enable_port_forwarding: bool,
 ) -> anyhow::Result<()> {
     let ed25519_public_key_pem = if session.ed25519_public_key_pem.trim().is_empty() {
         let keys = crypto::keys::VpnKeys::from_base64(&session.ed25519_private_key)?;
@@ -534,11 +1276,18 @@ async fn renew_proton_certificate(
     };
 
     let client = api::http::ProtonClient::authenticated(&session.uid, &session.access_token)?;
-    let cert = api::certificate::fetch_certificate(&client, &ed25519_public_key_pem).await?;
+    let cert = api::certificate::fetch_certificate(
+        &client,
+        &ed25519_public_key_pem,
+        enable_port_forwarding,
+    )
+    .await?;
     session.certificate_pem = cert.certificate;
+    session.certificate_port_forwarding = enable_port_forwarding;
     config::save_session(PROVIDER, session, config)?;
     tracing::info!(
         serial = %cert.serial_number,
+        port_forwarding = enable_port_forwarding,
         "proton_certificate_renewed"
     );
     Ok(())
@@ -854,74 +1603,9 @@ fn connect_direct(
 }
 
 fn cmd_disconnect(instance: Option<String>, all: bool, config: &AppConfig) -> anyhow::Result<()> {
-    let provider_name = PROVIDER.dir_name();
-
-    if all {
-        let connections = wireguard::connection::ConnectionState::load_all()?;
-        let mine: Vec<_> = connections
-            .into_iter()
-            .filter(|c| c.provider == provider_name)
-            .collect();
-        if mine.is_empty() {
-            println!("No active proton connections.");
-            return Ok(());
-        }
-        for conn in mine {
-            disconnect_one(&conn, config)?;
-            println!("Disconnected {}", conn.instance_name);
-        }
-        return Ok(());
-    }
-
-    if let Some(ref name) = instance {
-        let conn = wireguard::connection::ConnectionState::load(name)?
-            .ok_or_else(|| anyhow::anyhow!("no connection with instance {:?}", name))?;
-        if conn.provider != provider_name {
-            anyhow::bail!(
-                "instance {:?} belongs to provider {:?}, not proton",
-                name,
-                conn.provider
-            );
-        }
-        disconnect_one(&conn, config)?;
-        println!("Disconnected {}", name);
-        return Ok(());
-    }
-
-    // No instance specified -- find sole connection for this provider
-    let connections = wireguard::connection::ConnectionState::load_all()?;
-    let mine: Vec<_> = connections
-        .into_iter()
-        .filter(|c| c.provider == provider_name)
-        .collect();
-
-    match mine.len() {
-        0 => {
-            println!("Not connected.");
-        }
-        1 => {
-            let conn = &mine[0];
-            disconnect_one(conn, config)?;
-            println!("Disconnected {}", conn.instance_name);
-        }
-        _ => {
-            println!("Multiple active connections. Specify which to disconnect:\n");
-            for conn in &mine {
-                let ports = match (conn.socks_port, conn.http_port) {
-                    (Some(s), Some(h)) => format!("SOCKS5 :{}, HTTP :{}", s, h),
-                    _ => "-".to_string(),
-                };
-                println!(
-                    "  {}  {}  {}",
-                    conn.instance_name, conn.server_display_name, ports
-                );
-            }
-            println!("\nUsage: tunmux disconnect <instance>");
-            println!("       tunmux disconnect --provider proton --all");
-        }
-    }
-
-    Ok(())
+    connection_ops::disconnect_provider_connections(PROVIDER.dir_name(), instance, all, |conn| {
+        disconnect_one(conn, config)
+    })
 }
 
 fn disconnect_one(
@@ -976,6 +1660,11 @@ fn disconnect_one(
     }
 
     hooks::run_ifdown(config, PROVIDER, state);
+    if state.namespace_name.is_none()
+        && state.instance_name == wireguard::connection::DIRECT_INSTANCE
+    {
+        clear_proton_port_forward_state_file()?;
+    }
     Ok(())
 }
 
@@ -1022,6 +1711,33 @@ fn load_manifest() -> anyhow::Result<Vec<models::server::LogicalServer>> {
 mod tests {
     use super::*;
 
+    fn make_server(name: &str, features: i32) -> models::server::LogicalServer {
+        models::server::LogicalServer {
+            id: format!("id-{}", name),
+            name: name.to_string(),
+            entry_country: "US".to_string(),
+            exit_country: "US".to_string(),
+            host_country: None,
+            domain: format!("{}.example.com", name.to_ascii_lowercase()),
+            tier: 2,
+            features,
+            region: None,
+            city: None,
+            score: 1.0,
+            load: 10,
+            status: 1,
+            servers: vec![models::server::PhysicalServer {
+                id: "ps-1".to_string(),
+                entry_ip: "127.0.0.1".to_string(),
+                exit_ip: "127.0.0.1".to_string(),
+                domain: "example.com".to_string(),
+                status: 1,
+                x25519_public_key: Some("key".to_string()),
+            }],
+            location: None,
+        }
+    }
+
     #[test]
     fn test_parse_proton_feature_tags_supported_aliases() {
         let tags = vec![
@@ -1048,6 +1764,81 @@ mod tests {
     fn test_parse_proton_feature_tags_rejects_unknown_tag() {
         let err = parse_proton_feature_tags(&["unknown".to_string()]).expect_err("unknown tag");
         assert!(err.to_string().contains("unknown Proton tag"));
+    }
+
+    #[test]
+    fn test_parse_proton_nat_pmp_protocols() {
+        assert_eq!(
+            parse_proton_nat_pmp_protocols("tcp").expect("tcp"),
+            vec![ProtonNatPmpProtocol::Tcp]
+        );
+        assert_eq!(
+            parse_proton_nat_pmp_protocols("udp").expect("udp"),
+            vec![ProtonNatPmpProtocol::Udp]
+        );
+        assert_eq!(
+            parse_proton_nat_pmp_protocols("both").expect("both"),
+            vec![ProtonNatPmpProtocol::Tcp, ProtonNatPmpProtocol::Udp]
+        );
+        assert!(parse_proton_nat_pmp_protocols("sctp").is_err());
+    }
+
+    #[test]
+    fn test_nat_pmp_result_code_desc_known_values() {
+        assert_eq!(nat_pmp_result_code_desc(0), "success");
+        assert_eq!(nat_pmp_result_code_desc(2), "not authorized/refused");
+        assert_eq!(nat_pmp_result_code_desc(5), "unsupported opcode");
+    }
+
+    #[test]
+    fn test_apply_proton_feature_filters_excludes_secure_core_and_tor_by_default() {
+        let mut servers = vec![
+            make_server("US#1", 0),
+            make_server("US#2", models::server::ServerFeature::SecureCore as i32),
+            make_server("US#3", models::server::ServerFeature::Tor as i32),
+        ];
+
+        apply_proton_feature_filters(&mut servers, &[]);
+        let names: Vec<&str> = servers.iter().map(|s| s.name.as_str()).collect();
+        assert_eq!(names, vec!["US#1"]);
+    }
+
+    #[test]
+    fn test_apply_proton_feature_filters_secure_core_request_still_excludes_tor() {
+        let mut servers = vec![
+            make_server("US#1", models::server::ServerFeature::SecureCore as i32),
+            make_server(
+                "US#2",
+                (models::server::ServerFeature::SecureCore as i32)
+                    | (models::server::ServerFeature::Tor as i32),
+            ),
+            make_server("US#3", 0),
+        ];
+
+        apply_proton_feature_filters(&mut servers, &[models::server::ServerFeature::SecureCore]);
+        let names: Vec<&str> = servers.iter().map(|s| s.name.as_str()).collect();
+        assert_eq!(names, vec!["US#1"]);
+    }
+
+    #[test]
+    fn test_apply_proton_feature_filters_p2p_request_excludes_secure_core_and_tor() {
+        let mut servers = vec![
+            make_server("US#1", models::server::ServerFeature::P2P as i32),
+            make_server(
+                "US#2",
+                (models::server::ServerFeature::P2P as i32)
+                    | (models::server::ServerFeature::SecureCore as i32),
+            ),
+            make_server(
+                "US#3",
+                (models::server::ServerFeature::P2P as i32)
+                    | (models::server::ServerFeature::Tor as i32),
+            ),
+        ];
+
+        apply_proton_feature_filters(&mut servers, &[models::server::ServerFeature::P2P]);
+        let names: Vec<&str> = servers.iter().map(|s| s.name.as_str()).collect();
+        assert_eq!(names, vec!["US#1"]);
     }
 
     #[test]
