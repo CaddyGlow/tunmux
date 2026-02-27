@@ -180,7 +180,7 @@ pub fn disconnect_one_provider_connection(
                 ConnectionState::remove(&state.instance_name)?;
             }
             WgBackend::Userspace => {
-                wireguard::userspace::down(&state.interface_name)?;
+                wireguard::userspace::down(&state.interface_name, provider)?;
                 ConnectionState::remove(&state.instance_name)?;
             }
             WgBackend::LocalProxy => unreachable!(),

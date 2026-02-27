@@ -1,3 +1,4 @@
+use crate::config;
 use crate::error::Result;
 use crate::privileged_api::GotaTunAction;
 use crate::privileged_client::PrivilegedClient;
@@ -6,7 +7,26 @@ use tracing::info;
 use super::handshake;
 
 /// Bring up a WireGuard tunnel using the embedded gotatun userspace backend.
-pub fn up(config_content: &str, interface_name: &str) -> Result<()> {
+pub fn up(
+    config_content: &str,
+    interface_name: &str,
+    provider: config::Provider,
+) -> Result<String> {
+    #[cfg(target_os = "macos")]
+    {
+        return super::wg_quick::up(config_content, interface_name, provider, true);
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = provider;
+        up_raw(config_content, interface_name)?;
+        Ok(interface_name.to_string())
+    }
+}
+
+/// Bring up a userspace tunnel directly via gotatun helper.
+pub fn up_raw(config_content: &str, interface_name: &str) -> Result<()> {
     let client = PrivilegedClient::new();
     info!(
         interface = ?interface_name,
@@ -18,7 +38,21 @@ pub fn up(config_content: &str, interface_name: &str) -> Result<()> {
 }
 
 /// Tear down a userspace WireGuard tunnel.
-pub fn down(interface_name: &str) -> Result<()> {
+pub fn down(interface_name: &str, provider: config::Provider) -> Result<()> {
+    #[cfg(target_os = "macos")]
+    {
+        return super::wg_quick::down(interface_name, provider);
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = provider;
+        down_raw(interface_name)
+    }
+}
+
+/// Tear down a userspace tunnel directly via gotatun helper.
+pub fn down_raw(interface_name: &str) -> Result<()> {
     let client = PrivilegedClient::new();
     info!(
         interface = ?interface_name,

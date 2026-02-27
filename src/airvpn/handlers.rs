@@ -687,12 +687,12 @@ fn connect_direct(
         }
         wireguard::backend::WgBackend::Userspace => {
             let wg_config = wireguard::config::generate_config(params);
-            wireguard::userspace::up(&wg_config, INTERFACE_NAME)?;
+            let effective_iface = wireguard::userspace::up(&wg_config, INTERFACE_NAME, PROVIDER)?;
 
             let state = wireguard::connection::ConnectionState {
                 instance_name: DIRECT_INSTANCE.to_string(),
                 provider: PROVIDER.dir_name().to_string(),
-                interface_name: INTERFACE_NAME.to_string(),
+                interface_name: effective_iface,
                 backend,
                 server_endpoint: format!("{}:{}", server_ip, server_port),
                 server_display_name: server_name.to_string(),

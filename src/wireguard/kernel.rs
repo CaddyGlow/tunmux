@@ -546,7 +546,7 @@ fn up_macos(
     }
 
     let wg_config = super::config::generate_config(params);
-    super::userspace::up(&wg_config, interface_name)?;
+    super::userspace::up_raw(&wg_config, interface_name)?;
 
     let state = ConnectionState {
         instance_name: DIRECT_INSTANCE.to_string(),
@@ -580,7 +580,7 @@ fn up_macos(
 }
 
 fn down_macos(state: &ConnectionState) -> Result<()> {
-    super::userspace::down(&state.interface_name)?;
+    super::userspace::down_raw(&state.interface_name)?;
     ConnectionState::remove(&state.instance_name)?;
     info!(
         interface = state.interface_name,
