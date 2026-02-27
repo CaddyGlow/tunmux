@@ -6,6 +6,8 @@ pub fn maybe_run_from_env() -> bool {
 #[cfg(unix)]
 use base64::Engine;
 #[cfg(unix)]
+use std::fs::File;
+#[cfg(unix)]
 use std::io;
 #[cfg(target_os = "macos")]
 use std::net::Ipv4Addr;
@@ -18,7 +20,7 @@ use std::path::Path;
 #[cfg(unix)]
 use std::path::PathBuf;
 #[cfg(unix)]
-use std::process::Command;
+use std::process::{Command, Output};
 #[cfg(unix)]
 use std::time::Duration;
 
@@ -36,6 +38,8 @@ use gotatun::tun::tun_async_device::TunDevice;
 use gotatun::x25519::{PublicKey, StaticSecret};
 #[cfg(unix)]
 use tokio::signal::unix::{signal, SignalKind};
+#[cfg(unix)]
+use tracing::info;
 
 #[cfg(unix)]
 const READY_OK: &[u8] = &[1];
@@ -83,6 +87,7 @@ struct LinuxRoute {
 #[cfg(target_os = "macos")]
 struct MacosCleanupState {
     routes_added: Vec<MacosRoute>,
+    dns_services: Vec<MacosDnsServiceState>,
 }
 
 #[cfg(target_os = "macos")]
@@ -91,6 +96,13 @@ struct MacosRoute {
     destination: String,
     interface: Option<String>,
     gateway: Option<String>,
+}
+
+#[cfg(target_os = "macos")]
+struct MacosDnsServiceState {
+    service: String,
+    dns_servers: Option<Vec<String>>,
+    search_domains: Option<Vec<String>>,
 }
 
 #[cfg(unix)]
@@ -111,6 +123,8 @@ pub fn maybe_run_from_env() -> bool {
     if std::env::var_os(HELPER_ENV).is_none() {
         return false;
     }
+
+    crate::logging::init_terminal(false);
 
     let mut args = std::env::args();
     let _program = args.next();
@@ -136,7 +150,18 @@ pub fn maybe_run_from_env() -> bool {
 #[cfg(unix)]
 fn daemonize_and_run(interface: &str) -> anyhow::Result<()> {
     let (child_tx, parent_rx) = UnixDatagram::pair().context("failed to create status socket")?;
-    let daemonize = Daemonize::new().working_directory("/tmp");
+    let stdout = File::options()
+        .write(true)
+        .open("/dev/stdout")
+        .context("failed to open /dev/stdout for helper logging")?;
+    let stderr = File::options()
+        .write(true)
+        .open("/dev/stderr")
+        .context("failed to open /dev/stderr for helper logging")?;
+    let daemonize = Daemonize::new()
+        .working_directory("/tmp")
+        .stdout(stdout)
+        .stderr(stderr);
 
     match daemonize.execute() {
         daemonize::Outcome::Parent(Err(e)) => {
@@ -498,10 +523,7 @@ fn cleanup_network(running: &RunningDevice) {
 
 #[cfg(unix)]
 fn run_command(name: &str, args: &[&str]) -> anyhow::Result<()> {
-    let output = Command::new(name)
-        .args(args)
-        .output()
-        .with_context(|| format!("failed to run {} {}", name, args.join(" ")))?;
+    let output = run_command_capture_output(name, args)?;
     if output.status.success() {
         return Ok(());
     }
@@ -513,10 +535,7 @@ fn run_command(name: &str, args: &[&str]) -> anyhow::Result<()> {
 
 #[cfg(unix)]
 fn run_command_with_exists_ok(name: &str, args: &[&str]) -> anyhow::Result<bool> {
-    let output = Command::new(name)
-        .args(args)
-        .output()
-        .with_context(|| format!("failed to run {} {}", name, args.join(" ")))?;
+    let output = run_command_capture_output(name, args)?;
     if output.status.success() {
         return Ok(true);
     }
@@ -530,6 +549,23 @@ fn run_command_with_exists_ok(name: &str, args: &[&str]) -> anyhow::Result<bool>
         anyhow::bail!("{} {} failed", name, args.join(" "));
     }
     anyhow::bail!("{} {} failed: {}", name, args.join(" "), detail);
+}
+
+#[cfg(unix)]
+fn run_command_capture_output(name: &str, args: &[&str]) -> anyhow::Result<Output> {
+    info!(command = %format_command_for_log(name, args), "userspace_helper_command");
+    Command::new(name)
+        .args(args)
+        .output()
+        .with_context(|| format!("failed to run {} {}", name, args.join(" ")))
+}
+
+#[cfg(unix)]
+fn format_command_for_log(name: &str, args: &[&str]) -> String {
+    if args.is_empty() {
+        return name.to_string();
+    }
+    format!("{} {}", name, args.join(" "))
 }
 
 #[cfg(target_os = "linux")]
@@ -850,7 +886,12 @@ fn configure_network_macos(
         }
     }
 
-    Ok(MacosCleanupState { routes_added })
+    let dns_services = configure_macos_dns(config)?;
+
+    Ok(MacosCleanupState {
+        routes_added,
+        dns_services,
+    })
 }
 
 #[cfg(target_os = "macos")]
@@ -858,6 +899,144 @@ fn cleanup_network_macos(state: &MacosCleanupState) {
     for route in state.routes_added.iter().rev() {
         let _ = del_macos_route(route);
     }
+    for service in state.dns_services.iter().rev() {
+        let _ = restore_macos_dns_service(service);
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn configure_macos_dns(
+    config: &ParsedUserspaceConfig,
+) -> anyhow::Result<Vec<MacosDnsServiceState>> {
+    if config.dns_servers.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let services = list_macos_network_services()?;
+    let mut saved = Vec::new();
+
+    for service in services {
+        let previous_dns = get_macos_dns_servers(&service)?;
+        let previous_search = get_macos_search_domains(&service)?;
+
+        set_macos_dns_servers(&service, &config.dns_servers)?;
+        set_macos_search_domains_empty(&service)?;
+
+        saved.push(MacosDnsServiceState {
+            service,
+            dns_servers: previous_dns,
+            search_domains: previous_search,
+        });
+    }
+
+    Ok(saved)
+}
+
+#[cfg(target_os = "macos")]
+fn restore_macos_dns_service(state: &MacosDnsServiceState) -> anyhow::Result<()> {
+    match &state.dns_servers {
+        Some(servers) => set_macos_dns_servers(&state.service, servers)?,
+        None => set_macos_dns_servers_empty(&state.service)?,
+    }
+
+    match &state.search_domains {
+        Some(domains) => set_macos_search_domains(&state.service, domains)?,
+        None => set_macos_search_domains_empty(&state.service)?,
+    }
+
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn list_macos_network_services() -> anyhow::Result<Vec<String>> {
+    let output = run_command_capture_output("networksetup", &["-listallnetworkservices"])?;
+    if !output.status.success() {
+        anyhow::bail!("networksetup -listallnetworkservices failed");
+    }
+
+    let text = String::from_utf8_lossy(&output.stdout);
+    let mut services = Vec::new();
+    for line in text.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed.starts_with("An asterisk") {
+            continue;
+        }
+        let service = trimmed.strip_prefix('*').map(str::trim).unwrap_or(trimmed);
+        if !service.is_empty() {
+            services.push(service.to_string());
+        }
+    }
+
+    Ok(services)
+}
+
+#[cfg(target_os = "macos")]
+fn get_macos_dns_servers(service: &str) -> anyhow::Result<Option<Vec<String>>> {
+    get_macos_networksetup_values(service, "-getdnsservers", "DNS Servers")
+}
+
+#[cfg(target_os = "macos")]
+fn get_macos_search_domains(service: &str) -> anyhow::Result<Option<Vec<String>>> {
+    get_macos_networksetup_values(service, "-getsearchdomains", "Search Domains")
+}
+
+#[cfg(target_os = "macos")]
+fn get_macos_networksetup_values(
+    service: &str,
+    flag: &str,
+    value_label: &str,
+) -> anyhow::Result<Option<Vec<String>>> {
+    let output = run_command_capture_output("networksetup", &[flag, service])?;
+    if !output.status.success() {
+        anyhow::bail!("networksetup {} {} failed", flag, service);
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let marker = format!("There aren't any {} set", value_label);
+    if stdout.lines().any(|line| line.contains(&marker)) {
+        return Ok(None);
+    }
+
+    let values: Vec<String> = stdout
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .map(str::to_string)
+        .collect();
+
+    if values.is_empty() || values == ["Empty".to_string()] {
+        Ok(None)
+    } else {
+        Ok(Some(values))
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn set_macos_dns_servers(service: &str, dns_servers: &[String]) -> anyhow::Result<()> {
+    let mut args: Vec<&str> = Vec::with_capacity(2 + dns_servers.len());
+    args.push("-setdnsservers");
+    args.push(service);
+    args.extend(dns_servers.iter().map(String::as_str));
+    run_command("networksetup", &args)
+}
+
+#[cfg(target_os = "macos")]
+fn set_macos_dns_servers_empty(service: &str) -> anyhow::Result<()> {
+    run_command("networksetup", &["-setdnsservers", service, "Empty"])
+}
+
+#[cfg(target_os = "macos")]
+fn set_macos_search_domains(service: &str, domains: &[String]) -> anyhow::Result<()> {
+    let mut args: Vec<&str> = Vec::with_capacity(2 + domains.len());
+    args.push("-setsearchdomains");
+    args.push(service);
+    args.extend(domains.iter().map(String::as_str));
+    run_command("networksetup", &args)
+}
+
+#[cfg(target_os = "macos")]
+fn set_macos_search_domains_empty(service: &str) -> anyhow::Result<()> {
+    run_command("networksetup", &["-setsearchdomains", service, "Empty"])
 }
 
 #[cfg(target_os = "macos")]
