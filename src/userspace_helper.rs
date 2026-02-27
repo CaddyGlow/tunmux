@@ -48,6 +48,7 @@ const CONFIG_B64_ENV: &str = "TUNMUX_GOTATUN_CONFIG_B64";
 
 #[cfg(unix)]
 struct RunningDevice {
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     interface_name: String,
     control_socket_path: PathBuf,
     device: Device<DefaultDeviceTransports>,
@@ -95,6 +96,7 @@ struct MacosRoute {
 struct ParsedUserspaceConfig {
     private_key: [u8; 32],
     addresses: Vec<String>,
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     dns_servers: Vec<String>,
     peer_public_key: [u8; 32],
     peer_preshared_key: Option<[u8; 32]>,

@@ -1,6 +1,7 @@
 use std::net::IpAddr;
 use std::process::Command;
 
+use crate::config;
 use crate::error::{AppError, Result};
 use crate::netns;
 use crate::privileged_client::PrivilegedClient;
@@ -19,6 +20,21 @@ pub fn up(
     server_display_name: &str,
     disable_ipv6: bool,
 ) -> Result<()> {
+    if cfg!(target_os = "macos") {
+        return up_macos(
+            params,
+            interface_name,
+            provider,
+            server_display_name,
+            disable_ipv6,
+        );
+    }
+    if !cfg!(target_os = "linux") {
+        return Err(AppError::WireGuard(
+            "kernel backend is only supported on linux and macos".to_string(),
+        ));
+    }
+
     info!(
         interface = interface_name,
         provider,
@@ -109,6 +125,13 @@ pub fn up_in_netns(
     interface_name: &str,
     namespace: &str,
 ) -> Result<()> {
+    if !cfg!(target_os = "linux") {
+        let _ = (params, interface_name, namespace);
+        return Err(AppError::WireGuard(
+            "kernel backend in network namespaces is only supported on linux".to_string(),
+        ));
+    }
+
     if let Some(mtu) = params.mtu {
         validate_mtu(mtu)?;
     }
@@ -275,6 +298,15 @@ pub fn up_in_netns(
 
 /// Tear down a kernel WireGuard tunnel.
 pub fn down(state: &ConnectionState) -> Result<()> {
+    if cfg!(target_os = "macos") {
+        return down_macos(state);
+    }
+    if !cfg!(target_os = "linux") {
+        return Err(AppError::WireGuard(
+            "kernel backend is only supported on linux and macos".to_string(),
+        ));
+    }
+
     let iface = &state.interface_name;
     let client = PrivilegedClient::new();
     let manage_resolv_conf = should_manage_global_resolv_conf();
@@ -495,6 +527,84 @@ fn bring_up(
         );
     }
 
+    Ok(())
+}
+
+fn provider_from_dir_name(name: &str) -> Option<config::Provider> {
+    match name {
+        "proton" => Some(config::Provider::Proton),
+        "airvpn" => Some(config::Provider::AirVpn),
+        "mullvad" => Some(config::Provider::Mullvad),
+        "ivpn" => Some(config::Provider::Ivpn),
+        "wgconf" => Some(config::Provider::Wgconf),
+        _ => None,
+    }
+}
+
+fn up_macos(
+    params: &WgConfigParams<'_>,
+    interface_name: &str,
+    provider: &str,
+    server_display_name: &str,
+    disable_ipv6: bool,
+) -> Result<()> {
+    if disable_ipv6 && has_ipv6_interface_address(params.addresses) {
+        return Err(AppError::WireGuard(
+            "--disable-ipv6 can only be used when Interface.Address has no IPv6 entry".into(),
+        ));
+    }
+    if let Some(mtu) = params.mtu {
+        validate_mtu(mtu)?;
+    }
+
+    let provider = provider_from_dir_name(provider)
+        .ok_or_else(|| AppError::WireGuard(format!("unsupported provider {:?}", provider)))?;
+
+    let wg_config = super::config::generate_config(params);
+    let effective_iface = super::wg_quick::up(&wg_config, interface_name, provider, false)?;
+
+    let state = ConnectionState {
+        instance_name: DIRECT_INSTANCE.to_string(),
+        provider: provider.dir_name().to_string(),
+        interface_name: effective_iface,
+        backend: WgBackend::Kernel,
+        server_endpoint: format!("{}:{}", params.server_ip, params.server_port),
+        server_display_name: server_display_name.to_string(),
+        original_gateway_ip: None,
+        original_gateway_iface: None,
+        original_resolv_conf: None,
+        namespace_name: None,
+        proxy_pid: None,
+        socks_port: None,
+        http_port: None,
+        dns_servers: params.dns_servers.iter().map(|s| s.to_string()).collect(),
+        peer_public_key: None,
+        local_public_key: None,
+        virtual_ips: vec![],
+        keepalive_secs: None,
+    };
+    state.save()?;
+
+    info!(
+        interface = state.interface_name,
+        provider = state.provider,
+        server = server_display_name,
+        "kernel_tunnel_setup_complete_macos"
+    );
+    Ok(())
+}
+
+fn down_macos(state: &ConnectionState) -> Result<()> {
+    let provider = provider_from_dir_name(&state.provider)
+        .ok_or_else(|| AppError::WireGuard(format!("unsupported provider {:?}", state.provider)))?;
+    super::wg_quick::down(&state.interface_name, provider)?;
+    ConnectionState::remove(&state.instance_name)?;
+    info!(
+        interface = state.interface_name,
+        provider = state.provider,
+        server = state.server_display_name,
+        "kernel_tunnel_teardown_complete_macos"
+    );
     Ok(())
 }
 

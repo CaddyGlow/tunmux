@@ -10,6 +10,7 @@ pub fn delete(_name: &str) -> Result<()> {
     Ok(())
 }
 
+#[allow(dead_code)]
 pub fn exists(_name: &str) -> bool {
     false
 }
@@ -24,6 +25,7 @@ pub fn remove_namespace_dir(_namespace: &str) -> Result<()> {
     Ok(())
 }
 
+#[allow(dead_code)]
 pub fn enter(_name: &str) -> Result<()> {
     Err(AppError::Namespace(
         "network namespace operations are supported only on Linux".into(),

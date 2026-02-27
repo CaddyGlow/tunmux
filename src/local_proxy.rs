@@ -9,6 +9,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::Context;
 use base64::Engine as _;
+use nix::libc;
 use tracing::debug;
 
 use crate::config;
@@ -153,7 +154,7 @@ pub fn spawn_daemon(
     while Instant::now() < deadline {
         if let Ok(text) = std::fs::read_to_string(&pid_path) {
             if let Ok(pid) = text.trim().parse::<u32>() {
-                if std::path::Path::new(&format!("/proc/{}/exe", pid)).exists() {
+                if proc_alive(pid) {
                     if wait_for_startup_ready(&status_path, Duration::from_secs(12)) {
                         debug!(pid = ?pid, instance = ?instance, "local_proxy_daemon_ready");
                         return Ok(pid);
@@ -240,7 +241,11 @@ pub fn stop_daemon(pid: u32) -> anyhow::Result<()> {
 }
 
 fn proc_alive(pid: u32) -> bool {
-    std::path::Path::new(&format!("/proc/{}", pid)).exists()
+    let rc = unsafe { libc::kill(pid as libc::pid_t, 0) };
+    if rc == 0 {
+        return true;
+    }
+    std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
 }
 
 fn self_executable() -> anyhow::Result<std::path::PathBuf> {

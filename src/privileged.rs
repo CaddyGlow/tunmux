@@ -7,6 +7,7 @@ use std::os::unix::process::CommandExt;
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
+use nix::libc;
 use nix::sys::signal::{kill, Signal};
 #[cfg(target_os = "linux")]
 use nix::sys::socket::{getsockopt, sockopt::PeerCredentials};
@@ -1338,7 +1339,7 @@ fn wait_for_pid_file(pid_file: &str, timeout: Duration) -> Result<u32> {
     while Instant::now().duration_since(start) < timeout {
         if let Ok(pid_text) = std::fs::read_to_string(pid_file) {
             if let Ok(pid) = pid_text.trim().parse::<u32>() {
-                if std::path::Path::new(&format!("/proc/{}/exe", pid)).exists() {
+                if pid_is_alive(pid) {
                     return Ok(pid);
                 }
             }
@@ -1370,7 +1371,7 @@ fn terminate_managed_process(pid: u32) {
     let _ = kill(target, Signal::SIGTERM);
     for _ in 0..20 {
         std::thread::sleep(Duration::from_millis(100));
-        if !std::path::Path::new(&format!("/proc/{pid}")).exists() {
+        if !pid_is_alive(pid) {
             return;
         }
     }
@@ -1509,6 +1510,7 @@ fn managed_pid_is_current(pid: u32) -> Result<bool> {
 
     match process_start_ticks(pid) {
         Some(current) if current == expected => Ok(true),
+        None if expected == 0 && pid_is_alive(pid) => Ok(true),
         _ => {
             let _ = unregister_managed_pid(pid);
             Ok(false)
@@ -1548,11 +1550,21 @@ fn lease_token_is_live(token: &str) -> bool {
         Some(start) => start,
         None => return false,
     };
-    process_start_ticks(pid)
-        .map(|current| current == start_ticks)
-        .unwrap_or(false)
+    match process_start_ticks(pid) {
+        Some(current) => current == start_ticks,
+        None => start_ticks == 0 && pid_is_alive(pid),
+    }
 }
 
+fn pid_is_alive(pid: u32) -> bool {
+    let rc = unsafe { libc::kill(pid as libc::pid_t, 0) };
+    if rc == 0 {
+        return true;
+    }
+    std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+}
+
+#[cfg(target_os = "linux")]
 fn process_start_ticks(pid: u32) -> Option<u64> {
     let path = format!("/proc/{}/stat", pid);
     let stat = std::fs::read_to_string(path).ok()?;
@@ -1560,6 +1572,11 @@ fn process_start_ticks(pid: u32) -> Option<u64> {
     let rest = stat.get(close + 2..)?;
     let fields: Vec<&str> = rest.split_whitespace().collect();
     fields.get(19)?.parse::<u64>().ok()
+}
+
+#[cfg(not(target_os = "linux"))]
+fn process_start_ticks(_pid: u32) -> Option<u64> {
+    None
 }
 
 fn categorize_error(error: &AppError) -> String {
