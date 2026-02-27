@@ -9,8 +9,6 @@ use base64::Engine;
 use std::fs::File;
 #[cfg(unix)]
 use std::io;
-#[cfg(target_os = "macos")]
-use std::net::Ipv4Addr;
 #[cfg(unix)]
 use std::net::{IpAddr, SocketAddr};
 #[cfg(unix)]
@@ -832,18 +830,9 @@ fn configure_network_macos(
         match ip {
             IpAddr::V4(addr) => {
                 let ip_string = addr.to_string();
-                let netmask = ipv4_prefix_to_netmask(prefix)?.to_string();
                 run_command(
                     "ifconfig",
-                    &[
-                        interface,
-                        "inet",
-                        ip_string.as_str(),
-                        ip_string.as_str(),
-                        "netmask",
-                        netmask.as_str(),
-                        "alias",
-                    ],
+                    &[interface, "inet", address, ip_string.as_str(), "alias"],
                 )?;
             }
             IpAddr::V6(addr) => {
@@ -1187,17 +1176,4 @@ fn parse_cidr(value: &str) -> anyhow::Result<(IpAddr, u8)> {
         .parse()
         .with_context(|| format!("invalid cidr prefix {}", prefix))?;
     Ok((ip, prefix))
-}
-
-#[cfg(target_os = "macos")]
-fn ipv4_prefix_to_netmask(prefix: u8) -> anyhow::Result<Ipv4Addr> {
-    if prefix > 32 {
-        anyhow::bail!("invalid IPv4 prefix {}", prefix);
-    }
-    let mask = if prefix == 0 {
-        0
-    } else {
-        u32::MAX << (32 - u32::from(prefix))
-    };
-    Ok(Ipv4Addr::from(mask))
 }
