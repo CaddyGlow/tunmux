@@ -3,13 +3,16 @@ use std::path::PathBuf;
 use crate::config;
 
 pub mod daemon {
+    #[allow(clippy::too_many_arguments)]
     pub fn run(
         _netns_name: &str,
+        _interface_name: &str,
         _socks_port: u16,
         _http_port: u16,
         _proxy_access_log: bool,
         _pid_file: &str,
         _log_file: &str,
+        _startup_status_file: &str,
     ) -> anyhow::Result<()> {
         anyhow::bail!("proxy mode is not compiled in (enable with --features proxy)")
     }

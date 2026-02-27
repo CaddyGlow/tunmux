@@ -1406,6 +1406,7 @@ fn resolve_authorized_group(cli_group: Option<String>) -> Option<String> {
     Some(AUTH_GROUP_NAME.to_string())
 }
 
+#[cfg(target_os = "linux")]
 fn is_authorized(peer_uid: u32, peer_gid: u32, authorized_group: Option<&str>) -> bool {
     if peer_uid == 0 {
         return true;

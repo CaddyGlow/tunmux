@@ -11,8 +11,10 @@ use std::io;
 use std::net::{IpAddr, SocketAddr};
 #[cfg(unix)]
 use std::os::unix::net::UnixDatagram;
+#[cfg(all(unix, target_os = "linux"))]
+use std::path::Path;
 #[cfg(unix)]
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 #[cfg(unix)]
 use std::process::Command;
 #[cfg(unix)]

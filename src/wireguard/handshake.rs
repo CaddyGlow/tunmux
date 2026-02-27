@@ -1,13 +1,18 @@
-use std::net::{IpAddr, SocketAddr, UdpSocket};
+use std::net::IpAddr;
+#[cfg(target_os = "linux")]
+use std::net::{SocketAddr, UdpSocket};
 #[cfg(target_os = "linux")]
 use std::thread;
+#[cfg(target_os = "linux")]
 use std::time::Duration;
 #[cfg(target_os = "linux")]
 use std::time::Instant;
 
 #[cfg(target_os = "linux")]
+use tracing::debug;
+#[cfg(target_os = "linux")]
 use tracing::info;
-use tracing::{debug, warn};
+use tracing::warn;
 
 #[cfg(target_os = "linux")]
 use crate::error::AppError;
@@ -15,7 +20,9 @@ use crate::error::Result;
 #[cfg(target_os = "linux")]
 use crate::privileged_client::PrivilegedClient;
 
+#[cfg(target_os = "linux")]
 const HANDSHAKE_WAIT_TIMEOUT: Duration = Duration::from_secs(12);
+#[cfg(target_os = "linux")]
 const HANDSHAKE_POLL_INTERVAL: Duration = Duration::from_millis(250);
 
 /// Wait until `wg show` reports at least one peer with a non-empty latest handshake.
@@ -87,6 +94,7 @@ pub fn dns_servers_from_config(config_content: &str) -> Vec<String> {
     }
 }
 
+#[cfg(any(target_os = "linux", test))]
 fn has_latest_handshake(output: &str) -> bool {
     output.lines().any(|line| {
         let trimmed = line.trim();
@@ -94,6 +102,7 @@ fn has_latest_handshake(output: &str) -> bool {
     })
 }
 
+#[cfg(target_os = "linux")]
 fn handshake_timeout_detail(last_output: &str) -> String {
     if last_output.trim().is_empty() {
         return String::new();
@@ -106,6 +115,7 @@ fn handshake_timeout_detail(last_output: &str) -> String {
     format!(". Last `wg show` output:\n{}", lines.join("\n"))
 }
 
+#[cfg(target_os = "linux")]
 fn nudge_tunnel_traffic(dns_servers: &[String]) {
     let mut sent_any = false;
 
@@ -127,6 +137,7 @@ fn nudge_tunnel_traffic(dns_servers: &[String]) {
     let _ = nudge_ip(IpAddr::V4(std::net::Ipv4Addr::new(8, 8, 8, 8)));
 }
 
+#[cfg(target_os = "linux")]
 fn nudge_ip(ip: IpAddr) -> std::io::Result<()> {
     let bind_addr = match ip {
         IpAddr::V4(_) => "0.0.0.0:0",
