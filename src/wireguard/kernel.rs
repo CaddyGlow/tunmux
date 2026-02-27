@@ -2,8 +2,8 @@ use std::net::IpAddr;
 use std::process::Command;
 
 use crate::error::{AppError, Result};
-use crate::netns;
 use crate::privileged_client::PrivilegedClient;
+use crate::{config, netns};
 use tracing::{debug, info, warn};
 
 use super::backend::WgBackend;
@@ -545,13 +545,14 @@ fn up_macos(
         validate_mtu(mtu)?;
     }
 
+    let provider = provider_from_dir_name(provider)?;
     let wg_config = super::config::generate_config(params);
-    super::userspace::up(&wg_config, interface_name)?;
+    let effective_interface = super::wg_quick::up(&wg_config, interface_name, provider, false)?;
 
     let state = ConnectionState {
         instance_name: DIRECT_INSTANCE.to_string(),
-        provider: provider.to_string(),
-        interface_name: interface_name.to_string(),
+        provider: provider.dir_name().to_string(),
+        interface_name: effective_interface,
         backend: WgBackend::Kernel,
         server_endpoint: format!("{}:{}", params.server_ip, params.server_port),
         server_display_name: server_display_name.to_string(),
@@ -580,7 +581,8 @@ fn up_macos(
 }
 
 fn down_macos(state: &ConnectionState) -> Result<()> {
-    super::userspace::down(&state.interface_name)?;
+    let provider = provider_from_dir_name(&state.provider)?;
+    super::wg_quick::down(&state.interface_name, provider)?;
     ConnectionState::remove(&state.instance_name)?;
     info!(
         interface = state.interface_name,
@@ -589,6 +591,20 @@ fn down_macos(state: &ConnectionState) -> Result<()> {
         "kernel_tunnel_teardown_complete_macos"
     );
     Ok(())
+}
+
+fn provider_from_dir_name(provider: &str) -> Result<config::Provider> {
+    match provider {
+        "proton" => Ok(config::Provider::Proton),
+        "airvpn" => Ok(config::Provider::AirVpn),
+        "mullvad" => Ok(config::Provider::Mullvad),
+        "ivpn" => Ok(config::Provider::Ivpn),
+        "wgconf" => Ok(config::Provider::Wgconf),
+        other => Err(AppError::WireGuard(format!(
+            "unknown provider '{}': expected proton|airvpn|mullvad|ivpn|wgconf",
+            other
+        ))),
+    }
 }
 
 fn should_manage_global_resolv_conf() -> bool {
