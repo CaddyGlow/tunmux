@@ -38,6 +38,8 @@ use gotatun::x25519::{PublicKey, StaticSecret};
 use tokio::signal::unix::{signal, SignalKind};
 #[cfg(unix)]
 use tracing::info;
+#[cfg(target_os = "macos")]
+use tracing::warn;
 
 #[cfg(unix)]
 const READY_OK: &[u8] = &[1];
@@ -853,6 +855,13 @@ fn configure_network_macos(
         }
     }
     run_command("ifconfig", &[interface, "up"])?;
+    if let Err(error) = run_command("ifconfig", &[interface, "-rxcsum", "-txcsum"]) {
+        warn!(
+            interface,
+            error = %error,
+            "userspace_helper_disable_checksum_offload_failed"
+        );
+    }
 
     let endpoint_is_ipv6 = matches!(config.endpoint.ip(), IpAddr::V6(_));
     if !endpoint_is_ipv6 || has_ipv6_address {
