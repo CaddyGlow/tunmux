@@ -1,7 +1,6 @@
 use std::net::IpAddr;
 use std::process::Command;
 
-use crate::config;
 use crate::error::{AppError, Result};
 use crate::netns;
 use crate::privileged_client::PrivilegedClient;
@@ -530,17 +529,6 @@ fn bring_up(
     Ok(())
 }
 
-fn provider_from_dir_name(name: &str) -> Option<config::Provider> {
-    match name {
-        "proton" => Some(config::Provider::Proton),
-        "airvpn" => Some(config::Provider::AirVpn),
-        "mullvad" => Some(config::Provider::Mullvad),
-        "ivpn" => Some(config::Provider::Ivpn),
-        "wgconf" => Some(config::Provider::Wgconf),
-        _ => None,
-    }
-}
-
 fn up_macos(
     params: &WgConfigParams<'_>,
     interface_name: &str,
@@ -557,16 +545,13 @@ fn up_macos(
         validate_mtu(mtu)?;
     }
 
-    let provider = provider_from_dir_name(provider)
-        .ok_or_else(|| AppError::WireGuard(format!("unsupported provider {:?}", provider)))?;
-
     let wg_config = super::config::generate_config(params);
-    let effective_iface = super::wg_quick::up(&wg_config, interface_name, provider, false)?;
+    super::userspace::up(&wg_config, interface_name)?;
 
     let state = ConnectionState {
         instance_name: DIRECT_INSTANCE.to_string(),
-        provider: provider.dir_name().to_string(),
-        interface_name: effective_iface,
+        provider: provider.to_string(),
+        interface_name: interface_name.to_string(),
         backend: WgBackend::Kernel,
         server_endpoint: format!("{}:{}", params.server_ip, params.server_port),
         server_display_name: server_display_name.to_string(),
@@ -595,9 +580,7 @@ fn up_macos(
 }
 
 fn down_macos(state: &ConnectionState) -> Result<()> {
-    let provider = provider_from_dir_name(&state.provider)
-        .ok_or_else(|| AppError::WireGuard(format!("unsupported provider {:?}", state.provider)))?;
-    super::wg_quick::down(&state.interface_name, provider)?;
+    super::userspace::down(&state.interface_name)?;
     ConnectionState::remove(&state.instance_name)?;
     info!(
         interface = state.interface_name,

@@ -17,6 +17,13 @@ pub fn resolve_connect_backend(
 ) -> anyhow::Result<WgBackend> {
     let backend_str = backend_arg.unwrap_or(default_backend);
 
+    #[cfg(target_os = "macos")]
+    let backend_str = if backend_str == "wg-quick" {
+        "userspace"
+    } else {
+        backend_str
+    };
+
     if use_proxy && use_local_proxy {
         anyhow::bail!("--proxy and --local-proxy are mutually exclusive");
     }

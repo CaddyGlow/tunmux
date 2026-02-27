@@ -74,7 +74,7 @@ pub enum CredentialStore {
 fn default_backend() -> &'static str {
     #[cfg(target_os = "macos")]
     {
-        "wg-quick"
+        "userspace"
     }
     #[cfg(all(unix, not(target_os = "macos")))]
     {
