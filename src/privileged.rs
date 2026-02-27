@@ -286,6 +286,7 @@ fn handle_client(
 
         #[cfg(not(target_os = "linux"))]
         {
+            let _ = authorized_group;
             (0u32, 0u32)
         }
     };

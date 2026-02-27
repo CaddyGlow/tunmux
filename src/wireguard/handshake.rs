@@ -1,10 +1,18 @@
 use std::net::{IpAddr, SocketAddr, UdpSocket};
+#[cfg(target_os = "linux")]
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::Duration;
+#[cfg(target_os = "linux")]
+use std::time::Instant;
 
-use tracing::{debug, info, warn};
+#[cfg(target_os = "linux")]
+use tracing::info;
+use tracing::{debug, warn};
 
-use crate::error::{AppError, Result};
+#[cfg(target_os = "linux")]
+use crate::error::AppError;
+use crate::error::Result;
+#[cfg(target_os = "linux")]
 use crate::privileged_client::PrivilegedClient;
 
 const HANDSHAKE_WAIT_TIMEOUT: Duration = Duration::from_secs(12);

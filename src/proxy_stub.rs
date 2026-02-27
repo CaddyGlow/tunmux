@@ -67,6 +67,7 @@ pub fn local_log_file(instance: &str) -> PathBuf {
 /// Spawn the proxy daemon through the privileged service.
 pub fn spawn_daemon(
     _instance: &str,
+    _interface_name: &str,
     _netns_name: &str,
     _proxy_config: &ProxyConfig,
 ) -> anyhow::Result<u32> {
