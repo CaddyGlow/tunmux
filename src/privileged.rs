@@ -1153,10 +1153,16 @@ fn run_gotatun_up(interface: &str, config_content: &str) -> Result<()> {
         cmd = format!("{} {} [TUNMUX_GOTATUN_HELPER=1]", exe.display(), interface),
         "exec"
     );
-    let status = Command::new(exe)
+    let mut command = Command::new(exe);
+    command
         .env("TUNMUX_GOTATUN_HELPER", "1")
         .env("TUNMUX_GOTATUN_CONFIG_B64", config_b64)
-        .arg(interface)
+        .arg(interface);
+    #[cfg(target_os = "macos")]
+    {
+        command.env("TUNMUX_GOTATUN_DIAG", "1");
+    }
+    let status = command
         .status()
         .map_err(|e| AppError::Other(format!("gotatun up failed to start: {}", e)))?;
 

@@ -11,6 +11,8 @@ use std::fs::File;
 use std::io;
 #[cfg(unix)]
 use std::net::{IpAddr, SocketAddr};
+#[cfg(target_os = "macos")]
+use std::net::{Ipv4Addr, Ipv6Addr, UdpSocket};
 #[cfg(unix)]
 use std::os::unix::net::UnixDatagram;
 #[cfg(all(unix, target_os = "linux"))]
@@ -56,6 +58,8 @@ const CONFIG_B64_ENV: &str = "TUNMUX_GOTATUN_CONFIG_B64";
 struct RunningDevice {
     #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     interface_name: String,
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    control_interface_name: String,
     control_socket_path: PathBuf,
     device: Device<DefaultDeviceTransports>,
     cleanup: CleanupState,
@@ -271,6 +275,7 @@ async fn start_device(interface: &str) -> anyhow::Result<RunningDevice> {
     let control_socket_path = PathBuf::from(SOCK_DIR).join(format!("{}.sock", interface));
     Ok(RunningDevice {
         interface_name,
+        control_interface_name: interface.to_string(),
         control_socket_path,
         device,
         cleanup,
@@ -282,6 +287,12 @@ async fn wait_for_shutdown(running: &RunningDevice) -> anyhow::Result<()> {
     let mut sigint = signal(SignalKind::interrupt()).context("failed to set SIGINT handler")?;
     let mut sigterm = signal(SignalKind::terminate()).context("failed to set SIGTERM handler")?;
     let mut ticker = tokio::time::interval(Duration::from_secs(1));
+    #[cfg(target_os = "macos")]
+    let diag_enabled = std::env::var_os("TUNMUX_GOTATUN_DIAG").is_some();
+    #[cfg(target_os = "macos")]
+    let mut next_diag_at = std::time::Instant::now();
+    #[cfg(target_os = "macos")]
+    let mut last_transfer: Option<(u64, u64)> = None;
 
     loop {
         tokio::select! {
@@ -299,11 +310,121 @@ async fn wait_for_shutdown(running: &RunningDevice) -> anyhow::Result<()> {
                         break;
                     }
                 }
+
+                #[cfg(target_os = "macos")]
+                {
+                    if diag_enabled && std::time::Instant::now() >= next_diag_at {
+                        next_diag_at = std::time::Instant::now() + Duration::from_secs(5);
+                        log_macos_dataplane_probe(
+                            &running.control_interface_name,
+                            &mut last_transfer,
+                        );
+                    }
+                }
             }
         }
     }
 
     Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn log_macos_dataplane_probe(interface: &str, last_transfer: &mut Option<(u64, u64)>) {
+    let ipv4_probe_sent = send_udp_probe(SocketAddr::from((Ipv4Addr::new(8, 8, 8, 8), 53)));
+    let ipv6_probe_sent = send_udp_probe(SocketAddr::from((
+        Ipv6Addr::new(0x2001, 0x4860, 0x4860, 0, 0, 0, 0, 0x8888),
+        53,
+    )));
+
+    match read_wg_transfer_bytes(interface) {
+        Ok(Some((rx_bytes, tx_bytes))) => {
+            let (delta_rx_bytes, delta_tx_bytes) = last_transfer
+                .map(|(prev_rx, prev_tx)| {
+                    (
+                        rx_bytes.saturating_sub(prev_rx),
+                        tx_bytes.saturating_sub(prev_tx),
+                    )
+                })
+                .unwrap_or((0, 0));
+            *last_transfer = Some((rx_bytes, tx_bytes));
+            info!(
+                interface,
+                ipv4_probe_sent,
+                ipv6_probe_sent,
+                rx_bytes,
+                tx_bytes,
+                delta_rx_bytes,
+                delta_tx_bytes,
+                "userspace_helper_dataplane_probe"
+            );
+        }
+        Ok(None) => {
+            info!(
+                interface,
+                ipv4_probe_sent, ipv6_probe_sent, "userspace_helper_dataplane_probe_no_transfer"
+            );
+        }
+        Err(error) => {
+            warn!(
+                interface,
+                ipv4_probe_sent,
+                ipv6_probe_sent,
+                error = %error,
+                "userspace_helper_dataplane_probe_failed"
+            );
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn send_udp_probe(target: SocketAddr) -> bool {
+    let bind = if target.is_ipv4() {
+        "0.0.0.0:0"
+    } else {
+        "[::]:0"
+    };
+    let Ok(socket) = UdpSocket::bind(bind) else {
+        return false;
+    };
+    socket.send_to(&[0], target).is_ok()
+}
+
+#[cfg(target_os = "macos")]
+fn read_wg_transfer_bytes(interface: &str) -> anyhow::Result<Option<(u64, u64)>> {
+    let output = Command::new("wg")
+        .args(["show", interface, "transfer"])
+        .output()
+        .context("failed to run wg show transfer")?;
+    if !output.status.success() {
+        anyhow::bail!("wg show {} transfer failed", interface);
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let mut parsed_any = false;
+    let mut rx_total: u64 = 0;
+    let mut tx_total: u64 = 0;
+
+    for line in stdout.lines() {
+        let fields: Vec<&str> = line.split_whitespace().collect();
+        if fields.len() < 3 {
+            continue;
+        }
+        let Ok(rx) = fields[1].parse::<u64>() else {
+            continue;
+        };
+        let Ok(tx) = fields[2].parse::<u64>() else {
+            continue;
+        };
+        parsed_any = true;
+        rx_total = rx_total.saturating_add(rx);
+        tx_total = tx_total.saturating_add(tx);
+    }
+
+    if parsed_any {
+        Ok(Some((rx_total, tx_total)))
+    } else {
+        Ok(None)
+    }
 }
 
 #[cfg(unix)]
