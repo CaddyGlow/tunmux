@@ -784,6 +784,10 @@ fn configure_network_macos(
     config: &ParsedUserspaceConfig,
 ) -> anyhow::Result<MacosCleanupState> {
     let mut routes_added = Vec::new();
+    let has_ipv4_address = config
+        .addresses
+        .iter()
+        .any(|address| !address.contains(':'));
     let has_ipv6_address = config.addresses.iter().any(|address| address.contains(':'));
     for address in &config.addresses {
         let (ip, prefix) = parse_cidr(address)?;
@@ -792,13 +796,7 @@ fn configure_network_macos(
                 let ip_string = addr.to_string();
                 run_command(
                     "ifconfig",
-                    &[
-                        interface,
-                        "inet",
-                        ip_string.as_str(),
-                        ip_string.as_str(),
-                        "alias",
-                    ],
+                    &[interface, "inet", address, ip_string.as_str(), "alias"],
                 )?;
             }
             IpAddr::V6(addr) => {
@@ -835,7 +833,7 @@ fn configure_network_macos(
         }
     }
 
-    for route in macos_allowed_routes(config, interface, has_ipv6_address) {
+    for route in macos_allowed_routes(config, interface, has_ipv4_address, has_ipv6_address) {
         if add_macos_route(&route)? {
             routes_added.push(route);
         }
@@ -864,23 +862,17 @@ fn add_macos_route(route: &MacosRoute) -> anyhow::Result<bool> {
         args.push(interface.clone());
     }
     let refs: Vec<&str> = args.iter().map(String::as_str).collect();
-    if run_command_with_exists_ok("route", &refs)? {
-        return Ok(true);
-    }
-
-    // If a split-route destination already exists (often from a stale utun),
-    // replace it so the new tunnel interface becomes active.
+    // Split routes (dev-bound, no explicit gateway) can linger on stale utun
+    // devices; clear any existing entry first so this tunnel owns the route.
     if route.interface.is_some() && route.gateway.is_none() {
         let mut delete_args: Vec<String> = vec!["-q".into(), "-n".into(), "delete".into()];
         delete_args.push(if route.is_ipv6 { "-inet6" } else { "-inet" }.into());
         delete_args.push(route.destination.clone());
         let delete_refs: Vec<&str> = delete_args.iter().map(String::as_str).collect();
         let _ = run_command("route", &delete_refs);
-        run_command("route", &refs)?;
-        return Ok(true);
     }
 
-    Ok(false)
+    run_command_with_exists_ok("route", &refs)
 }
 
 #[cfg(target_os = "macos")]
@@ -903,12 +895,16 @@ fn del_macos_route(route: &MacosRoute) -> anyhow::Result<()> {
 fn macos_allowed_routes(
     config: &ParsedUserspaceConfig,
     interface: &str,
+    has_ipv4_address: bool,
     has_ipv6_address: bool,
 ) -> Vec<MacosRoute> {
     let mut routes = Vec::new();
     for allowed in &config.allowed_ips {
         match allowed.as_str() {
             "0.0.0.0/0" => {
+                if !has_ipv4_address {
+                    continue;
+                }
                 routes.push(MacosRoute {
                     is_ipv6: false,
                     destination: "0.0.0.0/1".to_string(),
@@ -941,6 +937,9 @@ fn macos_allowed_routes(
             }
             other => {
                 if other.contains(':') && !has_ipv6_address {
+                    continue;
+                }
+                if !other.contains(':') && !has_ipv4_address {
                     continue;
                 }
                 routes.push(MacosRoute {
