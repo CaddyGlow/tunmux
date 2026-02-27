@@ -864,7 +864,23 @@ fn add_macos_route(route: &MacosRoute) -> anyhow::Result<bool> {
         args.push(interface.clone());
     }
     let refs: Vec<&str> = args.iter().map(String::as_str).collect();
-    run_command_with_exists_ok("route", &refs)
+    if run_command_with_exists_ok("route", &refs)? {
+        return Ok(true);
+    }
+
+    // If a split-route destination already exists (often from a stale utun),
+    // replace it so the new tunnel interface becomes active.
+    if route.interface.is_some() && route.gateway.is_none() {
+        let mut delete_args: Vec<String> = vec!["-q".into(), "-n".into(), "delete".into()];
+        delete_args.push(if route.is_ipv6 { "-inet6" } else { "-inet" }.into());
+        delete_args.push(route.destination.clone());
+        let delete_refs: Vec<&str> = delete_args.iter().map(String::as_str).collect();
+        let _ = run_command("route", &delete_refs);
+        run_command("route", &refs)?;
+        return Ok(true);
+    }
+
+    Ok(false)
 }
 
 #[cfg(target_os = "macos")]
