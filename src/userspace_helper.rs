@@ -288,11 +288,17 @@ async fn wait_for_shutdown(running: &RunningDevice) -> anyhow::Result<()> {
     let mut sigterm = signal(SignalKind::terminate()).context("failed to set SIGTERM handler")?;
     let mut ticker = tokio::time::interval(Duration::from_secs(1));
     #[cfg(target_os = "macos")]
-    let diag_enabled = std::env::var_os("TUNMUX_GOTATUN_DIAG").is_some();
+    let diag_enabled = true;
     #[cfg(target_os = "macos")]
     let mut next_diag_at = std::time::Instant::now();
     #[cfg(target_os = "macos")]
     let mut last_transfer: Option<(u64, u64)> = None;
+
+    #[cfg(target_os = "macos")]
+    info!(
+        interface = running.control_interface_name,
+        "userspace_helper_dataplane_probe_enabled"
+    );
 
     loop {
         tokio::select! {
