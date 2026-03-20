@@ -594,17 +594,17 @@ fn connect_proxy(
     let proxy_config =
         connection_ops::resolve_proxy_config(socks_port_arg, http_port_arg, proxy_access_log)?;
     let display_name = format!("{} [{}]", server_name, country_code);
-    connection_ops::connect_proxy_via_netns(
-        PROVIDER,
-        &instance,
-        &display_name,
-        server_ip,
-        &format!("{}:{}", params.server_ip, params.server_port),
-        params.dns_servers.iter().map(|s| s.to_string()).collect(),
+    connection_ops::connect_proxy_via_netns(&connection_ops::ConnectContext {
+        provider: PROVIDER,
+        instance: &instance,
+        display_name: &display_name,
+        connect_endpoint: server_ip,
+        state_endpoint: &format!("{}:{}", params.server_ip, params.server_port),
+        dns_servers: params.dns_servers.iter().map(|s| s.to_string()).collect(),
         params,
-        &proxy_config,
+        proxy_config: &proxy_config,
         config,
-    )
+    })
 }
 
 fn connect_local_proxy(
@@ -620,19 +620,19 @@ fn connect_local_proxy(
 
     let proxy_config =
         connection_ops::resolve_proxy_config(socks_port_arg, http_port_arg, proxy_access_log)?;
-    connection_ops::connect_local_proxy_instance(
-        PROVIDER,
-        &instance,
-        server_name,
-        params.server_ip,
-        &format!("{}:{}", params.server_ip, params.server_port),
-        params.dns_servers.iter().map(|s| s.to_string()).collect(),
-        params.addresses.iter().map(|s| s.to_string()).collect(),
-        params.server_public_key,
+    connection_ops::connect_local_proxy_instance(&connection_ops::LocalProxyContext {
+        provider: PROVIDER,
+        instance: &instance,
+        display_name: server_name,
+        connect_endpoint: params.server_ip,
+        state_endpoint: &format!("{}:{}", params.server_ip, params.server_port),
+        dns_servers: params.dns_servers.iter().map(|s| s.to_string()).collect(),
+        virtual_ips: params.addresses.iter().map(|s| s.to_string()).collect(),
+        peer_public_key: params.server_public_key,
         params,
-        &proxy_config,
+        proxy_config: &proxy_config,
         config,
-    )
+    })
 }
 
 fn connect_direct(

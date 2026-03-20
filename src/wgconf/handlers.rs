@@ -303,17 +303,17 @@ fn connect_proxy(
     };
 
     let endpoint = format_endpoint(&routed.server_ip, routed.server_port);
-    connection_ops::connect_proxy_via_netns(
-        PROVIDER,
-        &instance,
-        &source.display_name,
-        &endpoint,
-        &endpoint,
-        routed.dns_servers.clone(),
-        &params,
-        &proxy_config,
+    connection_ops::connect_proxy_via_netns(&connection_ops::ConnectContext {
+        provider: PROVIDER,
+        instance: &instance,
+        display_name: &source.display_name,
+        connect_endpoint: &endpoint,
+        state_endpoint: &endpoint,
+        dns_servers: routed.dns_servers.clone(),
+        params: &params,
+        proxy_config: &proxy_config,
         config,
-    )
+    })
 }
 
 fn connect_local_proxy(
@@ -346,19 +346,19 @@ fn connect_local_proxy(
     };
 
     let endpoint = format_endpoint(&routed.server_ip, routed.server_port);
-    connection_ops::connect_local_proxy_instance(
-        PROVIDER,
-        &instance,
-        &source.display_name,
-        &endpoint,
-        &endpoint,
-        routed.dns_servers.clone(),
-        routed.addresses.clone(),
-        &routed.server_public_key,
-        &params,
-        &proxy_config,
+    connection_ops::connect_local_proxy_instance(&connection_ops::LocalProxyContext {
+        provider: PROVIDER,
+        instance: &instance,
+        display_name: &source.display_name,
+        connect_endpoint: &endpoint,
+        state_endpoint: &endpoint,
+        dns_servers: routed.dns_servers.clone(),
+        virtual_ips: routed.addresses.clone(),
+        peer_public_key: &routed.server_public_key,
+        params: &params,
+        proxy_config: &proxy_config,
         config,
-    )
+    })
 }
 
 fn cmd_disconnect(instance: Option<String>, all: bool, config: &AppConfig) -> anyhow::Result<()> {

@@ -5,3 +5,10 @@ target
 CLAUDE.md
 README.md
 systemd
+android
+nix
+scripts
+.direnv
+.envrc
+flake.nix
+flake.lock

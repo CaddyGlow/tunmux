@@ -538,13 +538,13 @@ fn run_local_proxy_daemon(pid_file: &str, log_file: &str, config_b64: &str) -> a
     std::fs::write(pid_file, pid.to_string())?;
     {
         use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(pid_file, std::fs::Permissions::from_mode(0o644))?;
+        std::fs::set_permissions(pid_file, std::fs::Permissions::from_mode(0o600))?;
     }
     let startup_status_file = format!("{}.status", pid_file);
     std::fs::write(&startup_status_file, "starting\n")?;
     {
         use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&startup_status_file, std::fs::Permissions::from_mode(0o644))?;
+        std::fs::set_permissions(&startup_status_file, std::fs::Permissions::from_mode(0o600))?;
     }
 
     let workers = std::thread::available_parallelism()

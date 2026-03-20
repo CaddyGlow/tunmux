@@ -248,18 +248,30 @@ pub fn resolve_proxy_config(
     Ok(auto)
 }
 
-#[allow(clippy::too_many_arguments)]
-pub fn connect_proxy_via_netns(
-    provider: Provider,
-    instance: &str,
-    display_name: &str,
-    connect_endpoint: &str,
-    state_endpoint: &str,
-    dns_servers: Vec<String>,
-    params: &wireguard::config::WgConfigParams<'_>,
-    proxy_config: &proxy::ProxyConfig,
-    config: &AppConfig,
-) -> anyhow::Result<()> {
+pub struct ConnectContext<'a> {
+    pub provider: Provider,
+    pub instance: &'a str,
+    pub display_name: &'a str,
+    pub connect_endpoint: &'a str,
+    pub state_endpoint: &'a str,
+    pub dns_servers: Vec<String>,
+    pub params: &'a wireguard::config::WgConfigParams<'a>,
+    pub proxy_config: &'a proxy::ProxyConfig,
+    pub config: &'a AppConfig,
+}
+
+pub fn connect_proxy_via_netns(ctx: &ConnectContext<'_>) -> anyhow::Result<()> {
+    let ConnectContext {
+        provider,
+        instance,
+        display_name,
+        connect_endpoint,
+        state_endpoint,
+        ref dns_servers,
+        params,
+        proxy_config,
+        config,
+    } = *ctx;
     let interface_name = format!("wg-{}", instance);
     let namespace_name = format!("tunmux_{}", instance);
 
@@ -294,7 +306,7 @@ pub fn connect_proxy_via_netns(
         proxy_pid: Some(pid),
         socks_port: Some(proxy_config.socks_port),
         http_port: Some(proxy_config.http_port),
-        dns_servers,
+        dns_servers: dns_servers.clone(),
         peer_public_key: None,
         local_public_key: None,
         virtual_ips: vec![],
@@ -310,20 +322,34 @@ pub fn connect_proxy_via_netns(
     Ok(())
 }
 
-#[allow(clippy::too_many_arguments)]
-pub fn connect_local_proxy_instance(
-    provider: Provider,
-    instance: &str,
-    display_name: &str,
-    connect_endpoint: &str,
-    state_endpoint: &str,
-    dns_servers: Vec<String>,
-    virtual_ips: Vec<String>,
-    peer_public_key: &str,
-    params: &wireguard::config::WgConfigParams<'_>,
-    proxy_config: &proxy::ProxyConfig,
-    config: &AppConfig,
-) -> anyhow::Result<()> {
+pub struct LocalProxyContext<'a> {
+    pub provider: Provider,
+    pub instance: &'a str,
+    pub display_name: &'a str,
+    pub connect_endpoint: &'a str,
+    pub state_endpoint: &'a str,
+    pub dns_servers: Vec<String>,
+    pub virtual_ips: Vec<String>,
+    pub peer_public_key: &'a str,
+    pub params: &'a wireguard::config::WgConfigParams<'a>,
+    pub proxy_config: &'a proxy::ProxyConfig,
+    pub config: &'a AppConfig,
+}
+
+pub fn connect_local_proxy_instance(ctx: &LocalProxyContext<'_>) -> anyhow::Result<()> {
+    let LocalProxyContext {
+        provider,
+        instance,
+        display_name,
+        connect_endpoint,
+        state_endpoint,
+        ref dns_servers,
+        ref virtual_ips,
+        peer_public_key,
+        params,
+        proxy_config,
+        config,
+    } = *ctx;
     let cfg = local_proxy::local_proxy_config_from_params(
         params,
         Some(25),
@@ -350,10 +376,10 @@ pub fn connect_local_proxy_instance(
         proxy_pid: Some(pid),
         socks_port: Some(proxy_config.socks_port),
         http_port: Some(proxy_config.http_port),
-        dns_servers,
+        dns_servers: dns_servers.clone(),
         peer_public_key: Some(peer_public_key.to_string()),
         local_public_key,
-        virtual_ips,
+        virtual_ips: virtual_ips.clone(),
         keepalive_secs: cfg.keepalive,
     };
     state.save()?;

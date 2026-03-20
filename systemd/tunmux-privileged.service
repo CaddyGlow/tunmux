@@ -19,7 +19,7 @@ ProtectHome=true
 ProtectKernelTunables=true
 ProtectKernelModules=true
 
-RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX AF_NETLINK
 RuntimeDirectory=tunmux
 RuntimeDirectoryMode=0750
 StateDirectory=tunmux
@@ -29,6 +29,8 @@ SystemCallFilter=@system-service
 CapabilityBoundingSet=CAP_NET_ADMIN CAP_SYS_ADMIN CAP_DAC_OVERRIDE
 AmbientCapabilities=CAP_NET_ADMIN CAP_SYS_ADMIN CAP_DAC_OVERRIDE
 
+MemoryMax=256M
+TasksMax=64
 UMask=0077
 
 [Install]

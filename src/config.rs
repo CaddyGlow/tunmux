@@ -152,13 +152,27 @@ pub struct WgconfConfig {
 pub fn load_config() -> AppConfig {
     let path = app_config_dir().join("config.toml");
     match fs::read_to_string(&path) {
-        Ok(text) => toml::from_str(&text).unwrap_or_else(|e| {
-            tracing::warn!(
-                path = ?path.display().to_string(),
-                error = ?e.to_string(), "config_parse_failed");
+        Ok(text) => match toml::from_str(&text) {
+            Ok(cfg) => cfg,
+            Err(e) => {
+                eprintln!(
+                    "warning: failed to parse {}: {}\n\
+                     Using default configuration. Fix the file or remove it to silence this warning.",
+                    path.display(),
+                    e
+                );
+                AppConfig::default()
+            }
+        },
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => AppConfig::default(),
+        Err(e) => {
+            eprintln!(
+                "warning: unable to read {}: {}\nUsing default configuration.",
+                path.display(),
+                e
+            );
             AppConfig::default()
-        }),
-        Err(_) => AppConfig::default(),
+        }
     }
 }
 
