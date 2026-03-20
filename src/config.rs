@@ -366,6 +366,23 @@ pub fn load_provider_file(provider: Provider, filename: &str) -> Result<Option<V
     Ok(Some(fs::read(&path)?))
 }
 
+/// Save a serializable manifest to a provider's config directory.
+pub fn save_manifest<T: Serialize>(provider: Provider, filename: &str, manifest: &T) -> Result<()> {
+    let json = serde_json::to_string_pretty(manifest)?;
+    save_provider_file(provider, filename, json.as_bytes())
+}
+
+/// Load a deserializable manifest from a provider's config directory.
+pub fn load_manifest<T: DeserializeOwned>(provider: Provider, filename: &str) -> Result<T> {
+    let data = load_provider_file(provider, filename)?.ok_or_else(|| {
+        AppError::Other(format!(
+            "no cached manifest -- run `tunmux {} servers` first",
+            provider.dir_name()
+        ))
+    })?;
+    Ok(serde_json::from_slice(&data)?)
+}
+
 #[cfg(test)]
 mod tests {
     use super::{

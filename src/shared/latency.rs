@@ -148,6 +148,24 @@ fn is_reachable_connect_error(err: &std::io::Error) -> bool {
     )
 }
 
+/// Compare two optional latency durations. Measured values sort before `None`.
+pub fn latency_order(a: &Option<Duration>, b: &Option<Duration>) -> std::cmp::Ordering {
+    match (a, b) {
+        (Some(a), Some(b)) => a.cmp(b),
+        (Some(_), None) => std::cmp::Ordering::Less,
+        (None, Some(_)) => std::cmp::Ordering::Greater,
+        (None, None) => std::cmp::Ordering::Equal,
+    }
+}
+
+/// Format an optional latency as `"<N>ms"` or `"-"`.
+pub fn format_latency(latency: Option<Duration>) -> String {
+    match latency {
+        Some(value) => format!("{}ms", value.as_millis()),
+        None => "-".to_string(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

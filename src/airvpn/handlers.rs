@@ -5,12 +5,12 @@ use crate::cli::{AirVpnCommand, ApiKeyAction, DeviceAction, PortAction};
 use crate::config::{self, AppConfig, Provider};
 use crate::error;
 use crate::shared::connection_ops;
-use crate::shared::hooks;
-use crate::shared::latency;
+use crate::shared::latency::{self, format_latency, latency_order};
+use crate::shared::util::normalize_tags;
 use crate::wireguard;
 
 use super::api::AirVpnClient;
-use super::models::{AirManifest, AirServer, AirSession};
+use super::models::{AirServer, AirSession};
 use super::web::{AirVpnWeb, AirVpnWebApi};
 
 const PROVIDER: Provider = Provider::AirVpn;
@@ -321,21 +321,6 @@ async fn probe_airvpn_latencies(
     latencies
 }
 
-fn latency_order(a: &Option<Duration>, b: &Option<Duration>) -> Ordering {
-    match (a, b) {
-        (Some(a), Some(b)) => a.cmp(b),
-        (Some(_), None) => Ordering::Less,
-        (None, Some(_)) => Ordering::Greater,
-        (None, None) => Ordering::Equal,
-    }
-}
-
-fn format_latency(latency: Option<Duration>) -> String {
-    match latency {
-        Some(value) => format!("{}ms", value.as_millis()),
-        None => "-".to_string(),
-    }
-}
 
 #[allow(clippy::too_many_arguments)]
 async fn cmd_connect(
@@ -545,22 +530,11 @@ async fn cmd_connect(
             &params,
             backend,
             disable_ipv6,
+            config,
         )?;
-        if let Some(state) =
-            wireguard::connection::ConnectionState::load(wireguard::connection::DIRECT_INSTANCE)?
-        {
-            hooks::run_ifup(config, PROVIDER, &state);
-        }
     }
 
     Ok(())
-}
-
-fn normalize_tags(tags: &[String]) -> Vec<String> {
-    tags.iter()
-        .map(|tag| tag.trim().to_ascii_lowercase())
-        .filter(|tag| !tag.is_empty())
-        .collect()
 }
 
 fn airvpn_server_matches_tags(server: &super::models::AirServer, tags: &[String]) -> bool {
@@ -638,93 +612,22 @@ fn connect_local_proxy(
 fn connect_direct(
     server_name: &str,
     country_code: &str,
-    server_ip: &str,
-    server_port: u16,
+    _server_ip: &str,
+    _server_port: u16,
     params: &wireguard::config::WgConfigParams<'_>,
     backend: wireguard::backend::WgBackend,
     disable_ipv6: bool,
+    config: &AppConfig,
 ) -> anyhow::Result<()> {
-    use wireguard::connection::DIRECT_INSTANCE;
-
-    if wireguard::connection::ConnectionState::exists(DIRECT_INSTANCE) {
-        anyhow::bail!("Already connected via direct VPN. Disconnect first.");
-    }
-    if wireguard::wg_quick::is_interface_active(INTERFACE_NAME)
-        || wireguard::userspace::is_interface_active(INTERFACE_NAME)
-    {
-        anyhow::bail!("Already connected. Run `tunmux disconnect --provider airvpn` first.");
-    }
-
-    println!("Connecting to {} ({})...", server_name, server_ip);
-
-    match backend {
-        wireguard::backend::WgBackend::WgQuick => {
-            let wg_config = wireguard::config::generate_config(params);
-            let effective_iface =
-                wireguard::wg_quick::up(&wg_config, INTERFACE_NAME, PROVIDER, false)?;
-
-            let state = wireguard::connection::ConnectionState {
-                instance_name: DIRECT_INSTANCE.to_string(),
-                provider: PROVIDER.dir_name().to_string(),
-                interface_name: effective_iface,
-                backend,
-                server_endpoint: format!("{}:{}", server_ip, server_port),
-                server_display_name: server_name.to_string(),
-                original_gateway_ip: None,
-                original_gateway_iface: None,
-                original_resolv_conf: None,
-                namespace_name: None,
-                proxy_pid: None,
-                socks_port: None,
-                http_port: None,
-                dns_servers: params.dns_servers.iter().map(|s| s.to_string()).collect(),
-                peer_public_key: None,
-                local_public_key: None,
-                virtual_ips: vec![],
-                keepalive_secs: None,
-            };
-            state.save()?;
-        }
-        wireguard::backend::WgBackend::Userspace => {
-            let wg_config = wireguard::config::generate_config(params);
-            let effective_iface = wireguard::userspace::up(&wg_config, INTERFACE_NAME, PROVIDER)?;
-
-            let state = wireguard::connection::ConnectionState {
-                instance_name: DIRECT_INSTANCE.to_string(),
-                provider: PROVIDER.dir_name().to_string(),
-                interface_name: effective_iface,
-                backend,
-                server_endpoint: format!("{}:{}", server_ip, server_port),
-                server_display_name: server_name.to_string(),
-                original_gateway_ip: None,
-                original_gateway_iface: None,
-                original_resolv_conf: None,
-                namespace_name: None,
-                proxy_pid: None,
-                socks_port: None,
-                http_port: None,
-                dns_servers: params.dns_servers.iter().map(|s| s.to_string()).collect(),
-                peer_public_key: None,
-                local_public_key: None,
-                virtual_ips: vec![],
-                keepalive_secs: None,
-            };
-            state.save()?;
-        }
-        wireguard::backend::WgBackend::Kernel => {
-            wireguard::kernel::up(
-                params,
-                INTERFACE_NAME,
-                PROVIDER.dir_name(),
-                server_name,
-                disable_ipv6,
-            )?;
-        }
-        wireguard::backend::WgBackend::LocalProxy => {
-            anyhow::bail!("use --local-proxy flag to start userspace WireGuard proxy mode");
-        }
-    }
-
+    connection_ops::connect_direct_wg(
+        params,
+        backend,
+        INTERFACE_NAME,
+        PROVIDER,
+        server_name,
+        disable_ipv6,
+        config,
+    )?;
     println!(
         "Connected to {} ({}) [backend: {}]",
         server_name, country_code, backend
@@ -746,11 +649,7 @@ fn disconnect_one(
 }
 
 fn disconnect_instance_direct(config: &AppConfig) -> anyhow::Result<()> {
-    use wireguard::connection::DIRECT_INSTANCE;
-    if let Some(state) = wireguard::connection::ConnectionState::load(DIRECT_INSTANCE)? {
-        disconnect_one(&state, config)?;
-    }
-    Ok(())
+    connection_ops::disconnect_instance_direct(|state| disconnect_one(state, config))
 }
 
 async fn cmd_sessions(config: &AppConfig) -> anyhow::Result<()> {
@@ -1321,18 +1220,13 @@ fn resolve_protocol(name: &str) -> String {
     name.to_string()
 }
 
-fn save_manifest(manifest: &AirManifest) -> anyhow::Result<()> {
-    let json = serde_json::to_string_pretty(manifest)?;
-    config::save_provider_file(PROVIDER, MANIFEST_FILE, json.as_bytes())?;
+fn save_manifest(manifest: &super::models::AirManifest) -> anyhow::Result<()> {
+    config::save_manifest(PROVIDER, MANIFEST_FILE, manifest)?;
     Ok(())
 }
 
-fn load_manifest() -> anyhow::Result<AirManifest> {
-    let data = config::load_provider_file(PROVIDER, MANIFEST_FILE)?.ok_or_else(|| {
-        error::AppError::Other("no cached manifest -- run `tunmux airvpn login` first".into())
-    })?;
-    let manifest: AirManifest = serde_json::from_slice(&data)?;
-    Ok(manifest)
+fn load_manifest() -> anyhow::Result<super::models::AirManifest> {
+    Ok(config::load_manifest(PROVIDER, MANIFEST_FILE)?)
 }
 
 #[cfg(test)]

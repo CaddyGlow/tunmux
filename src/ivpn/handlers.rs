@@ -9,8 +9,9 @@ use crate::config::{self, AppConfig, Provider};
 use crate::error;
 use crate::shared::connection_ops;
 use crate::shared::crypto;
-use crate::shared::hooks;
 use crate::shared::latency;
+use crate::shared::latency::{format_latency, latency_order};
+use crate::shared::util::{ensure_cidr, normalize_tags, short_key};
 use crate::wireguard;
 
 const PROVIDER: Provider = Provider::Ivpn;
@@ -540,29 +541,6 @@ async fn cmd_servers(
     Ok(())
 }
 
-fn latency_order(a: &Option<Duration>, b: &Option<Duration>) -> std::cmp::Ordering {
-    match (a, b) {
-        (Some(a), Some(b)) => a.cmp(b),
-        (Some(_), None) => std::cmp::Ordering::Less,
-        (None, Some(_)) => std::cmp::Ordering::Greater,
-        (None, None) => std::cmp::Ordering::Equal,
-    }
-}
-
-fn format_latency(latency: Option<Duration>) -> String {
-    match latency {
-        Some(value) => format!("{}ms", value.as_millis()),
-        None => "-".to_string(),
-    }
-}
-
-fn normalize_tags(tags: &[String]) -> Vec<String> {
-    tags.iter()
-        .map(|tag| tag.trim().to_ascii_lowercase())
-        .filter(|tag| !tag.is_empty())
-        .collect()
-}
-
 fn ivpn_matches_tags(
     server: &IvpnWireGuardServer,
     host: &IvpnWireGuardHost,
@@ -786,91 +764,15 @@ fn connect_direct(
     disable_ipv6: bool,
     config: &AppConfig,
 ) -> anyhow::Result<()> {
-    use wireguard::connection::DIRECT_INSTANCE;
-
-    if wireguard::connection::ConnectionState::exists(DIRECT_INSTANCE) {
-        anyhow::bail!("Already connected via direct VPN. Disconnect first.");
-    }
-    if wireguard::wg_quick::is_interface_active(INTERFACE_NAME)
-        || wireguard::userspace::is_interface_active(INTERFACE_NAME)
-    {
-        anyhow::bail!("Already connected. Run `tunmux disconnect --provider ivpn` first.");
-    }
-
-    println!("Connecting to {} ({})...", host.hostname, params.server_ip);
-
-    match backend {
-        wireguard::backend::WgBackend::WgQuick => {
-            let wg_config = wireguard::config::generate_config(params);
-            let effective_iface =
-                wireguard::wg_quick::up(&wg_config, INTERFACE_NAME, PROVIDER, false)?;
-
-            let state = wireguard::connection::ConnectionState {
-                instance_name: DIRECT_INSTANCE.to_string(),
-                provider: PROVIDER.dir_name().to_string(),
-                interface_name: effective_iface,
-                backend,
-                server_endpoint: format!("{}:{}", params.server_ip, params.server_port),
-                server_display_name: host.hostname.clone(),
-                original_gateway_ip: None,
-                original_gateway_iface: None,
-                original_resolv_conf: None,
-                namespace_name: None,
-                proxy_pid: None,
-                socks_port: None,
-                http_port: None,
-                dns_servers: params.dns_servers.iter().map(|s| s.to_string()).collect(),
-                peer_public_key: None,
-                local_public_key: None,
-                virtual_ips: vec![],
-                keepalive_secs: None,
-            };
-            state.save()?;
-        }
-        wireguard::backend::WgBackend::Userspace => {
-            let wg_config = wireguard::config::generate_config(params);
-            let effective_iface = wireguard::userspace::up(&wg_config, INTERFACE_NAME, PROVIDER)?;
-
-            let state = wireguard::connection::ConnectionState {
-                instance_name: DIRECT_INSTANCE.to_string(),
-                provider: PROVIDER.dir_name().to_string(),
-                interface_name: effective_iface,
-                backend,
-                server_endpoint: format!("{}:{}", params.server_ip, params.server_port),
-                server_display_name: host.hostname.clone(),
-                original_gateway_ip: None,
-                original_gateway_iface: None,
-                original_resolv_conf: None,
-                namespace_name: None,
-                proxy_pid: None,
-                socks_port: None,
-                http_port: None,
-                dns_servers: params.dns_servers.iter().map(|s| s.to_string()).collect(),
-                peer_public_key: None,
-                local_public_key: None,
-                virtual_ips: vec![],
-                keepalive_secs: None,
-            };
-            state.save()?;
-        }
-        wireguard::backend::WgBackend::Kernel => {
-            wireguard::kernel::up(
-                params,
-                INTERFACE_NAME,
-                PROVIDER.dir_name(),
-                &host.hostname,
-                disable_ipv6,
-            )?;
-        }
-        wireguard::backend::WgBackend::LocalProxy => {
-            anyhow::bail!("use --local-proxy flag to start userspace WireGuard proxy mode");
-        }
-    }
-
-    if let Some(state) = wireguard::connection::ConnectionState::load(DIRECT_INSTANCE)? {
-        hooks::run_ifup(config, PROVIDER, &state);
-    }
-
+    connection_ops::connect_direct_wg(
+        params,
+        backend,
+        INTERFACE_NAME,
+        PROVIDER,
+        &host.hostname,
+        disable_ipv6,
+        config,
+    )?;
     println!(
         "Connected to {} ({}, {}) [backend: {}]",
         host.hostname, server.country_code, server.city, backend
@@ -901,16 +803,11 @@ async fn load_manifest_cached_or_fetch(client: &Client) -> anyhow::Result<IvpnMa
 }
 
 fn save_manifest(manifest: &IvpnManifest) -> anyhow::Result<()> {
-    let json = serde_json::to_string_pretty(manifest)?;
-    config::save_provider_file(PROVIDER, MANIFEST_FILE, json.as_bytes())?;
-    Ok(())
+    Ok(config::save_manifest(PROVIDER, MANIFEST_FILE, manifest)?)
 }
 
 fn load_manifest() -> anyhow::Result<IvpnManifest> {
-    let data = config::load_provider_file(PROVIDER, MANIFEST_FILE)?.ok_or_else(|| {
-        error::AppError::Other("no cached manifest -- run `tunmux ivpn servers` first".into())
-    })?;
-    Ok(serde_json::from_slice(&data)?)
+    Ok(config::load_manifest(PROVIDER, MANIFEST_FILE)?)
 }
 
 fn select_host<'a>(
@@ -1013,22 +910,6 @@ fn port_matches(port: &IvpnPortInfo, value: u16) -> bool {
         return range.min <= value && value <= range.max;
     }
     false
-}
-
-fn ensure_cidr(addr: &str, default_mask: &str) -> String {
-    if addr.contains('/') {
-        addr.to_string()
-    } else {
-        format!("{}{}", addr, default_mask)
-    }
-}
-
-fn short_key(key: &str) -> String {
-    if key.len() <= 20 {
-        key.to_string()
-    } else {
-        format!("{}...", &key[..20])
-    }
 }
 
 fn ensure_api_success(code: i64, message: &str, action: &str) -> anyhow::Result<()> {

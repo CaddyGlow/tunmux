@@ -1,7 +1,6 @@
 use thiserror::Error;
 
 #[derive(Debug, Error)]
-#[allow(dead_code)]
 pub enum AppError {
     #[error("HTTP request failed: {0}")]
     Http(#[from] reqwest::Error),
@@ -21,14 +20,8 @@ pub enum AppError {
     #[error("Authentication failed: {0}")]
     Auth(String),
 
-    #[error("2FA required")]
-    TwoFactorRequired,
-
     #[error("Not logged in -- run `tunmux <provider> login <username>` first")]
     NotLoggedIn,
-
-    #[error("Session expired -- run `tunmux <provider> login <username>` again")]
-    SessionExpired,
 
     #[error("No suitable server found")]
     NoServerFound,

@@ -53,7 +53,6 @@ import androidx.compose.material3.NavigationBar
 import androidx.compose.material3.NavigationBarItem
 import androidx.compose.material3.NavigationBarItemDefaults
 import androidx.compose.material3.OutlinedButton
-import androidx.compose.material3.OutlinedButtonDefaults
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.OutlinedTextFieldDefaults
 import androidx.compose.material3.Scaffold
@@ -647,7 +646,7 @@ private fun DashboardHeroSection(
                     OutlinedButton(
                         onClick = onLogout,
                         shape = RoundedCornerShape(12.dp),
-                        colors = OutlinedButtonDefaults.outlinedButtonColors(contentColor = StitchMuted),
+                        colors = ButtonDefaults.outlinedButtonColors(contentColor = StitchMuted),
                     ) {
                         Icon(Icons.AutoMirrored.Filled.Logout, contentDescription = null, modifier = Modifier.size(18.dp))
                         Spacer(Modifier.width(6.dp))
@@ -657,7 +656,7 @@ private fun DashboardHeroSection(
                     OutlinedButton(
                         onClick = onOpenLogin,
                         shape = RoundedCornerShape(12.dp),
-                        colors = OutlinedButtonDefaults.outlinedButtonColors(contentColor = StitchPrimary),
+                        colors = ButtonDefaults.outlinedButtonColors(contentColor = StitchPrimary),
                     ) {
                         Text("Login")
                     }
@@ -686,7 +685,7 @@ private fun DashboardHeroSection(
                     onClick = onCreateAccount,
                     modifier = Modifier.fillMaxWidth(),
                     shape = RoundedCornerShape(12.dp),
-                    colors = OutlinedButtonDefaults.outlinedButtonColors(contentColor = StitchMuted),
+                    colors = ButtonDefaults.outlinedButtonColors(contentColor = StitchMuted),
                 ) {
                     Text("Create provider account")
                 }
@@ -1207,7 +1206,7 @@ private fun AccountSection(
                     onClick = onLogout,
                     modifier = Modifier.fillMaxWidth(),
                     shape = RoundedCornerShape(12.dp),
-                    colors = OutlinedButtonDefaults.outlinedButtonColors(contentColor = StitchDanger),
+                    colors = ButtonDefaults.outlinedButtonColors(contentColor = StitchDanger),
                 ) {
                     Text("Log Out")
                 }
@@ -1279,7 +1278,7 @@ private fun ConfigDashboardSection(
                             onClick = onRefreshAirvpn,
                             modifier = Modifier.weight(1f),
                             shape = RoundedCornerShape(12.dp),
-                            colors = OutlinedButtonDefaults.outlinedButtonColors(contentColor = StitchPrimary),
+                            colors = ButtonDefaults.outlinedButtonColors(contentColor = StitchPrimary),
                         ) { Text("Refresh AirVPN") }
                     }
                 }
@@ -1326,7 +1325,7 @@ private fun ConfigDashboardSection(
                                     OutlinedButton(
                                         onClick = { onSelectAirvpnKey(key.name) },
                                         shape = RoundedCornerShape(12.dp),
-                                        colors = OutlinedButtonDefaults.outlinedButtonColors(contentColor = StitchPrimary),
+                                        colors = ButtonDefaults.outlinedButtonColors(contentColor = StitchPrimary),
                                     ) { Text("Select") }
                                 }
                             }
@@ -1346,14 +1345,14 @@ private fun ConfigDashboardSection(
                         onClick = { onRenameAirvpnDevice(renameFrom, renameTo); renameFrom = ""; renameTo = "" },
                         modifier = Modifier.fillMaxWidth(),
                         shape = RoundedCornerShape(12.dp),
-                        colors = OutlinedButtonDefaults.outlinedButtonColors(contentColor = StitchPrimary),
+                        colors = ButtonDefaults.outlinedButtonColors(contentColor = StitchPrimary),
                     ) { Text("Rename device") }
                     StitchField(value = deleteName, onValueChange = { deleteName = it }, label = "Delete device")
                     OutlinedButton(
                         onClick = { onDeleteAirvpnDevice(deleteName); deleteName = "" },
                         modifier = Modifier.fillMaxWidth(),
                         shape = RoundedCornerShape(12.dp),
-                        colors = OutlinedButtonDefaults.outlinedButtonColors(contentColor = StitchDanger),
+                        colors = ButtonDefaults.outlinedButtonColors(contentColor = StitchDanger),
                     ) { Text("Delete device") }
                     Text(
                         text = "Known devices: ${airvpnDevices.joinToString { it.name }.ifBlank { "none" }}",
@@ -1626,14 +1625,14 @@ private fun AutoDashboardSection(
                                 OutlinedButton(
                                     onClick = onRequestLocationPermissions,
                                     shape = RoundedCornerShape(12.dp),
-                                    colors = OutlinedButtonDefaults.outlinedButtonColors(contentColor = StitchPrimary),
+                                    colors = ButtonDefaults.outlinedButtonColors(contentColor = StitchPrimary),
                                 ) { Text("Grant location") }
                             }
                             if (!locationServicesEnabled) {
                                 OutlinedButton(
                                     onClick = onOpenLocationSettings,
                                     shape = RoundedCornerShape(12.dp),
-                                    colors = OutlinedButtonDefaults.outlinedButtonColors(contentColor = StitchPrimary),
+                                    colors = ButtonDefaults.outlinedButtonColors(contentColor = StitchPrimary),
                                 ) { Text("Open settings") }
                             }
                         }
@@ -1643,12 +1642,12 @@ private fun AutoDashboardSection(
                             onClick = onAddCurrentWifi,
                             enabled = connectedWifiSsid.isNotBlank(),
                             shape = RoundedCornerShape(12.dp),
-                            colors = OutlinedButtonDefaults.outlinedButtonColors(contentColor = StitchPrimary),
+                            colors = ButtonDefaults.outlinedButtonColors(contentColor = StitchPrimary),
                         ) { Text("Add current") }
                         OutlinedButton(
                             onClick = onRefreshKnownWifi,
                             shape = RoundedCornerShape(12.dp),
-                            colors = OutlinedButtonDefaults.outlinedButtonColors(contentColor = StitchPrimary),
+                            colors = ButtonDefaults.outlinedButtonColors(contentColor = StitchPrimary),
                         ) { Text("Refresh known") }
                     }
                     ToggleLine(
@@ -1722,14 +1721,14 @@ private fun DangerZoneSection(
                     onClick = onLogout,
                     modifier = Modifier.fillMaxWidth(),
                     shape = RoundedCornerShape(12.dp),
-                    colors = OutlinedButtonDefaults.outlinedButtonColors(contentColor = StitchDanger),
+                    colors = ButtonDefaults.outlinedButtonColors(contentColor = StitchDanger),
                 ) { Text("Sign Out of Device") }
             } else {
                 OutlinedButton(
                     onClick = onOpenLogin,
                     modifier = Modifier.fillMaxWidth(),
                     shape = RoundedCornerShape(12.dp),
-                    colors = OutlinedButtonDefaults.outlinedButtonColors(contentColor = StitchPrimary),
+                    colors = ButtonDefaults.outlinedButtonColors(contentColor = StitchPrimary),
                 ) { Text("Switch Provider Account") }
             }
         }
@@ -1780,7 +1779,7 @@ private fun ServerCard(
             OutlinedButton(
                 onClick = { if (connected) onDisconnect() else onConnect() },
                 shape = RoundedCornerShape(12.dp),
-                colors = OutlinedButtonDefaults.outlinedButtonColors(
+                colors = ButtonDefaults.outlinedButtonColors(
                     contentColor = if (connected) StitchDanger else StitchPrimary,
                 ),
             ) {

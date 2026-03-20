@@ -248,6 +248,110 @@ pub fn resolve_proxy_config(
     Ok(auto)
 }
 
+/// Connect via WgQuick or Userspace backend in direct (non-proxy) mode.
+/// Handles generating the WG config, bringing the interface up, saving state, and running hooks.
+pub fn connect_direct_wg(
+    params: &wireguard::config::WgConfigParams<'_>,
+    backend: WgBackend,
+    interface_name: &str,
+    provider: Provider,
+    display_name: &str,
+    disable_ipv6: bool,
+    config: &AppConfig,
+) -> anyhow::Result<()> {
+    use wireguard::connection::{ConnectionState, DIRECT_INSTANCE};
+
+    if ConnectionState::exists(DIRECT_INSTANCE) {
+        anyhow::bail!("Already connected via direct VPN. Disconnect first.");
+    }
+    if wireguard::wg_quick::is_interface_active(interface_name)
+        || wireguard::userspace::is_interface_active(interface_name)
+    {
+        anyhow::bail!(
+            "Already connected. Run `tunmux disconnect --provider {}` first.",
+            provider.dir_name()
+        );
+    }
+
+    println!("Connecting to {} ({})...", display_name, params.server_ip);
+
+    match backend {
+        WgBackend::WgQuick => {
+            let wg_config = wireguard::config::generate_config(params);
+            let effective_iface =
+                wireguard::wg_quick::up(&wg_config, interface_name, provider, false)?;
+            build_direct_state(params, backend, effective_iface, provider, display_name).save()?;
+        }
+        WgBackend::Userspace => {
+            let wg_config = wireguard::config::generate_config(params);
+            let effective_iface =
+                wireguard::userspace::up(&wg_config, interface_name, provider)?;
+            build_direct_state(params, backend, effective_iface, provider, display_name).save()?;
+        }
+        WgBackend::Kernel => {
+            wireguard::kernel::up(
+                params,
+                interface_name,
+                provider.dir_name(),
+                display_name,
+                disable_ipv6,
+            )?;
+        }
+        WgBackend::LocalProxy => {
+            anyhow::bail!("use --local-proxy flag to start userspace WireGuard proxy mode");
+        }
+    }
+
+    if let Some(state) = ConnectionState::load(DIRECT_INSTANCE)? {
+        hooks::run_ifup(config, provider, &state);
+    }
+
+    Ok(())
+}
+
+fn build_direct_state(
+    params: &wireguard::config::WgConfigParams<'_>,
+    backend: WgBackend,
+    effective_iface: String,
+    provider: Provider,
+    display_name: &str,
+) -> wireguard::connection::ConnectionState {
+    use wireguard::connection::{ConnectionState, DIRECT_INSTANCE};
+
+    ConnectionState {
+        instance_name: DIRECT_INSTANCE.to_string(),
+        provider: provider.dir_name().to_string(),
+        interface_name: effective_iface,
+        backend,
+        server_endpoint: format!("{}:{}", params.server_ip, params.server_port),
+        server_display_name: display_name.to_string(),
+        original_gateway_ip: None,
+        original_gateway_iface: None,
+        original_resolv_conf: None,
+        namespace_name: None,
+        proxy_pid: None,
+        socks_port: None,
+        http_port: None,
+        dns_servers: params.dns_servers.iter().map(|s| s.to_string()).collect(),
+        peer_public_key: None,
+        local_public_key: None,
+        virtual_ips: vec![],
+        keepalive_secs: None,
+    }
+}
+
+/// Disconnect the direct instance for a provider, if it exists.
+pub fn disconnect_instance_direct<F>(mut disconnect_one: F) -> anyhow::Result<()>
+where
+    F: FnMut(&wireguard::connection::ConnectionState) -> anyhow::Result<()>,
+{
+    use wireguard::connection::{ConnectionState, DIRECT_INSTANCE};
+    if let Some(state) = ConnectionState::load(DIRECT_INSTANCE)? {
+        disconnect_one(&state)?;
+    }
+    Ok(())
+}
+
 pub struct ConnectContext<'a> {
     pub provider: Provider,
     pub instance: &'a str,
