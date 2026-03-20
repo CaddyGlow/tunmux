@@ -166,13 +166,13 @@ fun TunmuxApp(vm: VpnViewModel = viewModel()) {
     val activity = context as? MainActivity
 
     when (state.screen) {
-        Screen.Login -> LoginScreen(
+        Screen.Login -> StitchLoginScreen(
             provider = state.selectedProvider,
             error = state.errorMessage,
             onLogin = { u, p, t -> vm.login(u, p, t) },
             onBack = { vm.navigateBack() },
         )
-        Screen.ProviderSelect, Screen.Dashboard -> DashboardScreen(
+        Screen.ProviderSelect, Screen.Dashboard -> StitchDashboardScreen(
             provider = state.selectedProvider,
             isLoggedIn = state.isLoggedIn,
             loggedInUsername = state.loggedInUsername,

@@ -1914,7 +1914,7 @@ async fn login_proton_with_password(
         .await
         .map_err(|e| e.to_string())?;
     let keys = crypto::keys::VpnKeys::generate().map_err(|e| e.to_string())?;
-    let cert = api::certificate::fetch_certificate(&client, &keys.ed25519_pk_pem())
+    let cert = api::certificate::fetch_certificate(&client, &keys.ed25519_pk_pem(), false)
         .await
         .map_err(|e| e.to_string())?;
 
@@ -1934,6 +1934,7 @@ async fn login_proton_with_password(
         wg_public_key: keys.wg_public_key(),
         fingerprint: keys.fingerprint(),
         certificate_pem: cert.certificate,
+        certificate_port_forwarding: false,
     };
 
     let servers_resp = api::servers::fetch_server_list(&client)
@@ -1965,7 +1966,7 @@ async fn login_proton_with_api_key(
         .await
         .map_err(|e| e.to_string())?;
     let keys = crypto::keys::VpnKeys::generate().map_err(|e| e.to_string())?;
-    let cert = api::certificate::fetch_certificate(&client, &keys.ed25519_pk_pem())
+    let cert = api::certificate::fetch_certificate(&client, &keys.ed25519_pk_pem(), false)
         .await
         .map_err(|e| e.to_string())?;
     let session = Session {
@@ -1984,6 +1985,7 @@ async fn login_proton_with_api_key(
         wg_public_key: keys.wg_public_key(),
         fingerprint: keys.fingerprint(),
         certificate_pem: cert.certificate,
+        certificate_port_forwarding: false,
     };
 
     let servers_resp = api::servers::fetch_server_list(&client)
@@ -3220,6 +3222,7 @@ pub extern "system" fn Java_net_tunmux_RustBridge_startLocalProxy<'local>(
             keepalive: wg_cfg.keepalive_secs,
             socks_port: resolved_socks,
             http_port: resolved_http,
+            dns_servers: vec![],
         })
     })();
 
@@ -3245,7 +3248,7 @@ pub extern "system" fn Java_net_tunmux_RustBridge_startLocalProxy<'local>(
 
     let runtime = get_runtime();
     let handle = runtime.spawn(async move {
-        if let Err(e) = run_local_proxy(cfg).await {
+        if let Err(e) = run_local_proxy(cfg, None).await {
             log::error!("local_proxy_exited; error={}", e);
         }
     });
