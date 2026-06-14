@@ -627,10 +627,13 @@ fn gotatun_cleanup_status_path(interface: &str) -> std::path::PathBuf {
     gotatun_runtime_path(interface, "cleanup")
 }
 
-/// Per-interface log file the gotatun helper writes to. The service tails this to stream the
-/// helper's setup/teardown output back to the calling CLI. Must match `userspace_helper`.
+/// Log file the gotatun helper writes to. The service tails this to stream the
+/// helper's setup/teardown output back to the calling CLI. Shares the single
+/// source of truth in `config` with `userspace_helper` so the paths always match.
+///
+/// macOS: `~/Library/Logs/tunmux-<interface>.log`; Linux: `/var/log/tunmux/<interface>.log`.
 pub(super) fn gotatun_log_path(interface: &str) -> std::path::PathBuf {
-    gotatun_runtime_path(interface, "log")
+    crate::config::gotatun_helper_log_path(interface)
 }
 
 fn gotatun_runtime_path(interface: &str, suffix: &str) -> std::path::PathBuf {

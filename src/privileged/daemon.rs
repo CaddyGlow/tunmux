@@ -26,10 +26,12 @@ pub(super) fn spawn_proxy_daemon(
         exe = ?exe.display().to_string(),
         netns = ?netns, "spawn_proxy_daemon");
 
-    // Ensure the proxy directory exists (e.g. /var/lib/tunmux/proxy/).
+    // Ensure the proxy directory exists (e.g. /var/lib/tunmux/proxy/) for pid/status,
+    // and the root log dir (/var/log/tunmux/) for the now-separate log file.
     if let Some(parent) = std::path::Path::new(pid_file).parent() {
         config::ensure_privileged_directory(parent)?;
     }
+    config::ensure_root_log_dir()?;
 
     let _ = std::fs::remove_file(pid_file);
     let _ = std::fs::remove_file(log_file);

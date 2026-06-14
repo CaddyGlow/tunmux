@@ -48,7 +48,8 @@ pub fn pid_file(instance: &str) -> PathBuf {
 
 #[must_use]
 pub fn log_file(instance: &str) -> PathBuf {
-    config::privileged_proxy_dir().join(format!("{}.log", instance))
+    // Root service: log to /var/log/tunmux (pid/status stay in the runtime dir).
+    config::root_log_dir().join(format!("{}.log", instance))
 }
 
 #[must_use]

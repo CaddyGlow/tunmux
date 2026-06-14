@@ -73,7 +73,10 @@ fn gotatun_cleanup_status_path(interface: &str) -> PathBuf {
 
 #[cfg(unix)]
 fn gotatun_log_path(interface: &str) -> PathBuf {
-    PathBuf::from(SOCK_DIR).join(format!("{interface}.tunmux.log"))
+    // Shared with the privileged service (which clears and tails this file), so
+    // both derive it from the same place. macOS: ~/Library/Logs/tunmux-<iface>.log;
+    // Linux: /var/log/tunmux/<iface>.log.
+    crate::config::gotatun_helper_log_path(interface)
 }
 
 #[cfg(unix)]
@@ -312,10 +315,13 @@ fn daemonize_and_run(interface: &str) -> anyhow::Result<()> {
             // caller. Synchronous writer so the service reads complete lines without a flush race.
             // Ensure the runtime dir exists first (it is otherwise created later by start_device).
             let _ = std::fs::create_dir_all(SOCK_DIR);
-            let _ = crate::logging::init_file_sync(
-                &gotatun_log_path(interface).to_string_lossy(),
-                false,
-            );
+            // Ensure the log's parent dir exists (on macOS this is ~/Library/Logs,
+            // which normally exists; create_dir_all is cheap insurance).
+            let log_path = gotatun_log_path(interface);
+            if let Some(parent) = log_path.parent() {
+                let _ = std::fs::create_dir_all(parent);
+            }
+            let _ = crate::logging::init_file_sync(&log_path.to_string_lossy(), false);
 
             let rt = tokio::runtime::Builder::new_current_thread()
                 .enable_all()

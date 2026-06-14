@@ -283,6 +283,46 @@ pub fn privileged_runtime_dir() -> PathBuf {
     return PathBuf::from("/var/lib/tunmux");
 }
 
+/// Root-owned log directory for privileged services (gotatun helper on Linux, the
+/// privileged proxy daemon): `/var/log/tunmux`.
+#[must_use]
+pub fn root_log_dir() -> PathBuf {
+    PathBuf::from("/var/log/tunmux")
+}
+
+pub fn ensure_root_log_dir() -> Result<()> {
+    let dir = root_log_dir();
+    if !dir.exists() {
+        fs::create_dir_all(&dir)?;
+        // World-readable so the user can tail the root service's logs.
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o755))?;
+    }
+    Ok(())
+}
+
+/// macOS user-visible log directory: `~/Library/Logs` (what Console.app shows).
+/// Used for user-owned logs (the local proxy); root-owned logs go to
+/// [`root_log_dir`] instead. Callers run as the user, so `HOME` is already theirs.
+#[cfg(target_os = "macos")]
+#[must_use]
+pub fn macos_user_log_dir() -> PathBuf {
+    let home = std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("/tmp"));
+    home.join("Library/Logs")
+}
+
+/// Log file the gotatun userspace helper writes and the privileged service tails.
+/// Single source of truth shared by the helper (writer) and the service
+/// (clear-at-connect + tail), which must agree on the path.
+///
+/// The helper runs as root (the privileged daemon spawns it), so its log is a
+/// root service and lives under `/var/log/tunmux/<interface>.log` on all platforms.
+#[must_use]
+pub fn gotatun_helper_log_path(interface: &str) -> PathBuf {
+    root_log_dir().join(format!("{interface}.log"))
+}
+
 pub fn ensure_privileged_runtime_dir() -> Result<()> {
     let dir = privileged_runtime_dir();
     if !dir.exists() {

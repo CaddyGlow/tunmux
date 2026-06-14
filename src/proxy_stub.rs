@@ -53,7 +53,8 @@ pub fn pid_file(instance: &str) -> PathBuf {
 
 #[must_use]
 pub fn log_file(instance: &str) -> PathBuf {
-    config::privileged_proxy_dir().join(format!("{}.log", instance))
+    // Root service: log to /var/log/tunmux (pid/status stay in the runtime dir).
+    config::root_log_dir().join(format!("{}.log", instance))
 }
 
 /// Path helpers for user-owned local-proxy instance files.
@@ -64,6 +65,13 @@ pub fn local_pid_file(instance: &str) -> PathBuf {
 
 #[must_use]
 pub fn local_log_file(instance: &str) -> PathBuf {
+    // macOS: user-visible ~/Library/Logs/tunmux-<instance>.log (pid stays in the
+    // user proxy dir). Other non-Linux targets keep the proxy dir.
+    #[cfg(target_os = "macos")]
+    {
+        return config::macos_user_log_dir().join(format!("tunmux-{}.log", instance));
+    }
+    #[cfg(not(target_os = "macos"))]
     config::user_proxy_dir().join(format!("{}.log", instance))
 }
 
