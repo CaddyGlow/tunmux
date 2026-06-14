@@ -1,0 +1,30 @@
+<?xml version="1.0" encoding="UTF-8" ?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+    "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>me.pansen.tunmux.autoconnect</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>__HOME__/.local/bin/tunmux-autoconnect.sh</string>
+    </array>
+
+    <key>RunAtLoad</key>
+    <true />
+    <key>StartInterval</key>
+    <integer>60</integer>   <!-- re-check & reconnect every 60s -->
+
+    <!-- Do NOT set KeepAlive: connect exits 0 after setup, so KeepAlive
+         would relaunch it in a tight loop. StartInterval is the right knob. -->
+
+    <key>LimitLoadToSessionType</key>
+    <string>Aqua</string>   <!-- only in a real GUI login session -->
+
+    <key>StandardOutPath</key>
+    <string>__HOME__/Library/Logs/tunmux-autoconnect.out.log</string>
+    <key>StandardErrorPath</key>
+    <string>__HOME__/Library/Logs/tunmux-autoconnect.err.log</string>
+</dict>
+</plist>
