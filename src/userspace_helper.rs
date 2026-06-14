@@ -115,14 +115,9 @@ struct MacosCleanupState {
     /// Live routing state. Mutated by the network-change reconciler while the
     /// tunnel is up and read by teardown, hence the interior mutability.
     routing: std::sync::Mutex<MacosRoutingState>,
-    /// DNS overrides captured at connect and restored at teardown.
-    //
-    // TODO(dns-roam-reconcile): DNS is configured once at connect and is NOT
-    // re-applied when the network environment changes. After a roam the
-    // primary network service can change, leaving tunnel DNS unapplied on the
-    // new primary. The reconciler should re-assert DNS the same way it
-    // re-applies routes (see `macos_reconcile_routes`).
-    dns_services: Vec<MacosDnsServiceState>,
+    /// Live DNS state. Like `routing`, the reconciler keeps this in sync with
+    /// the active LAN while the tunnel is up and teardown reads it to restore.
+    dns: std::sync::Mutex<MacosDnsState>,
     /// Immutable inputs the reconciler replays on every network change.
     reconcile: MacosReconcileInputs,
 }
@@ -134,6 +129,16 @@ struct MacosRoutingState {
     routes_added: Vec<MacosRoute>,
     /// Last observed network environment. A change drives reconciliation.
     fingerprint: MacosNetworkFingerprint,
+}
+
+/// DNS state the reconciler keeps in sync with the active LAN.
+#[cfg(target_os = "macos")]
+struct MacosDnsState {
+    /// Services we currently own, each carrying the original config to restore
+    /// at teardown. Mutated as the reconciler takes/releases ownership.
+    services: Vec<MacosDnsServiceState>,
+    /// Last observed DNS-relevant environment. A change drives reconciliation.
+    fingerprint: MacosDnsFingerprint,
 }
 
 /// Inputs captured at connect that the reconciler needs to recompute routing.
@@ -174,11 +179,47 @@ struct MacosRoute {
 }
 
 #[cfg(target_os = "macos")]
+#[derive(Clone)]
 struct MacosDnsServiceState {
     service: String,
     dns_servers: Option<Vec<String>>,
     search_domains: Option<Vec<String>>,
 }
+
+/// A snapshot of the host DNS-relevant environment. Equality drives the DNS
+/// reconciler the same way `MacosNetworkFingerprint` drives the route one.
+#[cfg(target_os = "macos")]
+#[derive(Clone, Default, PartialEq)]
+struct MacosDnsFingerprint {
+    /// The service that currently owns global resolution (the primary service
+    /// name), or `None` if it can't be determined.
+    primary_service: Option<String>,
+    /// All current service names, sorted+deduped — detects appear/disappear.
+    services: Vec<String>,
+    /// Per-service DNS as currently observed on the system, sorted by service.
+    /// Detects DHCP clobber (our DNS silently replaced) without trusting our
+    /// own cached view. `None` == "no DNS set" (networksetup "Empty"). Server
+    /// lists are left in the order `networksetup` returns them (order is
+    /// significant to macOS) so equality is stable across ticks.
+    observed: Vec<(String, Option<Vec<String>>)>,
+}
+
+/// Which network services should carry the tunnel's DNS. `AllServices` matches
+/// the historical connect-time behavior (now applied dynamically); `PrimaryOnly`
+/// is the true analogue of the route LAN-exclusion — only the service that owns
+/// global resolution gets tunnel DNS, so non-primary LANs keep their own.
+#[cfg(target_os = "macos")]
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum DnsPolicy {
+    #[allow(dead_code)]
+    AllServices,
+    PrimaryOnly,
+}
+
+/// Active DNS targeting policy. Switching this constant is the only change
+/// needed to move between the phases described in `transparent_dns.md`.
+#[cfg(target_os = "macos")]
+const DNS_POLICY: DnsPolicy = DnsPolicy::PrimaryOnly;
 
 #[cfg(unix)]
 #[derive(Debug, Clone)]
@@ -498,6 +539,7 @@ async fn wait_for_shutdown(running: &RunningDevice) -> anyhow::Result<()> {
                     // link up/down) live, without requiring a reconnect.
                     if let CleanupState::Macos(state) = &running.cleanup {
                         macos_reconcile_routes(state);
+                        macos_reconcile_dns(state);
                     }
 
                     if diag_enabled && std::time::Instant::now() >= next_diag_at {
@@ -1250,6 +1292,7 @@ fn configure_network_macos(
     let mut routes_added: Vec<MacosRoute> = Vec::new();
     let mut dns_services: Vec<MacosDnsServiceState> = Vec::new();
     let mut fingerprint = MacosNetworkFingerprint::default();
+    let mut dns_fingerprint = MacosDnsFingerprint::default();
 
     let setup_result = (|| -> anyhow::Result<()> {
         if let Some(mtu) = config.mtu {
@@ -1301,9 +1344,10 @@ fn configure_network_macos(
         }
         log_macos_routing_overview("connect", &inputs, &routes_added, &fingerprint);
 
-        // TODO(dns-roam-reconcile): DNS is applied once here; unlike routes it
-        // is not recomputed on network change. See MacosCleanupState.dns_services.
-        configure_macos_dns(config, &mut dns_services)
+        // Apply DNS the same way the reconciler will, then seed the DNS
+        // fingerprint so the first reconcile tick is a no-op.
+        dns_fingerprint = configure_macos_dns(config, &mut dns_services)?;
+        Ok(())
     })();
 
     if let Err(setup_error) = setup_result {
@@ -1337,34 +1381,51 @@ fn configure_network_macos(
             routes_added,
             fingerprint,
         }),
-        dns_services,
+        dns: std::sync::Mutex::new(MacosDnsState {
+            services: dns_services,
+            fingerprint: dns_fingerprint,
+        }),
         reconcile: inputs,
     })
 }
 
 #[cfg(target_os = "macos")]
 fn cleanup_network_macos(state: &MacosCleanupState) -> anyhow::Result<()> {
-    let routing = state
-        .routing
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    debug!(
-        routes = routing.routes_added.len(),
-        dns_services = state.dns_services.len(),
-        "userspace_helper_network_cleanup_begin"
-    );
     let mut errors = Vec::new();
-    for route in routing.routes_added.iter().rev() {
-        if let Err(error) = del_macos_route(route) {
-            errors.push(error.to_string());
+    // Restore routes then DNS, taking the `routing` and `dns` locks
+    // independently (never both at once) to avoid any ordering hazard with the
+    // reconciler.
+    {
+        let routing = state
+            .routing
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        debug!(
+            routes = routing.routes_added.len(),
+            "userspace_helper_network_cleanup_routes"
+        );
+        for route in routing.routes_added.iter().rev() {
+            if let Err(error) = del_macos_route(route) {
+                errors.push(error.to_string());
+            }
         }
     }
-    for service in state.dns_services.iter().rev() {
-        if let Err(error) = restore_macos_dns_service(service) {
-            errors.push(format!(
-                "restore DNS for {:?} failed: {error}",
-                service.service
-            ));
+    {
+        let dns = state
+            .dns
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        debug!(
+            dns_services = dns.services.len(),
+            "userspace_helper_network_cleanup_dns"
+        );
+        for service in dns.services.iter().rev() {
+            if let Err(error) = restore_macos_dns_service(service) {
+                errors.push(format!(
+                    "restore DNS for {:?} failed: {error}",
+                    service.service
+                ));
+            }
         }
     }
     finish_cleanup(errors)
@@ -1379,32 +1440,31 @@ fn finish_cleanup(errors: Vec<String>) -> anyhow::Result<()> {
     }
 }
 
+/// Apply the tunnel's DNS to the services selected by `DNS_POLICY`, saving each
+/// touched service's original config into `saved` for later restore. Returns the
+/// DNS fingerprint observed *after* applying, so the reconciler's first tick is a
+/// no-op. Shares its per-service capture+apply path with the reconciler.
 #[cfg(target_os = "macos")]
 fn configure_macos_dns(
     config: &ParsedUserspaceConfig,
     saved: &mut Vec<MacosDnsServiceState>,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<MacosDnsFingerprint> {
     if config.dns_servers.is_empty() {
-        return Ok(());
+        return Ok(MacosDnsFingerprint::default());
     }
 
-    let services = list_macos_network_services()?;
-
-    for service in services {
-        let previous_dns = get_macos_dns_servers(&service)?;
-        let previous_search = get_macos_search_domains(&service)?;
-
-        saved.push(MacosDnsServiceState {
-            service: service.clone(),
-            dns_servers: previous_dns,
-            search_domains: previous_search,
-        });
-
+    let fingerprint = macos_current_dns_fingerprint();
+    for service in dns_target_services(DNS_POLICY, &fingerprint) {
+        if let Some(state) = capture_macos_dns_service(&service, &config.dns_servers)? {
+            saved.push(state);
+        }
         set_macos_dns_servers(&service, &config.dns_servers)?;
         set_macos_search_domains_empty(&service)?;
     }
 
-    Ok(())
+    // Re-snapshot post-apply: the stored fingerprint must reflect the DNS we
+    // just wrote so the first reconcile tick detects no change.
+    Ok(macos_current_dns_fingerprint())
 }
 
 #[cfg(target_os = "macos")]
@@ -1857,6 +1917,312 @@ fn macos_reconcile_routes(state: &MacosCleanupState) {
     log_macos_routing_overview("reconcile", inputs, &routing.routes_added, &fingerprint);
 }
 
+/// The services that should carry tunnel DNS under `policy`. `PrimaryOnly`
+/// targets just the service that owns global resolution; if that can't be
+/// determined (or isn't a current service) it falls back to `AllServices` so we
+/// never leave the primary resolver leaked (`transparent_dns.md` §6.3).
+#[cfg(target_os = "macos")]
+fn dns_target_services(policy: DnsPolicy, fp: &MacosDnsFingerprint) -> Vec<String> {
+    match policy {
+        DnsPolicy::AllServices => fp.services.clone(),
+        DnsPolicy::PrimaryOnly => match &fp.primary_service {
+            Some(primary) if fp.services.iter().any(|s| s == primary) => vec![primary.clone()],
+            _ => fp.services.clone(),
+        },
+    }
+}
+
+/// The pure decision behind a DNS reconcile: given the tunnel's DNS, the freshly
+/// observed environment, the services we currently own, and the services we want
+/// to own, decide what to do. Kept free of I/O so it is unit-testable.
+#[cfg(target_os = "macos")]
+#[derive(Debug, Default, PartialEq)]
+struct DnsActions {
+    /// Targets we don't yet own and whose live DNS differs from the tunnel's:
+    /// capture their original config, then assert tunnel DNS.
+    capture: Vec<String>,
+    /// Owned services no longer targeted but still present: restore originals.
+    restore: Vec<String>,
+    /// Owned services that have vanished: drop without restoring (gone already).
+    drop: Vec<String>,
+    /// Targets whose observed DNS has drifted from the tunnel's: (re-)assert.
+    apply: Vec<String>,
+}
+
+#[cfg(target_os = "macos")]
+fn plan_dns_actions(
+    tunnel_dns: &[String],
+    fp: &MacosDnsFingerprint,
+    owned: &[String],
+    targets: &[String],
+) -> DnsActions {
+    let shows_tunnel = |svc: &str| -> bool {
+        fp.observed
+            .iter()
+            .find(|(s, _)| s == svc)
+            .and_then(|(_, d)| d.as_deref())
+            == Some(tunnel_dns)
+    };
+
+    let mut actions = DnsActions::default();
+
+    for svc in targets {
+        let matches_tunnel = shows_tunnel(svc);
+        // Capture an original only when we are about to overwrite a value that
+        // isn't already the tunnel's — never record our own DNS as "original".
+        if !owned.iter().any(|s| s == svc) && !matches_tunnel {
+            actions.capture.push(svc.clone());
+        }
+        if !matches_tunnel {
+            actions.apply.push(svc.clone());
+        }
+    }
+
+    for svc in owned {
+        if targets.iter().any(|s| s == svc) {
+            continue;
+        }
+        if fp.services.iter().any(|s| s == svc) {
+            actions.restore.push(svc.clone());
+        } else {
+            actions.drop.push(svc.clone());
+        }
+    }
+
+    actions
+}
+
+/// Snapshot the current DNS-relevant environment. Any sub-call that fails
+/// degrades to empty/`None` rather than aborting the tick, mirroring
+/// `macos_local_connected_subnets`.
+#[cfg(target_os = "macos")]
+fn macos_current_dns_fingerprint() -> MacosDnsFingerprint {
+    let mut services = list_macos_network_services().unwrap_or_default();
+    services.sort();
+    services.dedup();
+
+    let mut observed = Vec::with_capacity(services.len());
+    for svc in &services {
+        // None on error → treat as "unknown/unset"; never panic the tick.
+        let dns = get_macos_dns_servers(svc).ok().flatten();
+        observed.push((svc.clone(), dns));
+    }
+
+    MacosDnsFingerprint {
+        primary_service: macos_primary_service(),
+        services,
+        observed,
+    }
+}
+
+/// Read a service's current DNS + search domains and wrap them for later
+/// restore. Returns `Ok(None)` when the service already shows the tunnel's DNS,
+/// so we never capture our own values as "original" (`transparent_dns.md` §6.1).
+#[cfg(target_os = "macos")]
+fn capture_macos_dns_service(
+    service: &str,
+    tunnel_dns: &[String],
+) -> anyhow::Result<Option<MacosDnsServiceState>> {
+    let dns = get_macos_dns_servers(service)?;
+    if dns.as_deref() == Some(tunnel_dns) {
+        return Ok(None);
+    }
+    let search = get_macos_search_domains(service)?;
+    Ok(Some(MacosDnsServiceState {
+        service: service.to_string(),
+        dns_servers: dns,
+        search_domains: search,
+    }))
+}
+
+/// Re-apply DNS when the host DNS environment changed (roam, DHCP renewal, a new
+/// or vanished service, a primary-service change). Cheap and silent when nothing
+/// changed; expressive when it acts. Mirrors `macos_reconcile_routes`.
+#[cfg(target_os = "macos")]
+fn macos_reconcile_dns(state: &MacosCleanupState) {
+    let inputs = &state.reconcile;
+    if inputs.dns_servers.is_empty() {
+        return; // VPN promotes no DNS → nothing to own.
+    }
+
+    let fingerprint = macos_current_dns_fingerprint();
+
+    let mut dns = state
+        .dns
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if fingerprint == dns.fingerprint {
+        return; // cheap identity check, same guard as routes.
+    }
+
+    let previous = dns.fingerprint.clone();
+    info!(
+        interface = inputs.interface,
+        old_primary = ?previous.primary_service,
+        new_primary = ?fingerprint.primary_service,
+        old_services = previous.services.len(),
+        new_services = fingerprint.services.len(),
+        "userspace_helper_dns_change_detected"
+    );
+
+    let targets = dns_target_services(DNS_POLICY, &fingerprint);
+    let owned: Vec<String> = dns.services.iter().map(|s| s.service.clone()).collect();
+    let actions = plan_dns_actions(&inputs.dns_servers, &fingerprint, &owned, &targets);
+
+    let (mut applied, mut captured, mut restored, mut dropped, mut errors) =
+        (0usize, 0usize, 0usize, 0usize, 0usize);
+
+    // (a) Capture originals for services we are about to own.
+    for svc in &actions.capture {
+        match capture_macos_dns_service(svc, &inputs.dns_servers) {
+            Ok(Some(saved)) => {
+                dns.services.push(saved);
+                captured += 1;
+            }
+            Ok(None) => {} // already showing tunnel DNS; nothing to capture
+            Err(_) => errors += 1,
+        }
+    }
+
+    // (b) Release services we no longer target: restore the ones still present,
+    // drop the ones whose host service has vanished.
+    for svc in &actions.restore {
+        let saved = dns.services.iter().find(|s| &s.service == svc).cloned();
+        if let Some(saved) = saved {
+            if restore_macos_dns_service(&saved).is_ok() {
+                restored += 1;
+            } else {
+                errors += 1;
+            }
+        }
+        dns.services.retain(|s| &s.service != svc);
+    }
+    for svc in &actions.drop {
+        dropped += 1;
+        dns.services.retain(|s| &s.service != svc);
+    }
+
+    // (c) (Re-)assert tunnel DNS on every target whose observed DNS has drifted.
+    for svc in &actions.apply {
+        if set_macos_dns_servers(svc, &inputs.dns_servers).is_ok()
+            && set_macos_search_domains_empty(svc).is_ok()
+        {
+            applied += 1;
+        } else {
+            errors += 1;
+        }
+    }
+
+    dns.fingerprint = fingerprint;
+    info!(
+        interface = inputs.interface,
+        applied, captured, restored, dropped, errors, "userspace_helper_dns_reconcile_applied"
+    );
+}
+
+/// The human-readable network service name that currently owns the default
+/// route / global resolver, or `None`. `scutil` speaks BSD device names (en0)
+/// and `networksetup` speaks service names ("Wi-Fi"); bridge them via the
+/// service order, matching on device.
+#[cfg(target_os = "macos")]
+fn macos_primary_service() -> Option<String> {
+    let primary_if = scutil_global_primary_interface()?;
+    macos_service_name_for_device(&primary_if)
+}
+
+/// Ask `scutil` for the primary interface (BSD device, e.g. "en0").
+#[cfg(target_os = "macos")]
+fn scutil_global_primary_interface() -> Option<String> {
+    use std::io::Write;
+    use std::process::Stdio;
+
+    let mut child = Command::new("scutil")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .ok()?;
+    child
+        .stdin
+        .as_mut()?
+        .write_all(b"show State:/Network/Global/IPv4\n")
+        .ok()?;
+    // `wait_with_output` closes stdin first, so scutil sees EOF and exits.
+    let output = child.wait_with_output().ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    parse_scutil_primary_interface(&String::from_utf8_lossy(&output.stdout))
+}
+
+/// Parse `PrimaryInterface : en0` out of `scutil show State:/Network/Global/IPv4`.
+#[cfg(target_os = "macos")]
+fn parse_scutil_primary_interface(text: &str) -> Option<String> {
+    for line in text.lines() {
+        let trimmed = line.trim();
+        if let Some(rest) = trimmed.strip_prefix("PrimaryInterface") {
+            let value = rest.trim_start_matches([' ', ':']).trim();
+            if !value.is_empty() {
+                return Some(value.to_string());
+            }
+        }
+    }
+    None
+}
+
+/// Map a BSD device ("en0") to its `networksetup` service name ("Wi-Fi") via
+/// `networksetup -listnetworkserviceorder`.
+#[cfg(target_os = "macos")]
+fn macos_service_name_for_device(device: &str) -> Option<String> {
+    let output =
+        run_command_capture_output("networksetup", &["-listnetworkserviceorder"]).ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    parse_service_name_for_device(&String::from_utf8_lossy(&output.stdout), device)
+}
+
+/// Parse `networksetup -listnetworkserviceorder` output, returning the service
+/// name whose `(Hardware Port: …, Device: <device>)` line matches `device`.
+/// Pseudo-services without a real device (e.g. VPNs) are skipped.
+#[cfg(target_os = "macos")]
+fn parse_service_name_for_device(text: &str, device: &str) -> Option<String> {
+    let mut current_name: Option<String> = None;
+    for line in text.lines() {
+        let trimmed = line.trim();
+        if let Some(hw) = trimmed.strip_prefix("(Hardware Port:") {
+            if parse_device_from_hw_line(hw).as_deref() == Some(device) {
+                return current_name.clone();
+            }
+        } else if trimmed.starts_with('(') {
+            // Service line: "(1) Wi-Fi" or "(*) Wi-Fi" (asterisk == disabled).
+            if let Some((_, name)) = trimmed.split_once(')') {
+                let name = name.trim();
+                if !name.is_empty() {
+                    current_name = Some(name.to_string());
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Extract the BSD device from the tail of a `(Hardware Port: …, Device: enX)`
+/// line (the part passed in is everything after "(Hardware Port:").
+#[cfg(target_os = "macos")]
+fn parse_device_from_hw_line(hw: &str) -> Option<String> {
+    let idx = hw.find("Device:")?;
+    let device = hw[idx + "Device:".len()..]
+        .trim()
+        .trim_end_matches(')')
+        .trim();
+    if device.is_empty() {
+        None
+    } else {
+        Some(device.to_string())
+    }
+}
+
 /// Emit a full route + DNS overview. Called once at connect and after every
 /// reconcile action, so the log always shows the resulting tunnel state.
 #[cfg(target_os = "macos")]
@@ -1874,10 +2240,10 @@ fn log_macos_routing_overview(
         endpoint_gateway = ?fingerprint.endpoint_gateway,
         local_subnets = %format_subnets(&fingerprint.local_subnets),
         tunnel_routes = %format_routes(routes),
-        // TODO(dns-roam-reconcile): report live per-service DNS here once DNS
-        // is reconciled; for now this is the static configured server list.
+        // The configured server list; live per-service DNS state is reported by
+        // the DNS reconciler's own `userspace_helper_dns_*` events.
         dns_servers = %format_list(&inputs.dns_servers),
-        dns_reconciled = false,
+        dns_reconciled = true,
         "userspace_helper_routing_overview"
     );
 }
@@ -2175,5 +2541,214 @@ mod tests {
             gateway: Some("10.0.0.1".to_string()),
         };
         assert!(macos_route_excluded_by_local_subnet(&gatewayed, &[local]).is_none());
+    }
+
+    // --- DNS reconciler ---
+
+    fn dns_fp(
+        primary: Option<&str>,
+        observed: &[(&str, Option<&[&str]>)],
+    ) -> MacosDnsFingerprint {
+        let observed: Vec<(String, Option<Vec<String>>)> = observed
+            .iter()
+            .map(|(svc, dns)| {
+                (
+                    svc.to_string(),
+                    dns.map(|servers| servers.iter().map(|s| s.to_string()).collect()),
+                )
+            })
+            .collect();
+        let mut services: Vec<String> = observed.iter().map(|(s, _)| s.clone()).collect();
+        services.sort();
+        services.dedup();
+        MacosDnsFingerprint {
+            primary_service: primary.map(str::to_string),
+            services,
+            observed,
+        }
+    }
+
+    #[test]
+    fn dns_target_services_honours_policy_and_falls_back() {
+        let fp = dns_fp(
+            Some("Wi-Fi"),
+            &[("Ethernet", Some(&["1.1.1.1"])), ("Wi-Fi", Some(&["1.1.1.1"]))],
+        );
+
+        // AllServices targets every service.
+        assert_eq!(
+            dns_target_services(DnsPolicy::AllServices, &fp),
+            vec!["Ethernet".to_string(), "Wi-Fi".to_string()]
+        );
+
+        // PrimaryOnly targets just the primary.
+        assert_eq!(
+            dns_target_services(DnsPolicy::PrimaryOnly, &fp),
+            vec!["Wi-Fi".to_string()]
+        );
+
+        // PrimaryOnly with no detectable primary falls back to all services.
+        let no_primary = dns_fp(None, &[("Wi-Fi", None), ("Ethernet", None)]);
+        assert_eq!(
+            dns_target_services(DnsPolicy::PrimaryOnly, &no_primary),
+            vec!["Ethernet".to_string(), "Wi-Fi".to_string()]
+        );
+
+        // PrimaryOnly whose primary isn't a current service also falls back.
+        let stale_primary = dns_fp(Some("Bogus"), &[("Wi-Fi", None)]);
+        assert_eq!(
+            dns_target_services(DnsPolicy::PrimaryOnly, &stale_primary),
+            vec!["Wi-Fi".to_string()]
+        );
+    }
+
+    fn tunnel() -> Vec<String> {
+        vec!["100.64.0.1".to_string()]
+    }
+
+    #[test]
+    fn plan_dns_new_primary_captures_and_restores_previous() {
+        // Roamed Wi-Fi -> Ethernet under PrimaryOnly: own Wi-Fi, target Ethernet.
+        let fp = dns_fp(
+            Some("Ethernet"),
+            &[
+                ("Ethernet", Some(&["192.168.1.1"])), // native DHCP DNS
+                ("Wi-Fi", Some(&["100.64.0.1"])),     // still has our tunnel DNS
+            ],
+        );
+        let targets = dns_target_services(DnsPolicy::PrimaryOnly, &fp);
+        let actions = plan_dns_actions(&tunnel(), &fp, &["Wi-Fi".to_string()], &targets);
+
+        assert_eq!(actions.capture, vec!["Ethernet".to_string()]);
+        assert_eq!(actions.apply, vec!["Ethernet".to_string()]);
+        assert_eq!(actions.restore, vec!["Wi-Fi".to_string()]);
+        assert!(actions.drop.is_empty());
+    }
+
+    #[test]
+    fn plan_dns_clobber_reapplies_without_recapturing() {
+        // configd reverted our DNS on an owned, still-targeted service.
+        let fp = dns_fp(Some("Wi-Fi"), &[("Wi-Fi", Some(&["192.168.1.1"]))]);
+        let targets = dns_target_services(DnsPolicy::PrimaryOnly, &fp);
+        let actions = plan_dns_actions(&tunnel(), &fp, &["Wi-Fi".to_string()], &targets);
+
+        assert!(actions.capture.is_empty()); // already owned → keep original
+        assert_eq!(actions.apply, vec!["Wi-Fi".to_string()]);
+        assert!(actions.restore.is_empty());
+        assert!(actions.drop.is_empty());
+    }
+
+    #[test]
+    fn plan_dns_new_service_captured_under_all_services() {
+        let fp = dns_fp(
+            Some("Wi-Fi"),
+            &[
+                ("Wi-Fi", Some(&["100.64.0.1"])),  // owned, already tunnel
+                ("Tether", Some(&["10.0.0.1"])),   // new service with native DNS
+            ],
+        );
+        let targets = dns_target_services(DnsPolicy::AllServices, &fp);
+        let actions = plan_dns_actions(&tunnel(), &fp, &["Wi-Fi".to_string()], &targets);
+
+        assert_eq!(actions.capture, vec!["Tether".to_string()]);
+        assert_eq!(actions.apply, vec!["Tether".to_string()]);
+        assert!(actions.restore.is_empty());
+        assert!(actions.drop.is_empty());
+    }
+
+    #[test]
+    fn plan_dns_vanished_service_is_dropped_not_restored() {
+        // We owned "Tether" but it's gone from the current services.
+        let fp = dns_fp(Some("Wi-Fi"), &[("Wi-Fi", Some(&["100.64.0.1"]))]);
+        let targets = dns_target_services(DnsPolicy::PrimaryOnly, &fp);
+        let actions = plan_dns_actions(
+            &tunnel(),
+            &fp,
+            &["Wi-Fi".to_string(), "Tether".to_string()],
+            &targets,
+        );
+
+        assert_eq!(actions.drop, vec!["Tether".to_string()]);
+        assert!(actions.restore.is_empty());
+        assert!(actions.capture.is_empty());
+        assert!(actions.apply.is_empty());
+    }
+
+    #[test]
+    fn plan_dns_steady_state_is_a_no_op() {
+        // Primary already shows tunnel DNS and is owned → nothing to do.
+        let fp = dns_fp(Some("Wi-Fi"), &[("Wi-Fi", Some(&["100.64.0.1"]))]);
+        let targets = dns_target_services(DnsPolicy::PrimaryOnly, &fp);
+        let actions = plan_dns_actions(&tunnel(), &fp, &["Wi-Fi".to_string()], &targets);
+        assert_eq!(actions, DnsActions::default());
+    }
+
+    #[test]
+    fn plan_dns_partial_overlap_is_not_a_match() {
+        // VPN [100.64.0.1, 8.8.8.8] vs observed [100.64.0.1] is not equal → apply.
+        let tunnel = vec!["100.64.0.1".to_string(), "8.8.8.8".to_string()];
+        let fp = dns_fp(Some("Wi-Fi"), &[("Wi-Fi", Some(&["100.64.0.1"]))]);
+        let targets = dns_target_services(DnsPolicy::PrimaryOnly, &fp);
+        let actions = plan_dns_actions(&tunnel, &fp, &[], &targets);
+        assert_eq!(actions.apply, vec!["Wi-Fi".to_string()]);
+        assert_eq!(actions.capture, vec!["Wi-Fi".to_string()]);
+    }
+
+    #[test]
+    fn parse_scutil_primary_interface_extracts_device() {
+        let output = "\
+<dictionary> {
+  PrimaryInterface : en0
+  PrimaryService : 1A2B3C4D-0000-1111-2222-333344445555
+  Router : 192.168.1.1
+}
+";
+        assert_eq!(
+            parse_scutil_primary_interface(output).as_deref(),
+            Some("en0")
+        );
+        assert_eq!(parse_scutil_primary_interface("No such key").as_deref(), None);
+    }
+
+    #[test]
+    fn parse_service_name_for_device_maps_devices_and_ignores_pseudo_services() {
+        let output = "\
+An asterisk (*) denotes that a network service is disabled.
+(1) Wi-Fi
+(Hardware Port: Wi-Fi, Device: en0)
+
+(2) Thunderbolt Bridge
+(Hardware Port: Thunderbolt Bridge, Device: bridge0)
+
+(3) USB 10/100/1000 LAN
+(Hardware Port: USB 10/100/1000 LAN, Device: en5)
+
+(*) VPN (Cisco IPSec)
+(Hardware Port: VPN (Cisco IPSec), Device: )
+";
+        assert_eq!(
+            parse_service_name_for_device(output, "en0").as_deref(),
+            Some("Wi-Fi")
+        );
+        assert_eq!(
+            parse_service_name_for_device(output, "bridge0").as_deref(),
+            Some("Thunderbolt Bridge")
+        );
+        assert_eq!(
+            parse_service_name_for_device(output, "en5").as_deref(),
+            Some("USB 10/100/1000 LAN")
+        );
+        // Unknown device and the device-less VPN pseudo-service yield nothing.
+        assert_eq!(parse_service_name_for_device(output, "en9"), None);
+    }
+
+    #[test]
+    fn parse_device_from_hw_line_handles_present_and_empty() {
+        assert_eq!(
+            parse_device_from_hw_line(" Wi-Fi, Device: en0)").as_deref(),
+            Some("en0")
+        );
+        assert_eq!(parse_device_from_hw_line(" VPN (Cisco IPSec), Device: )"), None);
+        assert_eq!(parse_device_from_hw_line(" no device field here)"), None);
     }
 }
