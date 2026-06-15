@@ -152,7 +152,7 @@ fn cmd_status() -> anyhow::Result<()> {
 
     let connections: Vec<ConnectionState> = ConnectionState::load_all()?
         .into_iter()
-        .filter(|conn| conn.provider == "wgconf")
+        .filter(|conn| conn.provider == "wgconf" && conn.is_live())
         .collect();
 
     if connections.is_empty() {
