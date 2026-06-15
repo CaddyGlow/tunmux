@@ -142,6 +142,9 @@ pub fn serve(
         match listener.accept() {
             Ok((stream, _)) => {
                 let mut stream = stream;
+                // On macOS (BSD), accepted sockets inherit O_NONBLOCK from the listener.
+                // The connection must be handled in blocking mode so write_all() doesn't EAGAIN.
+                stream.set_nonblocking(false)?;
                 loop {
                     match handle_client(
                         &mut stream,
