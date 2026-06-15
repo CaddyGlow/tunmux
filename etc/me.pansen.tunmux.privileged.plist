@@ -14,12 +14,36 @@
         <string>--serve</string>
         <string>--authorized-group</string>
         <string>tunmux</string>
+        <string>--autostarted</string>
+        <string>--idle-timeout-ms</string>
+        <string>60000</string>
     </array>
 
+    <key>Sockets</key>
+    <dict>
+        <key>Listeners</key>
+        <dict>
+            <key>SockPathName</key>
+            <string>/Library/Application Support/tunmux/run/ctl.sock</string>
+            <!-- SockPathGroup requires an integer GID, not a name — group is set by the
+                 daemon via chown immediately after receiving the fd from launch_activate_socket. -->
+            <!-- 0660 octal = 432 decimal; plist <integer> is base-10 -->
+            <key>SockPathMode</key>
+            <integer>432</integer>
+        </dict>
+    </dict>
+
+    <!-- Extend PATH so that Homebrew tools (wg, etc.) are reachable from the daemon.
+         launchd default is /usr/bin:/bin:/usr/sbin:/sbin which misses /opt/homebrew/bin. -->
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>/opt/homebrew/bin:/opt/homebrew/sbin:/usr/local/bin:/usr/local/sbin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+    </dict>
+
+    <!-- On-demand: launchd spawns on first connect, daemon exits on idle, launchd re-spawns. -->
     <key>RunAtLoad</key>
-    <true />
-    <key>KeepAlive</key>
-    <true />   <!-- genuinely long-running; restart on crash -->
+    <false/>
 
     <key>StandardOutPath</key>
     <string>/var/log/tunmux/privileged.out.log</string>

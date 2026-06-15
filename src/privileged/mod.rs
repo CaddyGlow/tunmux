@@ -84,9 +84,26 @@ pub fn serve(
             gid = ?gid, "socket_dir_chowned");
     }
 
-    let listener = match systemd_activated_listener()? {
+    let activated = {
+        #[cfg(target_os = "macos")]
+        { launchd_activated_listener()? }
+        #[cfg(not(target_os = "macos"))]
+        { systemd_activated_listener()? }
+    };
+
+    let listener = match activated {
         Some(listener) => {
-            info!("privileged_service_systemd_socket_activation");
+            info!("privileged_service_socket_activation");
+            // launchd created the socket; set group and mode here since SockPathGroup
+            // in the plist requires an integer GID which isn't known at plist-authoring time.
+            let socket_path = config::privileged_socket_path();
+            std::fs::set_permissions(&socket_path, std::fs::Permissions::from_mode(0o660))?;
+            if let Some(gid) = group_gid {
+                chown(&socket_path, None, Some(Gid::from_raw(gid)))?;
+                info!(
+                    path = ?socket_path.display().to_string(),
+                    gid = ?gid, "socket_file_chowned");
+            }
             listener
         }
         None => {
@@ -203,6 +220,47 @@ pub fn serve_stdio(cli_idle_timeout_ms: Option<u64>, cli_autostarted: bool) -> a
     }
 }
 
+#[cfg(target_os = "macos")]
+extern "C" {
+    fn launch_activate_socket(
+        name: *const std::ffi::c_char,
+        fds: *mut *mut std::ffi::c_int,
+        cnt: *mut usize,
+    ) -> std::ffi::c_int;
+}
+
+/// On macOS, retrieve a launchd socket-activation listener for the `Listeners` socket
+/// declared in the LaunchDaemon plist. Returns `Ok(None)` when this process was not
+/// launched by launchd with that socket (e.g. a sudo-spawned daemon), so the caller
+/// falls through to the self-bind path.
+#[cfg(target_os = "macos")]
+fn launchd_activated_listener() -> anyhow::Result<Option<std::os::unix::net::UnixListener>> {
+    use nix::libc;
+    use std::ffi::CString;
+
+    let name = CString::new("Listeners").unwrap();
+    let mut fds: *mut std::ffi::c_int = std::ptr::null_mut();
+    let mut count: usize = 0;
+
+    // SAFETY: launch_activate_socket writes a heap-allocated fd array we must free.
+    let ret = unsafe { launch_activate_socket(name.as_ptr(), &mut fds, &mut count) };
+    if ret != 0 || fds.is_null() || count == 0 {
+        if !fds.is_null() {
+            unsafe { libc::free(fds as *mut libc::c_void) };
+        }
+        // Non-zero (commonly ESRCH when not launchd-managed) → not activated.
+        return Ok(None);
+    }
+
+    // We declare exactly one listener socket in the plist; take the first fd.
+    let fd = unsafe { *fds };
+    unsafe { libc::free(fds as *mut libc::c_void) };
+
+    let listener = unsafe { std::os::unix::net::UnixListener::from_raw_fd(fd) };
+    Ok(Some(listener))
+}
+
+#[cfg(not(target_os = "macos"))]
 fn systemd_activated_listener() -> anyhow::Result<Option<std::os::unix::net::UnixListener>> {
     let Some(listen_pid) = std::env::var("LISTEN_PID").ok() else {
         return Ok(None);
