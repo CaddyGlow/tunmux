@@ -553,6 +553,7 @@ fn describe_request(request: &PrivilegedRequest) -> &'static str {
         PrivilegedRequest::LeaseAcquire { .. } => "LeaseAcquire",
         PrivilegedRequest::LeaseRelease { .. } => "LeaseRelease",
         PrivilegedRequest::ShutdownIfIdle => "ShutdownIfIdle",
+        PrivilegedRequest::InterfaceActive { .. } => "InterfaceActive",
         PrivilegedRequest::WgShow { .. } => "WgShow",
     }
 }

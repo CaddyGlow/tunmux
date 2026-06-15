@@ -406,6 +406,16 @@ pub(super) fn dispatch(
                 message: format!("{}", e),
             },
         },
+
+        PrivilegedRequest::InterfaceActive { interface } => {
+            // The userspace UAPI control socket. Checked here (as root) because
+            // `/var/run/wireguard` is `0750 root:daemon` and unreachable from an
+            // unprivileged caller; this mirrors the old local `exists()` probe
+            // but from a context that can actually see the socket.
+            let socket_path =
+                std::path::PathBuf::from("/var/run/wireguard").join(format!("{interface}.sock"));
+            PrivilegedResponse::Bool(socket_path.exists())
+        }
     }
 }
 

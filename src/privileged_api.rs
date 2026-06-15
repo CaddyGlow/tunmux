@@ -145,6 +145,15 @@ pub enum PrivilegedRequest {
     },
     ShutdownIfIdle,
 
+    /// Liveness probe for a userspace tunnel: returns whether the UAPI control
+    /// socket at `/var/run/wireguard/<interface>.sock` exists. Run by the
+    /// privileged service (root) because that directory is `0750 root:daemon`
+    /// and cannot be stat'd by an unprivileged caller — a local `exists()`
+    /// check there is permission-blind and always reports the tunnel as down.
+    InterfaceActive {
+        interface: String,
+    },
+
     /// Run `wg show <interface>` and return the output (works for kernel, wg-quick, and
     /// userspace backends since the `wg` tool reads the UAPI socket at
     /// `/var/run/wireguard/<interface>.sock` for userspace interfaces).
@@ -318,6 +327,7 @@ impl PrivilegedRequest {
                 validate_lease_token(token)
             }
             Self::ShutdownIfIdle => Ok(()),
+            Self::InterfaceActive { interface } => validate_interface_name(interface),
             Self::WgShow { interface } => validate_interface_name(interface),
         }
     }

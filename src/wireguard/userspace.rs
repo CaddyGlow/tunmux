@@ -68,9 +68,18 @@ pub fn down_raw(interface_name: &str) -> Result<()> {
 }
 
 /// Check if a userspace interface appears active by control socket presence.
+///
+/// The UAPI control socket lives in `/var/run/wireguard`, which is
+/// `0750 root:daemon` on macOS. An unprivileged caller cannot even stat inside
+/// it, so a local `Path::exists()` is permission-blind: `stat` fails with
+/// `EACCES` and `exists()` returns `false`, making a live tunnel look dead.
+/// That false negative drove an autoconnect reconnect storm. Ask the privileged
+/// service instead — it runs as root and can see the socket. On any transport
+/// error we conservatively report "not active" (matching the old best-effort
+/// semantics).
 #[must_use]
 pub fn is_interface_active(interface_name: &str) -> bool {
-    std::path::Path::new("/var/run/wireguard")
-        .join(format!("{interface_name}.sock"))
-        .exists()
+    PrivilegedClient::new()
+        .interface_active(interface_name)
+        .unwrap_or(false)
 }

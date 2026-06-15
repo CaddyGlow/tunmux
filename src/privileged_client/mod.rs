@@ -315,6 +315,21 @@ impl PrivilegedClient {
         }
     }
 
+    /// Ask the privileged service whether the userspace UAPI control socket for
+    /// `interface` exists. Used for liveness checks that would otherwise be
+    /// permission-blind from an unprivileged caller (the socket dir is
+    /// `0750 root:daemon`).
+    pub fn interface_active(&self, interface: &str) -> Result<bool> {
+        match self.send(PrivilegedRequest::InterfaceActive {
+            interface: interface.to_string(),
+        })? {
+            PrivilegedResponse::Bool(active) => Ok(active),
+            _ => Err(AppError::Other(
+                "invalid privileged response for InterfaceActive".into(),
+            )),
+        }
+    }
+
     pub fn ensure_dir(&self, path: &str, mode: u32) -> Result<()> {
         self.send_unit(PrivilegedRequest::EnsureDir {
             path: path.to_string(),

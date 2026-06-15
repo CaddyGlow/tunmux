@@ -333,6 +333,24 @@ pub(super) fn run_gotatun_up(
 ) -> Result<()> {
     use base64::Engine;
 
+    // Idempotency / anti-race: every helper shares the control-socket path
+    // `/var/run/wireguard/<interface>.sock` (keyed by the logical name). If a
+    // previous helper is still alive and we spawn a second one, the departing
+    // helper's cleanup deletes the new helper's socket out from under it and the
+    // new helper self-terminates on `control_socket_removed`. Tear any existing
+    // live helper down cleanly first so there is never more than one and the new
+    // socket can't be clobbered by a concurrent teardown.
+    if let Ok(Some(existing_pid)) = read_gotatun_pid(&gotatun_pid_path(interface)) {
+        if pid_is_alive(existing_pid) {
+            debug!(
+                interface,
+                pid = existing_pid,
+                "gotatun_up_replacing_existing_helper"
+            );
+            run_gotatun_down(interface)?;
+        }
+    }
+
     let exe = self_executable_for_spawn()?;
     let config_b64 = base64::engine::general_purpose::STANDARD.encode(config_content);
     for path in [
