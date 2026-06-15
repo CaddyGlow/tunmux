@@ -24,6 +24,8 @@ install/privileged:
 	sudo /usr/libexec/PlistBuddy -c "Add :Sockets:Listeners:SockPathGroup integer $$GID" \
 		/Library/LaunchDaemons/me.pansen.tunmux.privileged.plist
 	sudo launchctl bootout system/me.pansen.tunmux.privileged 2>/dev/null || true
+	@# Clear any stale "disabled" override — bootstrap of a disabled label fails with EIO (5).
+	sudo launchctl enable system/me.pansen.tunmux.privileged
 	sudo launchctl bootstrap system /Library/LaunchDaemons/me.pansen.tunmux.privileged.plist
 
 
