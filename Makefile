@@ -64,6 +64,7 @@ check/privileged:
 	sudo log show --predicate 'sender == "launchd"' --last 10m --info | grep tunmux | tail -n30
 	sudo tail -n20  /var/log/tunmux/*
 	ps axu | grep tunmux
+	ping -c2 55.56.57.2
 
 .PHONY: check
 check: check/privileged
