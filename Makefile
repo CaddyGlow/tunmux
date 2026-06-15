@@ -51,6 +51,30 @@ install/autostart:
 install: build.release install/privileged install/wrapper install/autostart
 
 
+.PHONY: uninstall/autostart
+uninstall/autostart:
+	launchctl bootout gui/$$(id -u)/me.pansen.tunmux.autoconnect 2>/dev/null || true
+	rm -f $$HOME/Library/LaunchAgents/me.pansen.tunmux.autoconnect.plist
+
+.PHONY: uninstall/wrapper
+uninstall/wrapper:
+	rm -f $$HOME/.local/bin/tunmux-autoconnect.sh
+
+.PHONY: uninstall/privileged
+uninstall/privileged:
+	sudo launchctl bootout system/me.pansen.tunmux.privileged 2>/dev/null || true
+	sudo launchctl disable system/me.pansen.tunmux.privileged 2>/dev/null || true
+	sudo pkill -f '/usr/local/bin/tunmux wgconf' 2>/dev/null || true
+	sudo rm -f /Library/LaunchDaemons/me.pansen.tunmux.privileged.plist
+	sudo rm -f /usr/local/bin/tunmux
+	sudo rm -rf "/Library/Application Support/tunmux"
+	sudo rm -rf /var/log/tunmux
+	sudo dseditgroup -o delete tunmux 2>/dev/null || true
+
+.PHONY: uninstall
+uninstall: uninstall/autostart uninstall/wrapper uninstall/privileged
+
+
 .PHONY: check/privileged
 check/privileged:
 	@echo "==> daemon (expect: state = not running, sockets registered)"
