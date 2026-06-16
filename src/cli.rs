@@ -47,7 +47,7 @@ pub struct Cli {
     pub command: TopCommand,
 
     /// Enable verbose logging
-    #[arg(short, long, global = true)]
+    #[arg(short, long, visible_alias = "debug", global = true)]
     pub verbose: bool,
 }
 
@@ -345,7 +345,7 @@ pub struct WgconfConnectArgs {
     #[arg(long)]
     pub disable_ipv6: bool,
 
-    /// Set WireGuard interface MTU (direct kernel mode)
+    /// Set WireGuard interface MTU (direct kernel or userspace mode)
     #[arg(long)]
     pub mtu: Option<u16>,
 }
@@ -737,6 +737,9 @@ pub enum WgconfCommand {
         all: bool,
     },
 
+    /// Show wgconf connection status (and `wg show` transfer/handshake)
+    Status,
+
     /// Save a WireGuard config file as a named profile
     Save {
         /// WireGuard .conf file path
@@ -909,6 +912,17 @@ mod tests {
         ProtonPortAction, ProviderArg, TopCommand, WgconfCommand,
     };
     use clap::Parser;
+
+    #[test]
+    fn parse_global_debug_alias_enables_verbose_logging() {
+        let before = Cli::try_parse_from(["tunmux", "--debug", "status"])
+            .expect("parse debug before command");
+        assert!(before.verbose);
+
+        let after = Cli::try_parse_from(["tunmux", "status", "--debug"])
+            .expect("parse debug after command");
+        assert!(after.verbose);
+    }
 
     #[test]
     fn parse_connect_wgconf_with_file() {

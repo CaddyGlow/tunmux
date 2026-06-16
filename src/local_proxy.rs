@@ -240,7 +240,7 @@ pub fn stop_daemon(pid: u32) -> anyhow::Result<()> {
     anyhow::bail!("local-proxy-daemon {} is still alive after SIGKILL", pid)
 }
 
-fn proc_alive(pid: u32) -> bool {
+pub(crate) fn proc_alive(pid: u32) -> bool {
     let rc = unsafe { libc::kill(pid as libc::pid_t, 0) };
     if rc == 0 {
         return true;

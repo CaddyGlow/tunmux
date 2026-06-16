@@ -16,8 +16,8 @@ use crate::error::{AppError, Result};
 use crate::privileged_api::PrivilegedRequest;
 
 use super::util::{
-    configured_privileged_stdio_log_path, map_sudo_spawn_error, request_kind, shell_quote,
-    startup_lock_dir, stderr_requires_password, run_sudo_validate_with_timeout,
+    configured_privileged_stdio_log_path, map_sudo_spawn_error, request_kind,
+    run_sudo_validate_with_timeout, shell_quote, startup_lock_dir, stderr_requires_password,
 };
 use super::PrivilegedClient;
 
@@ -285,11 +285,19 @@ impl PrivilegedClient {
             .arg("--autostarted")
             .arg("--authorized-group")
             .arg(self.authorized_group.as_str());
+        if crate::logging::debug_enabled() {
+            command.arg("--debug");
+        }
         if let Some(idle_timeout_ms) = self.daemon_idle_timeout_ms {
             command
                 .arg("--idle-timeout-ms")
                 .arg(idle_timeout_ms.to_string());
         }
+        // Detach the daemon's stdio. It is a long-lived background service; if it inherited the
+        // foreground process's stdout/stderr it would hold those fds (e.g. a `| tee` pipe) open
+        // for its whole lifetime, so the shell pipeline would never see EOF and would hang long
+        // after this command exited. Capture to the configured log file when set, else /dev/null.
+        command.stdin(Stdio::null());
         if let Some(log_path) = configured_privileged_stdio_log_path() {
             if let Some(parent) = log_path.parent() {
                 let _ = fs::create_dir_all(parent);
@@ -314,6 +322,9 @@ impl PrivilegedClient {
                 "privileged daemon start: capturing sudo/daemon stdio to {}",
                 log_path.display()
             );
+        } else {
+            command.stdout(Stdio::null());
+            command.stderr(Stdio::null());
         }
         debug!(cmd = "sudo -n -b tunmux privileged --serve", "exec");
         let status = command
@@ -382,6 +393,9 @@ impl PrivilegedClient {
             .arg(self.authorized_group.as_str())
             .stdin(Stdio::piped())
             .stdout(Stdio::piped());
+        if crate::logging::debug_enabled() {
+            command.arg("--debug");
+        }
 
         if let Some(idle_timeout_ms) = self.daemon_idle_timeout_ms {
             command
@@ -530,17 +544,7 @@ impl PrivilegedClient {
             .map_err(|e| AppError::Other(format!("flush request: {}", e)))?;
 
         let mut reader = BufReader::new(stream);
-        let mut response_line = String::new();
-        reader
-            .read_line(&mut response_line)
-            .map_err(|e| AppError::Other(format!("read response: {}", e)))?;
-        if response_line.trim().is_empty() {
-            return Err(AppError::Other(
-                "empty response from privileged server".into(),
-            ));
-        }
-        let response: super::PrivilegedResponse = serde_json::from_str(&response_line)
-            .map_err(|e| AppError::Other(format!("decode response: {}", e)))?;
+        let response = read_framed_response(&mut reader)?;
         tracing::trace!( request = ?request_kind(request), "privileged_ctl_response");
 
         super::map_privileged_error(response)
@@ -568,20 +572,96 @@ impl PrivilegedClient {
             .flush()
             .map_err(|e| AppError::Other(format!("flush request stdin: {}", e)))?;
 
-        let mut response_line = String::new();
-        session
-            .stdout
-            .read_line(&mut response_line)
-            .map_err(|e| AppError::Other(format!("read response stdout: {}", e)))?;
-        if response_line.trim().is_empty() {
-            return Err(AppError::Other(
-                "empty response from privileged server".into(),
-            ));
-        }
-        let response: super::PrivilegedResponse = serde_json::from_str(&response_line)
-            .map_err(|e| AppError::Other(format!("decode response: {}", e)))?;
+        let response = read_framed_response(&mut session.stdout)?;
         tracing::trace!(
             request = ?request_kind(request), "privileged_ctl_stdio_response");
         super::map_privileged_error(response)
+    }
+}
+
+/// Read the server's reply, which is zero or more log frames (`{"log":"…"}`) followed by exactly
+/// one response frame (`{"kind":…}`). Log frames are printed to stderr (so the operation's
+/// privileged-side logs appear in the caller's terminal); the response frame is returned.
+///
+/// Backward compatible: an older server that sends only a response produces no log frames, so the
+/// first line is parsed as the response.
+fn read_framed_response<R: BufRead>(reader: &mut R) -> Result<super::PrivilegedResponse> {
+    loop {
+        let mut line = String::new();
+        let bytes = reader
+            .read_line(&mut line)
+            .map_err(|e| AppError::Other(format!("read response: {}", e)))?;
+        if bytes == 0 {
+            return Err(AppError::Other(
+                "privileged server closed connection before responding".into(),
+            ));
+        }
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        // One deserialize per line: a log frame (`{"log":"…"}`) and a response frame
+        // (`{"kind":…}`) are structurally disjoint, so an untagged enum picks the right one.
+        match serde_json::from_str::<Frame>(trimmed)
+            .map_err(|e| AppError::Other(format!("decode response: {}", e)))?
+        {
+            Frame::Log { log } => eprintln!("{log}"),
+            Frame::Response(response) => return Ok(response),
+        }
+    }
+}
+
+/// One newline-delimited reply frame: either a streamed log line or the final response.
+#[derive(serde::Deserialize)]
+#[serde(untagged)]
+enum Frame {
+    Log { log: String },
+    Response(super::PrivilegedResponse),
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::PrivilegedResponse;
+    use super::{read_framed_response, Frame};
+    use std::io::Cursor;
+
+    fn reader(s: &str) -> Cursor<Vec<u8>> {
+        Cursor::new(s.as_bytes().to_vec())
+    }
+
+    #[test]
+    fn reads_lone_response_frame() {
+        // Backward compatible: a server that sends only a response (no logs) still works.
+        let mut r = reader("{\"kind\":\"unit\"}\n");
+        assert!(matches!(
+            read_framed_response(&mut r).unwrap(),
+            PrivilegedResponse::Unit
+        ));
+    }
+
+    #[test]
+    fn skips_log_frames_then_returns_response() {
+        let input =
+            "{\"log\":\"first\"}\n{\"log\":\"second\"}\n{\"kind\":\"bool\",\"value\":true}\n";
+        let mut r = reader(input);
+        assert!(matches!(
+            read_framed_response(&mut r).unwrap(),
+            PrivilegedResponse::Bool(true)
+        ));
+    }
+
+    #[test]
+    fn log_and_response_frames_are_disjoint() {
+        // The response frame must not be misread as a log frame, and vice versa.
+        let log: Frame = serde_json::from_str("{\"log\":\"hi\"}").unwrap();
+        assert!(matches!(log, Frame::Log { .. }));
+        let resp: Frame = serde_json::from_str("{\"kind\":\"unit\"}").unwrap();
+        assert!(matches!(resp, Frame::Response(PrivilegedResponse::Unit)));
+    }
+
+    #[test]
+    fn errors_when_closed_before_response() {
+        let mut r = reader("{\"log\":\"only a log\"}\n");
+        assert!(read_framed_response(&mut r).is_err());
     }
 }

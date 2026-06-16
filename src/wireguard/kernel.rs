@@ -7,7 +7,7 @@ use crate::privileged_client::PrivilegedClient;
 use tracing::{debug, info, warn};
 
 use super::backend::WgBackend;
-use super::config::WgConfigParams;
+use super::config::{validate_mtu, WgConfigParams};
 use super::connection::{ConnectionState, DIRECT_INSTANCE};
 use super::handshake;
 
@@ -625,16 +625,6 @@ fn has_ipv6_interface_address(addresses: &[&str]) -> bool {
 
 fn allowed_ips_contains_ipv6_default(allowed_ips: &str) -> bool {
     allowed_ips.split(',').any(|entry| entry.trim() == "::/0")
-}
-
-fn validate_mtu(mtu: u16) -> Result<()> {
-    if mtu < 576 {
-        return Err(AppError::WireGuard(format!(
-            "invalid MTU {} (must be >= 576)",
-            mtu
-        )));
-    }
-    Ok(())
 }
 
 fn is_systemd_resolved_managed_resolv_conf(path: &str) -> bool {

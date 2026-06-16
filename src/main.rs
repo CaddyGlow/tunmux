@@ -42,6 +42,9 @@ fn main() {
     }
 
     let cli = Cli::parse();
+    if cli.verbose {
+        logging::enable_debug();
+    }
 
     match cli.command {
         // Privileged control server.
@@ -52,7 +55,9 @@ fn main() {
             idle_timeout_ms,
             autostarted,
         } => {
-            init_logging(cli.verbose);
+            // The privileged service captures per-request log output so it can be streamed back
+            // to the calling CLI (see logging::begin_log_capture / privileged::process_request).
+            logging::init_service(cli.verbose);
             if !serve {
                 eprintln!("privileged mode requires --serve");
                 std::process::exit(1);

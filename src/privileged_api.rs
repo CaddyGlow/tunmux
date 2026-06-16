@@ -104,6 +104,10 @@ pub enum PrivilegedRequest {
         action: GotaTunAction,
         interface: String,
         config_content: String,
+        #[serde(default)]
+        mtu_override: Option<u16>,
+        #[serde(default)]
+        debug: bool,
     },
 
     EnsureDir {
@@ -187,10 +191,8 @@ impl PrivilegedRequest {
             Self::HostIpLinkSetUp { interface } => validate_interface_name(interface),
             Self::HostIpLinkSetMtu { interface, mtu } => {
                 validate_interface_name(interface)?;
-                if *mtu < 576 {
-                    return Err("mtu must be >= 576".into());
-                }
-                Ok(())
+                // Reuse the single MTU rule so the threshold/messaging never drifts.
+                crate::wireguard::config::validate_mtu(*mtu).map_err(|e| e.to_string())
             }
             Self::HostIpRouteAdd {
                 destination,
@@ -269,10 +271,15 @@ impl PrivilegedRequest {
                 action,
                 interface,
                 config_content,
+                mtu_override,
+                ..
             } => {
                 validate_interface_name(interface)?;
                 if matches!(action, GotaTunAction::Up) && config_content.trim().is_empty() {
                     return Err("config_content cannot be empty".into());
+                }
+                if let Some(mtu) = mtu_override {
+                    crate::wireguard::config::validate_mtu(*mtu).map_err(|e| e.to_string())?;
                 }
                 Ok(())
             }

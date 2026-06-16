@@ -27,6 +27,7 @@ struct RoutedConfig {
     private_key: String,
     addresses: Vec<String>,
     dns_servers: Vec<String>,
+    mtu: Option<u16>,
     server_public_key: String,
     server_ip: String,
     server_port: u16,
@@ -38,6 +39,7 @@ pub async fn dispatch(command: WgconfCommand, config: &AppConfig) -> anyhow::Res
     match command {
         WgconfCommand::Connect(args) => cmd_connect(args, config),
         WgconfCommand::Disconnect { instance, all } => cmd_disconnect(instance, all, config),
+        WgconfCommand::Status => cmd_status(),
         WgconfCommand::Save { file, name } => cmd_save(&file, &name),
         WgconfCommand::List => cmd_list(),
         WgconfCommand::Remove { name } => cmd_remove(&name),
@@ -63,11 +65,15 @@ fn cmd_connect(args: WgconfConnectArgs, config: &AppConfig) -> anyhow::Result<()
     if args.mtu.is_some()
         && !args.proxy
         && !args.local_proxy
-        && backend != wireguard::backend::WgBackend::Kernel
+        && !matches!(
+            backend,
+            wireguard::backend::WgBackend::Kernel | wireguard::backend::WgBackend::Userspace
+        )
     {
-        anyhow::bail!(
-            "--mtu for wgconf is supported only in kernel mode (or with --proxy kernel mode)"
-        );
+        anyhow::bail!("--mtu for wgconf is supported only with kernel or userspace backends");
+    }
+    if let Some(mtu) = args.mtu {
+        wireguard::config::validate_mtu(mtu)?;
     }
 
     let source = resolve_source(args.file.as_deref(), args.profile.as_deref())?;
@@ -105,7 +111,7 @@ fn cmd_connect(args: WgconfConnectArgs, config: &AppConfig) -> anyhow::Result<()
         let routed = routed
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("missing parsed routed config"))?;
-        connect_local_proxy(&source, routed, args.mtu, config)?;
+        connect_local_proxy(&source, routed, config)?;
     } else {
         connect_direct(
             &source,
@@ -140,6 +146,51 @@ fn cmd_list() -> anyhow::Result<()> {
     Ok(())
 }
 
+fn cmd_status() -> anyhow::Result<()> {
+    use crate::privileged_client::PrivilegedClient;
+    use crate::wireguard::connection::ConnectionState;
+
+    let connections: Vec<ConnectionState> = ConnectionState::load_all()?
+        .into_iter()
+        .filter(|conn| conn.provider == "wgconf")
+        .collect();
+
+    if connections.is_empty() {
+        println!("Not connected.");
+        return Ok(());
+    }
+
+    for (index, conn) in connections.iter().enumerate() {
+        if index > 0 {
+            println!();
+        }
+        println!("Connected: {}", conn.server_display_name);
+        println!("  instance:  {}", conn.instance_name);
+        println!("  interface: {}", conn.interface_name);
+        println!("  endpoint:  {}", conn.server_endpoint);
+        println!("  backend:   {}", conn.backend);
+        if !conn.dns_servers.is_empty() {
+            println!("  dns:       {}", conn.dns_servers.join(", "));
+        }
+
+        // Live handshake/transfer via `wg show` (through the privileged service). The service is
+        // already running while connected, so this does not trigger a new sudo prompt.
+        match PrivilegedClient::new().wg_show(&conn.interface_name) {
+            Ok(output) if !output.trim().is_empty() => {
+                println!();
+                print!("{}", output);
+                if !output.ends_with('\n') {
+                    println!();
+                }
+            }
+            Ok(_) => {}
+            Err(e) => eprintln!("wg show {} failed: {}", conn.interface_name, e),
+        }
+    }
+
+    Ok(())
+}
+
 fn cmd_remove(name: &str) -> anyhow::Result<()> {
     remove_profile(name)?;
     println!("Removed profile {}", name);
@@ -156,8 +207,12 @@ fn connect_direct(
 ) -> anyhow::Result<()> {
     use wireguard::connection::DIRECT_INSTANCE;
 
-    if wireguard::connection::ConnectionState::exists(DIRECT_INSTANCE) {
-        anyhow::bail!("Already connected via direct VPN. Disconnect first.");
+    match connection_ops::direct_connection_active()? {
+        connection_ops::DirectSlotStatus::Active => {
+            anyhow::bail!("Already connected via direct VPN. Disconnect first.")
+        }
+        connection_ops::DirectSlotStatus::ClearedStale(message) => println!("{}", message),
+        connection_ops::DirectSlotStatus::Free => {}
     }
     if wireguard::wg_quick::is_interface_active(INTERFACE_NAME)
         || wireguard::userspace::is_interface_active(INTERFACE_NAME)
@@ -201,8 +256,12 @@ fn connect_direct(
             state.save()?;
         }
         wireguard::backend::WgBackend::Userspace => {
-            let effective_iface =
-                wireguard::userspace::up(&source.config_text, INTERFACE_NAME, PROVIDER)?;
+            let effective_iface = wireguard::userspace::up_with_mtu(
+                &source.config_text,
+                INTERFACE_NAME,
+                PROVIDER,
+                mtu,
+            )?;
             let state = wireguard::connection::ConnectionState {
                 instance_name: DIRECT_INSTANCE.to_string(),
                 provider: PROVIDER.dir_name().to_string(),
@@ -242,7 +301,7 @@ fn connect_direct(
                 private_key: &routed.private_key,
                 addresses: &addresses,
                 dns_servers: &dns_servers,
-                mtu,
+                mtu: mtu.or(routed.mtu),
                 server_public_key: &routed.server_public_key,
                 server_ip: &routed.server_ip,
                 server_port: routed.server_port,
@@ -294,7 +353,7 @@ fn connect_proxy(
         private_key: &routed.private_key,
         addresses: &addresses,
         dns_servers: &dns_servers,
-        mtu,
+        mtu: mtu.or(routed.mtu),
         server_public_key: &routed.server_public_key,
         server_ip: &routed.server_ip,
         server_port: routed.server_port,
@@ -319,7 +378,6 @@ fn connect_proxy(
 fn connect_local_proxy(
     source: &ConfigSource,
     routed: &RoutedConfig,
-    mtu: Option<u16>,
     config: &AppConfig,
 ) -> anyhow::Result<()> {
     let instance = connection_ops::derive_instance_name(
@@ -337,7 +395,7 @@ fn connect_local_proxy(
         private_key: &routed.private_key,
         addresses: &addresses,
         dns_servers: &dns_servers,
-        mtu,
+        mtu: None,
         server_public_key: &routed.server_public_key,
         server_ip: &routed.server_ip,
         server_port: routed.server_port,
@@ -462,6 +520,7 @@ fn parse_routed_config(config_text: &str) -> anyhow::Result<RoutedConfig> {
         private_key: parsed.private_key.clone(),
         addresses,
         dns_servers,
+        mtu: parsed.mtu,
         server_public_key,
         server_ip,
         server_port,
@@ -738,10 +797,18 @@ mod tests {
         let parsed = parse_routed_config(with_dns).expect("parse routed config");
         assert_eq!(parsed.server_ip, "2001:db8::1");
         assert_eq!(parsed.server_port, 51820);
+        assert_eq!(parsed.mtu, None);
 
         let with_dns_hostname = "[Interface]\nPrivateKey = a\nAddress = 10.0.0.2/32\nDNS = 1.1.1.1\n[Peer]\nPublicKey = b\nAllowedIPs = 0.0.0.0/0\nEndpoint = localhost:51820\n";
         let parsed = parse_routed_config(with_dns_hostname).expect("parse hostname endpoint");
         assert_eq!(parsed.server_port, 51820);
+    }
+
+    #[test]
+    fn routed_parse_retains_interface_mtu() {
+        let config = "[Interface]\nPrivateKey = a\nAddress = 10.0.0.2/32\nDNS = 1.1.1.1\nMTU = 1280\n[Peer]\nPublicKey = b\nAllowedIPs = 0.0.0.0/0\nEndpoint = 198.51.100.10:51820\n";
+        let parsed = parse_routed_config(config).expect("parse routed config");
+        assert_eq!(parsed.mtu, Some(1280));
     }
 
     #[test]

@@ -6,6 +6,7 @@ pub struct WgParsedConfig {
     pub private_key: String,
     pub addresses: Vec<String>,
     pub dns_servers: Vec<String>,
+    pub mtu: Option<u16>,
     pub peers: Vec<WgParsedPeer>,
 }
 
@@ -50,6 +51,7 @@ pub fn parse_config(input: &str) -> Result<WgParsedConfig> {
     let mut private_key: Option<String> = None;
     let mut addresses: Vec<String> = Vec::new();
     let mut dns_servers: Vec<String> = Vec::new();
+    let mut mtu: Option<u16> = None;
     let mut peers: Vec<WgParsedPeer> = Vec::new();
 
     // Per-peer accumulators
@@ -127,6 +129,7 @@ pub fn parse_config(input: &str) -> Result<WgParsedConfig> {
                 "dns" => {
                     dns_servers.extend(value.split(',').map(|s| s.trim().to_owned()));
                 }
+                "mtu" => mtu = Some(parse_mtu(value)?),
                 _ => {} // ignore unknown keys
             },
             Section::Peer => match key.to_ascii_lowercase().as_str() {
@@ -164,8 +167,31 @@ pub fn parse_config(input: &str) -> Result<WgParsedConfig> {
         private_key,
         addresses,
         dns_servers,
+        mtu,
         peers,
     })
+}
+
+pub fn parse_mtu(value: &str) -> Result<u16> {
+    let mtu = value
+        .parse::<u16>()
+        .map_err(|_| AppError::WireGuard(format!("invalid MTU {value:?} (expected an integer)")))?;
+    validate_mtu(mtu)?;
+    Ok(mtu)
+}
+
+/// Minimum MTU accepted anywhere in the codebase. The single source of truth for the
+/// threshold -- callers go through [`validate_mtu`] rather than re-checking this directly.
+pub const MIN_MTU: u16 = 576;
+
+pub fn validate_mtu(mtu: u16) -> Result<()> {
+    if mtu < MIN_MTU {
+        return Err(AppError::WireGuard(format!(
+            "invalid MTU {} (must be >= {})",
+            mtu, MIN_MTU
+        )));
+    }
+    Ok(())
 }
 
 /// Parameters needed to generate a WireGuard config.
@@ -309,6 +335,7 @@ mod tests {
         assert_eq!(parsed.private_key, params.private_key);
         assert_eq!(parsed.addresses, &["10.2.0.2/32"]);
         assert_eq!(parsed.dns_servers, &["10.2.0.1"]);
+        assert_eq!(parsed.mtu, None);
         assert_eq!(parsed.peers.len(), 1);
 
         let peer = &parsed.peers[0];
@@ -370,5 +397,22 @@ mod tests {
         let input = "[Interface]\nPrivateKey = abc\nAddress = 10.0.0.1/32\n";
         let err = parse_config(input).unwrap_err();
         assert!(err.to_string().contains("Peer"));
+    }
+
+    #[test]
+    fn test_parse_config_with_mtu() {
+        let input = "[Interface]\nPrivateKey = abc\nAddress = 10.0.0.1/32\nMTU = 1280\n[Peer]\nPublicKey = def\nAllowedIPs = 0.0.0.0/0\n";
+        let parsed = parse_config(input).unwrap();
+        assert_eq!(parsed.mtu, Some(1280));
+    }
+
+    #[test]
+    fn test_parse_config_rejects_invalid_mtu() {
+        for mtu in ["575", "not-a-number", "65536"] {
+            let input = format!(
+                "[Interface]\nPrivateKey = abc\nAddress = 10.0.0.1/32\nMTU = {mtu}\n[Peer]\nPublicKey = def\nAllowedIPs = 0.0.0.0/0\n"
+            );
+            assert!(parse_config(&input).is_err(), "MTU {mtu} should fail");
+        }
     }
 }

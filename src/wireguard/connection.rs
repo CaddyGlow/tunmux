@@ -108,4 +108,77 @@ impl ConnectionState {
             .join(format!("{}.json", instance))
             .exists()
     }
+
+    /// Best-effort probe of whether this saved connection is still actually
+    /// active on the system. Used to tell a real, live tunnel apart from stale
+    /// state left behind by a reboot or crash (e.g. a `_direct.json` whose
+    /// interface and control socket no longer exist after boot).
+    #[must_use]
+    pub fn is_live(&self) -> bool {
+        #[cfg(not(target_os = "android"))]
+        {
+            use super::{userspace, wg_quick};
+            match self.backend {
+                WgBackend::Userspace => userspace::is_interface_active(&self.interface_name),
+                // Kernel and wg-quick both back a named interface (Linux) or a
+                // kernel-assigned utunN (macOS); the same probe applies.
+                WgBackend::WgQuick | WgBackend::Kernel => {
+                    wg_quick::is_interface_active(&self.interface_name)
+                }
+                WgBackend::LocalProxy => self.proxy_pid.is_some_and(crate::local_proxy::proc_alive),
+            }
+        }
+        #[cfg(target_os = "android")]
+        {
+            self.proxy_pid.is_some_and(crate::local_proxy::proc_alive)
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::wireguard::backend::WgBackend;
+
+    fn sample(backend: WgBackend, interface: &str, proxy_pid: Option<u32>) -> ConnectionState {
+        ConnectionState {
+            instance_name: DIRECT_INSTANCE.to_string(),
+            provider: "wgconf".to_string(),
+            interface_name: interface.to_string(),
+            backend,
+            server_endpoint: "198.51.100.1:51820".to_string(),
+            server_display_name: "test".to_string(),
+            original_gateway_ip: None,
+            original_gateway_iface: None,
+            original_resolv_conf: None,
+            namespace_name: None,
+            proxy_pid,
+            socks_port: None,
+            http_port: None,
+            dns_servers: vec![],
+            peer_public_key: None,
+            local_public_key: None,
+            virtual_ips: vec![],
+            keepalive_secs: None,
+        }
+    }
+
+    // The reboot bug: a saved userspace tunnel whose control socket no longer
+    // exists must be reported as not live (so the stale state gets pruned).
+    #[cfg(not(target_os = "android"))]
+    #[test]
+    fn userspace_state_with_missing_interface_is_not_live() {
+        let state = sample(
+            WgBackend::Userspace,
+            "__tunmux_nonexistent_test_iface__",
+            None,
+        );
+        assert!(!state.is_live());
+    }
+
+    #[test]
+    fn local_proxy_state_without_pid_is_not_live() {
+        let state = sample(WgBackend::LocalProxy, "wg0", None);
+        assert!(!state.is_live());
+    }
 }

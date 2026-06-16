@@ -1,6 +1,7 @@
 # Rust
 /target
 .cargo/
+/var
 
 # Android Rust library
 android/rust-lib/target

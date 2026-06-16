@@ -11,8 +11,9 @@ use crate::privileged_api::{
 };
 
 use super::commands::{
-    run, run_output, run_resolved_revert_dns, run_resolved_set_dns, run_wg_quick_down,
-    run_wg_quick_up, run_wg_show, run_gotatun_down, run_gotatun_up, set_preshared_key, wg_set,
+    run, run_gotatun_down, run_gotatun_up, run_output, run_resolved_revert_dns,
+    run_resolved_set_dns, run_wg_quick_down, run_wg_quick_up, run_wg_show, set_preshared_key,
+    wg_set,
 };
 use super::daemon::spawn_proxy_daemon;
 use super::managed_pids::{managed_pid_is_current, register_managed_pid, unregister_managed_pid};
@@ -206,9 +207,16 @@ pub(super) fn dispatch(
             action,
             interface,
             config_content,
+            mtu_override,
+            debug,
         } => match action {
             GotaTunAction::Up => {
-                match run_gotatun_up(interface.as_str(), config_content.as_str()) {
+                match run_gotatun_up(
+                    interface.as_str(),
+                    config_content.as_str(),
+                    mtu_override,
+                    debug,
+                ) {
                     Ok(()) => PrivilegedResponse::Unit,
                     Err(e) => PrivilegedResponse::Error {
                         code: categorize_error(&e),

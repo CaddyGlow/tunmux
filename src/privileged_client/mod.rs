@@ -290,11 +290,14 @@ impl PrivilegedClient {
         action: GotaTunAction,
         interface: &str,
         config_content: &str,
+        mtu_override: Option<u16>,
     ) -> Result<()> {
         self.send_unit(PrivilegedRequest::GotaTunRun {
             action,
             interface: interface.to_string(),
             config_content: config_content.to_string(),
+            mtu_override,
+            debug: crate::logging::debug_enabled(),
         })
     }
 

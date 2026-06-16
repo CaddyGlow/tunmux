@@ -418,7 +418,6 @@ async fn cmd_servers(
     Ok(())
 }
 
-
 fn mullvad_relay_matches_tags(
     manifest: &MullvadManifest,
     relay: &MullvadRelay,
@@ -462,7 +461,9 @@ async fn cmd_connect(
 ) -> anyhow::Result<()> {
     let backend = connection_ops::resolve_opts(&args.opts, &config.general.backend)?;
 
-    let effective_country = args.country.or_else(|| config.default_country_for(PROVIDER).map(str::to_owned));
+    let effective_country = args
+        .country
+        .or_else(|| config.default_country_for(PROVIDER).map(str::to_owned));
 
     let session: MullvadSession = config::load_session(PROVIDER, config)?;
     let client = api_client()?;

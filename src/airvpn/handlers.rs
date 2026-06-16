@@ -304,7 +304,6 @@ async fn probe_airvpn_latencies(
     latencies
 }
 
-
 async fn cmd_connect(
     args: crate::cli::AirVpnConnectArgs,
     config: &AppConfig,
@@ -312,7 +311,9 @@ async fn cmd_connect(
     let backend = connection_ops::resolve_opts(&args.opts, &config.general.backend)?;
 
     // Apply config defaults -- CLI flags override config
-    let effective_country = args.country.or_else(|| config.default_country_for(PROVIDER).map(str::to_owned));
+    let effective_country = args
+        .country
+        .or_else(|| config.default_country_for(PROVIDER).map(str::to_owned));
     let effective_key = args.key.or_else(|| config.airvpn.default_device.clone());
 
     let session: AirSession = config::load_session(PROVIDER, config)?;
