@@ -403,12 +403,10 @@ fn daemonize() -> anyhow::Result<()> {
     }
 
     // Redirect stdin/stdout/stderr to /dev/null
-    use std::os::unix::io::AsRawFd;
     let devnull = std::fs::File::open("/dev/null")?;
-    let fd = devnull.as_raw_fd();
-    nix::unistd::dup2(fd, 0)?; // stdin
-    nix::unistd::dup2(fd, 1)?; // stdout
-    nix::unistd::dup2(fd, 2)?; // stderr
+    nix::unistd::dup2_stdin(&devnull)?;
+    nix::unistd::dup2_stdout(&devnull)?;
+    nix::unistd::dup2_stderr(&devnull)?;
 
     Ok(())
 }

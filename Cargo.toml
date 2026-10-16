@@ -100,7 +100,7 @@ smoltcp = { version = "0.12", default-features = false, features = [
 rpassword = "7"
 
 # Linux namespaces
-nix = { version = "0.29", features = ["sched", "net", "fs", "signal", "process", "user", "mount"] }
+nix = { version = "0.31", features = ["sched", "net", "fs", "signal", "process", "user", "mount"] }
 
 # Daemonization and userspace WireGuard (unix, non-Android)
 daemonize = "0.5"

@@ -571,12 +571,10 @@ fn daemonize_local() -> anyhow::Result<()> {
         Err(e) => anyhow::bail!("second fork failed: {}", e),
     }
 
-    use std::os::unix::io::AsRawFd;
     let devnull = std::fs::File::open("/dev/null")?;
-    let fd = devnull.as_raw_fd();
-    nix::unistd::dup2(fd, 0)?;
-    nix::unistd::dup2(fd, 1)?;
-    nix::unistd::dup2(fd, 2)?;
+    nix::unistd::dup2_stdin(&devnull)?;
+    nix::unistd::dup2_stdout(&devnull)?;
+    nix::unistd::dup2_stderr(&devnull)?;
 
     Ok(())
 }
