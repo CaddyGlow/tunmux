@@ -4,11 +4,12 @@ use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 
 use anyhow::{anyhow, Context};
-use hickory_resolver::config::{NameServerConfigGroup, ResolverConfig, ResolverOpts};
-use hickory_resolver::TokioAsyncResolver;
+use hickory_resolver::config::{NameServerConfig, ResolverConfig, ResolverOpts};
+use hickory_resolver::net::runtime::TokioRuntimeProvider;
+use hickory_resolver::{Resolver, TokioResolver};
 use tracing::warn;
 
-pub type DnsResolver = Arc<TokioAsyncResolver>;
+pub type DnsResolver = Arc<TokioResolver>;
 
 pub fn build_dns_resolver_from_resolv_conf(content: &str) -> Option<DnsResolver> {
     let mut dns_ips: Vec<IpAddr> = Vec::new();
@@ -47,12 +48,21 @@ pub fn build_dns_resolver_from_resolv_conf(content: &str) -> Option<DnsResolver>
         return None;
     }
 
-    let nameservers = NameServerConfigGroup::from_ips_clear(&dns_ips, 53, true);
-    let config = ResolverConfig::from_parts(None, vec![], nameservers);
-    Some(Arc::new(TokioAsyncResolver::tokio(
-        config,
-        ResolverOpts::default(),
-    )))
+    let nameservers = dns_ips
+        .into_iter()
+        .map(NameServerConfig::udp_and_tcp)
+        .collect();
+    let config = ResolverConfig::from_name_servers(nameservers);
+    match Resolver::builder_with_config(config, TokioRuntimeProvider::default())
+        .with_options(ResolverOpts::default())
+        .build()
+    {
+        Ok(resolver) => Some(Arc::new(resolver)),
+        Err(error) => {
+            warn!(error = %error, "proxy_dns_resolver_build_failed");
+            None
+        }
+    }
 }
 
 pub async fn resolve_host_port(

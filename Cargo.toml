@@ -30,7 +30,7 @@ tokio = { version = "1", features = ["full"] }
 
 # HTTP
 reqwest = { version = "0.12", features = ["json", "rustls-tls", "cookies", "blocking"], default-features = false }
-hickory-resolver = { version = "0.24", features = ["tokio-runtime"] }
+hickory-resolver = { version = "0.26", default-features = false, features = ["tokio"] }
 
 # Serialization
 serde = { version = "1", features = ["derive"] }
