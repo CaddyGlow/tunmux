@@ -23,3 +23,6 @@ base64 = "0.22"
 socket2 = "0.5"
 gotatun = { version = "0.2.0", features = ["device", "tun"] }
 tun = { version = "0.8.5", features = ["async"], default-features = false }
+
+[patch.crates-io]
+smoltcp = { path = "../../third_party/smoltcp" }

@@ -86,7 +86,7 @@ keyring = { version = "3", optional = true }
 
 # Userspace WireGuard crypto + virtual TCP/IP stack for local-proxy mode
 boringtun = "0.7"
-smoltcp = { version = "0.12", default-features = false, features = [
+smoltcp = { version = "0.14", default-features = false, features = [
     "socket-tcp",
     "socket-udp",
     "proto-ipv4",
