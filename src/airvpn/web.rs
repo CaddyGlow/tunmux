@@ -292,7 +292,7 @@ impl AirVpnWeb {
 
     /// Full web login: GET homepage for csrfKey, POST credentials, extract ecsrf.
     pub async fn login(username: &str, password: &str) -> anyhow::Result<Self> {
-        let cookie_store = Arc::new(CookieStoreMutex::new(CookieStore::new(None)));
+        let cookie_store = Arc::new(CookieStoreMutex::new(CookieStore::new()));
         let client = Self::build_client(cookie_store.clone())?;
 
         // Step 1: GET /login/ to extract csrfKey from the login form.
