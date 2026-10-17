@@ -20,8 +20,7 @@ log = "0.4"
 android_logger = "0.14"
 libc = "0.2"
 base64 = "0.22"
-socket2 = "0.5"
-gotatun = { version = "0.2.0", features = ["device", "tun"] }
+gotatun = { version = "0.10", default-features = false, features = ["device", "tun", "ring"] }
 tun = { version = "0.8.5", features = ["async"], default-features = false }
 
 [patch.crates-io]

@@ -1,7 +1,8 @@
 use base64::Engine;
 use gotatun::device::{Device, DeviceBuilder, Peer};
 use gotatun::tun::tun_async_device::TunDevice;
-use gotatun::udp::{UdpRecv, UdpSend, UdpTransportFactory, UdpTransportFactoryParams};
+use gotatun::udp::socket::{UdpSocket, UdpSocketFactory};
+use gotatun::udp::{UdpTransportFactory, UdpTransportFactoryParams};
 use gotatun::x25519::{PublicKey, StaticSecret};
 use jni::objects::{GlobalRef, JClass, JObject, JString};
 use jni::sys::{jboolean, JNI_FALSE, JNI_TRUE};
@@ -10,9 +11,9 @@ use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::io;
 use std::net::{IpAddr, SocketAddr};
-use std::os::fd::AsRawFd;
+use std::os::fd::{AsFd, AsRawFd};
 use std::os::unix::io::RawFd;
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Mutex, OnceLock};
 #[cfg(target_os = "android")]
 use std::time::Duration;
 use tokio::runtime::Runtime;
@@ -243,92 +244,30 @@ struct WireGuardRuntimeConfig {
     keepalive_secs: Option<u16>,
 }
 
-#[derive(Clone)]
-struct AndroidUdpSocket {
-    inner: Arc<tokio::net::UdpSocket>,
-}
-
-impl AndroidUdpSocket {
-    fn local_addr(&self) -> io::Result<SocketAddr> {
-        self.inner.local_addr()
-    }
-}
-
-#[derive(Clone, Copy)]
-struct AndroidUdpFactory;
+/// gotatun's UDP socket factory, with each socket protected from the VPN so
+/// WireGuard traffic is not routed back into the tunnel.
+struct AndroidUdpFactory(UdpSocketFactory);
 
 impl AndroidUdpFactory {
-    fn create_socket(&self, addr: SocketAddr) -> io::Result<AndroidUdpSocket> {
-        let domain = match addr {
-            SocketAddr::V4(..) => socket2::Domain::IPV4,
-            SocketAddr::V6(..) => socket2::Domain::IPV6,
-        };
-        let socket =
-            socket2::Socket::new(domain, socket2::Type::DGRAM, Some(socket2::Protocol::UDP))?;
-        socket.set_nonblocking(true)?;
-        socket.set_reuse_address(true)?;
-        socket.set_recv_buffer_size(UDP_RECV_BUFFER_SIZE)?;
-        socket.set_send_buffer_size(UDP_SEND_BUFFER_SIZE)?;
-        socket.bind(&addr.into())?;
-
-        protect_fd_from_app_state(socket.as_raw_fd()).map_err(io::Error::other)?;
-
-        let std_socket: std::net::UdpSocket = socket.into();
-        let socket = tokio::net::UdpSocket::from_std(std_socket)?;
-        Ok(AndroidUdpSocket {
-            inner: Arc::new(socket),
+    fn new() -> Self {
+        Self(UdpSocketFactory {
+            recv_buffer_size: Some(UDP_RECV_BUFFER_SIZE),
+            send_buffer_size: Some(UDP_SEND_BUFFER_SIZE),
         })
     }
 }
 
 impl UdpTransportFactory for AndroidUdpFactory {
-    type Send = AndroidUdpSocket;
-    type RecvV4 = AndroidUdpSocket;
-    type RecvV6 = AndroidUdpSocket;
+    type Send = UdpSocket;
+    type Recv = UdpSocket;
 
     async fn bind(
         &mut self,
         params: &UdpTransportFactoryParams,
-    ) -> io::Result<((Self::Send, Self::RecvV4), (Self::Send, Self::RecvV6))> {
-        let mut port = params.port;
-        let udp_v4 = self.create_socket((params.addr_v4, port).into())?;
-        if port == 0 {
-            port = udp_v4.local_addr()?.port();
-        }
-
-        let udp_v6 = self.create_socket((params.addr_v6, port).into())?;
-        Ok(((udp_v4.clone(), udp_v4), (udp_v6.clone(), udp_v6)))
-    }
-}
-
-impl UdpSend for AndroidUdpSocket {
-    type SendManyBuf = ();
-
-    async fn send_to(
-        &self,
-        packet: gotatun::packet::Packet,
-        destination: SocketAddr,
-    ) -> io::Result<()> {
-        self.inner.send_to(&packet, destination).await?;
-        Ok(())
-    }
-
-    fn local_addr(&self) -> io::Result<Option<SocketAddr>> {
-        AndroidUdpSocket::local_addr(self).map(Some)
-    }
-}
-
-impl UdpRecv for AndroidUdpSocket {
-    type RecvManyBuf = ();
-
-    async fn recv_from(
-        &mut self,
-        pool: &mut gotatun::packet::PacketBufPool,
-    ) -> io::Result<(gotatun::packet::Packet, SocketAddr)> {
-        let mut buf = pool.get();
-        let (n, src) = self.inner.recv_from(&mut buf).await?;
-        buf.truncate(n);
-        Ok((buf, src))
+    ) -> io::Result<(Self::Send, Self::Recv)> {
+        let (send, recv) = self.0.bind(params).await?;
+        protect_fd_from_app_state(send.as_fd().as_raw_fd()).map_err(io::Error::other)?;
+        Ok((send, recv))
     }
 }
 
@@ -2108,7 +2047,7 @@ fn start_android_wireguard(
         peer.allowed_ips.push(network);
     }
 
-    let udp_factory = AndroidUdpFactory;
+    let udp_factory = AndroidUdpFactory::new();
     let runtime = get_runtime();
 
     // `tun::create_as_async` requires an entered Tokio runtime context.

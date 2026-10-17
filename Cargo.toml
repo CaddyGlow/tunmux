@@ -104,7 +104,7 @@ nix = { version = "0.31", features = ["sched", "net", "fs", "signal", "process",
 
 # Daemonization and userspace WireGuard (unix, non-Android)
 daemonize = "0.5"
-gotatun = { version = "0.2.0", features = ["device", "tun"] }
+gotatun = { version = "0.10", default-features = false, features = ["device", "tun", "ring"] }
 
 [patch.crates-io]
 smoltcp = { path = "third_party/smoltcp" }
