@@ -450,21 +450,14 @@ fn wait_for_namespace_handshake(
 }
 
 fn namespace_has_handshake(interface_name: &str) -> anyhow::Result<bool> {
-    let output = std::process::Command::new("wg")
-        .args(["show", interface_name, "latest-handshakes"])
-        .output()
-        .map_err(|e| anyhow::anyhow!("failed to run wg show latest-handshakes: {}", e))?;
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-        anyhow::bail!("wg show latest-handshakes failed: {}", stderr);
-    }
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    Ok(stdout.lines().any(|line| {
-        let mut cols = line.split_whitespace();
-        let _peer = cols.next();
-        cols.next()
+    // Netlink sockets bind to the calling thread's network namespace, which is
+    // the VPN namespace at this point.
+    let uapi = crate::wireguard::netlink::wg_get_uapi(interface_name)
+        .map_err(|e| anyhow::anyhow!("failed to read WireGuard device state: {}", e))?;
+    Ok(uapi.lines().any(|line| {
+        line.strip_prefix("last_handshake_time_sec=")
             .and_then(|value| value.parse::<u64>().ok())
-            .is_some_and(|epoch| epoch > 0)
+            .is_some_and(|secs| secs > 0)
     }))
 }
 
