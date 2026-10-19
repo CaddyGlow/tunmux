@@ -12,10 +12,15 @@ pub mod logging;
 pub mod shared;
 
 // Provider modules (handlers inside each mod are cfg-gated for Android)
+#[cfg(feature = "airvpn")]
 pub mod airvpn;
+#[cfg(feature = "ivpn")]
 pub mod ivpn;
+#[cfg(feature = "mullvad")]
 pub mod mullvad;
+#[cfg(feature = "proton")]
 pub mod proton;
+#[cfg(feature = "wgconf")]
 pub mod wgconf;
 
 // WireGuard config and connection state (portable);

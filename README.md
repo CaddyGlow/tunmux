@@ -41,6 +41,30 @@ cargo build
 cargo build --features keyring
 ```
 
+## Provider features
+
+Provider implementations and their CLI commands are controlled by independent
+Cargo features: `proton`, `airvpn`, `mullvad`, `ivpn`, and `wgconf`.
+`all-providers` enables all five. Default builds enable `all-providers` and `proxy`,
+preserving the standard CLI. Provider-specific dependencies are optional and are
+enabled by the providers that use them.
+
+```sh
+# WireGuard profiles only
+cargo build --no-default-features --features wgconf
+# Select providers, with Linux namespace proxy support
+cargo build --no-default-features --features proton,mullvad,proxy
+# Shared infrastructure and status/recovery support, without providers
+cargo build --no-default-features
+```
+
+Disabled providers are absent from CLI subcommands and provider choices. Saved
+provider names and configuration sections remain readable; disconnecting a saved
+session whose provider is disabled reports the feature needed to enable it.
+Library consumers using `default-features = false` must explicitly select their
+provider features. Android consumers can enable `all-providers` without enabling
+Linux proxy support.
+
 ## Android app
 
 The Android app and Rust JNI adapter live in the sibling `../tunmux-android`

@@ -204,14 +204,19 @@ pub fn load_config() -> AppConfig {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
 pub enum Provider {
+    #[cfg_attr(not(feature = "proton"), value(skip))]
     #[value(name = "proton")]
     Proton,
+    #[cfg_attr(not(feature = "airvpn"), value(skip))]
     #[value(name = "airvpn")]
     AirVpn,
+    #[cfg_attr(not(feature = "mullvad"), value(skip))]
     #[value(name = "mullvad")]
     Mullvad,
+    #[cfg_attr(not(feature = "ivpn"), value(skip))]
     #[value(name = "ivpn")]
     Ivpn,
+    #[cfg_attr(not(feature = "wgconf"), value(skip))]
     #[value(name = "wgconf")]
     Wgconf,
 }

@@ -1,39 +1,31 @@
-mod airvpn;
-mod cli;
-mod config;
-mod error;
-mod ivpn;
-mod local_proxy;
-mod logging;
-mod mullvad;
-#[cfg(target_os = "linux")]
-mod netns;
-#[cfg(not(target_os = "linux"))]
-#[path = "netns_stub.rs"]
-mod netns;
-mod privileged;
-mod privileged_api;
-mod privileged_client;
-mod proton;
-#[cfg(all(feature = "proxy", target_os = "linux"))]
-#[path = "proxy/mod.rs"]
-mod proxy;
-#[cfg(not(all(feature = "proxy", target_os = "linux")))]
-#[path = "proxy_stub.rs"]
-mod proxy;
-mod shared;
-mod userspace_helper;
-mod wgconf;
-mod wireguard;
+#[cfg(feature = "airvpn")]
+use tunmux::airvpn;
+#[cfg(feature = "ivpn")]
+use tunmux::ivpn;
+#[cfg(feature = "mullvad")]
+use tunmux::mullvad;
+#[cfg(feature = "proton")]
+use tunmux::proton;
+#[cfg(feature = "wgconf")]
+use tunmux::wgconf;
+use tunmux::{
+    cli, config, logging, privileged, privileged_client, proxy, shared, userspace_helper, wireguard,
+};
 
 use base64::Engine as _;
 
 use clap::Parser;
 use tracing::{error, info};
 
-use cli::{
-    Cli, ConnectProviderCommand, HookBuiltinArg, HookCommand, HookEventArg, ProviderArg, TopCommand,
-};
+#[cfg(any(
+    feature = "proton",
+    feature = "airvpn",
+    feature = "mullvad",
+    feature = "ivpn",
+    feature = "wgconf"
+))]
+use cli::ConnectProviderCommand;
+use cli::{Cli, HookBuiltinArg, HookCommand, HookEventArg, ProviderArg, TopCommand};
 use wireguard::connection::ConnectionState;
 
 fn main() -> std::process::ExitCode {
@@ -157,11 +149,23 @@ fn init_logging(verbose: bool) -> logging::LoggingGuard {
 
 async fn run(command: TopCommand, config: config::AppConfig) -> anyhow::Result<()> {
     match command {
+        #[cfg(feature = "proton")]
         TopCommand::Proton { command } => proton::handlers::dispatch(command, &config).await,
+        #[cfg(feature = "airvpn")]
         TopCommand::Airvpn { command } => airvpn::handlers::dispatch(command, &config).await,
+        #[cfg(feature = "mullvad")]
         TopCommand::Mullvad { command } => mullvad::handlers::dispatch(command, &config).await,
+        #[cfg(feature = "ivpn")]
         TopCommand::Ivpn { command } => ivpn::handlers::dispatch(command, &config).await,
+        #[cfg(feature = "wgconf")]
         TopCommand::Wgconf { command } => wgconf::handlers::dispatch(command, &config).await,
+        #[cfg(any(
+            feature = "proton",
+            feature = "airvpn",
+            feature = "mullvad",
+            feature = "ivpn",
+            feature = "wgconf"
+        ))]
         TopCommand::Connect { provider } => run_connect(provider, &config).await,
         TopCommand::Disconnect {
             instance,
@@ -304,23 +308,35 @@ fn provider_hint(provider: Option<ProviderArg>) -> &'static str {
     }
 }
 
+#[cfg(any(
+    feature = "proton",
+    feature = "airvpn",
+    feature = "mullvad",
+    feature = "ivpn",
+    feature = "wgconf"
+))]
 async fn run_connect(
     provider: ConnectProviderCommand,
     config: &config::AppConfig,
 ) -> anyhow::Result<()> {
     match provider {
+        #[cfg(feature = "proton")]
         ConnectProviderCommand::Proton(args) => {
             proton::handlers::dispatch(cli::ProtonCommand::Connect(args), config).await
         }
+        #[cfg(feature = "airvpn")]
         ConnectProviderCommand::Airvpn(args) => {
             airvpn::handlers::dispatch(cli::AirVpnCommand::Connect(args), config).await
         }
+        #[cfg(feature = "mullvad")]
         ConnectProviderCommand::Mullvad(args) => {
             mullvad::handlers::dispatch(cli::MullvadCommand::Connect(args), config).await
         }
+        #[cfg(feature = "ivpn")]
         ConnectProviderCommand::Ivpn(args) => {
             ivpn::handlers::dispatch(cli::IvpnCommand::Connect(args), config).await
         }
+        #[cfg(feature = "wgconf")]
         ConnectProviderCommand::Wgconf(args) => {
             wgconf::handlers::dispatch(cli::WgconfCommand::Connect(args), config).await
         }
@@ -424,29 +440,85 @@ async fn run_disconnect(
 
 async fn dispatch_provider_disconnect(
     provider: ProviderArg,
-    instance: Option<String>,
-    all: bool,
-    config: &config::AppConfig,
+    _instance: Option<String>,
+    _all: bool,
+    _config: &config::AppConfig,
 ) -> anyhow::Result<()> {
     match provider {
-        ProviderArg::Proton => {
-            proton::handlers::dispatch(cli::ProtonCommand::Disconnect { instance, all }, config)
-                .await
-        }
-        ProviderArg::AirVpn => {
-            airvpn::handlers::dispatch(cli::AirVpnCommand::Disconnect { instance, all }, config)
-                .await
-        }
-        ProviderArg::Mullvad => {
-            mullvad::handlers::dispatch(cli::MullvadCommand::Disconnect { instance, all }, config)
-                .await
-        }
-        ProviderArg::Ivpn => {
-            ivpn::handlers::dispatch(cli::IvpnCommand::Disconnect { instance, all }, config).await
-        }
+        #[cfg(not(feature = "wgconf"))]
         ProviderArg::Wgconf => {
-            wgconf::handlers::dispatch(cli::WgconfCommand::Disconnect { instance, all }, config)
-                .await
+            anyhow::bail!("wgconf support is disabled; enable the `wgconf` Cargo feature")
+        }
+        #[cfg(not(feature = "ivpn"))]
+        ProviderArg::Ivpn => {
+            anyhow::bail!("ivpn support is disabled; enable the `ivpn` Cargo feature")
+        }
+        #[cfg(not(feature = "mullvad"))]
+        ProviderArg::Mullvad => {
+            anyhow::bail!("mullvad support is disabled; enable the `mullvad` Cargo feature")
+        }
+        #[cfg(not(feature = "airvpn"))]
+        ProviderArg::AirVpn => {
+            anyhow::bail!("airvpn support is disabled; enable the `airvpn` Cargo feature")
+        }
+        #[cfg(not(feature = "proton"))]
+        ProviderArg::Proton => {
+            anyhow::bail!("proton support is disabled; enable the `proton` Cargo feature")
+        }
+        #[cfg(feature = "proton")]
+        ProviderArg::Proton => {
+            proton::handlers::dispatch(
+                cli::ProtonCommand::Disconnect {
+                    instance: _instance,
+                    all: _all,
+                },
+                _config,
+            )
+            .await
+        }
+        #[cfg(feature = "airvpn")]
+        ProviderArg::AirVpn => {
+            airvpn::handlers::dispatch(
+                cli::AirVpnCommand::Disconnect {
+                    instance: _instance,
+                    all: _all,
+                },
+                _config,
+            )
+            .await
+        }
+        #[cfg(feature = "mullvad")]
+        ProviderArg::Mullvad => {
+            mullvad::handlers::dispatch(
+                cli::MullvadCommand::Disconnect {
+                    instance: _instance,
+                    all: _all,
+                },
+                _config,
+            )
+            .await
+        }
+        #[cfg(feature = "ivpn")]
+        ProviderArg::Ivpn => {
+            ivpn::handlers::dispatch(
+                cli::IvpnCommand::Disconnect {
+                    instance: _instance,
+                    all: _all,
+                },
+                _config,
+            )
+            .await
+        }
+        #[cfg(feature = "wgconf")]
+        ProviderArg::Wgconf => {
+            wgconf::handlers::dispatch(
+                cli::WgconfCommand::Disconnect {
+                    instance: _instance,
+                    all: _all,
+                },
+                _config,
+            )
+            .await
         }
     }
 }

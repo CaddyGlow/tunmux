@@ -23,6 +23,27 @@ jobs:
       - name: Run repository CI script
         run: bash ./scripts/ci.sh
 
+  provider-features:
+    name: Provider features (${{ matrix.features || 'none' }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        features: ["", "proton", "airvpn", "mullvad", "ivpn", "wgconf", "proxy", "proxy,wgconf"]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - name: Check feature configuration
+        run: cargo clippy --locked --all-targets --no-default-features --features "${{ matrix.features }}" -- -D warnings
+      - name: Test CLI feature availability
+        run: cargo test --locked --no-default-features --features "${{ matrix.features }}" cli::tests
+
   audit:
     name: Security audit
     runs-on: ubuntu-latest

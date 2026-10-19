@@ -58,36 +58,48 @@ pub struct Cli {
 #[derive(Subcommand)]
 pub enum TopCommand {
     /// Proton VPN commands
+    #[cfg(feature = "proton")]
     Proton {
         #[command(subcommand)]
         command: ProtonCommand,
     },
 
     /// AirVPN commands
+    #[cfg(feature = "airvpn")]
     Airvpn {
         #[command(subcommand)]
         command: AirVpnCommand,
     },
 
     /// Mullvad VPN commands
+    #[cfg(feature = "mullvad")]
     Mullvad {
         #[command(subcommand)]
         command: MullvadCommand,
     },
 
     /// IVPN commands
+    #[cfg(feature = "ivpn")]
     Ivpn {
         #[command(subcommand)]
         command: IvpnCommand,
     },
 
     /// WireGuard config file/profile commands
+    #[cfg(feature = "wgconf")]
     Wgconf {
         #[command(subcommand)]
         command: WgconfCommand,
     },
 
     /// Connect to a VPN server (`tunmux connect <provider> ...`)
+    #[cfg(any(
+        feature = "proton",
+        feature = "airvpn",
+        feature = "mullvad",
+        feature = "ivpn",
+        feature = "wgconf"
+    ))]
     Connect {
         #[command(subcommand)]
         provider: ConnectProviderCommand,
@@ -221,24 +233,37 @@ pub enum HookBuiltinArg {
 
 pub type ProviderArg = crate::config::Provider;
 
+#[cfg(any(
+    feature = "proton",
+    feature = "airvpn",
+    feature = "mullvad",
+    feature = "ivpn",
+    feature = "wgconf"
+))]
 #[derive(Subcommand)]
 pub enum ConnectProviderCommand {
     /// Connect using Proton VPN
+    #[cfg(feature = "proton")]
     Proton(ProtonConnectArgs),
 
     /// Connect using AirVPN
+    #[cfg(feature = "airvpn")]
     Airvpn(AirVpnConnectArgs),
 
     /// Connect using Mullvad VPN
+    #[cfg(feature = "mullvad")]
     Mullvad(MullvadConnectArgs),
 
     /// Connect using IVPN
+    #[cfg(feature = "ivpn")]
     Ivpn(IvpnConnectArgs),
 
     /// Connect using a WireGuard config file/profile
+    #[cfg(feature = "wgconf")]
     Wgconf(WgconfConnectArgs),
 }
 
+#[cfg(feature = "proton")]
 #[derive(Args, Clone)]
 pub struct ProtonConnectArgs {
     /// Server name (e.g., US#1, CH#5)
@@ -264,6 +289,7 @@ pub struct ProtonConnectArgs {
     pub opts: ConnectOptions,
 }
 
+#[cfg(feature = "airvpn")]
 #[derive(Args, Clone)]
 pub struct AirVpnConnectArgs {
     /// Server name (e.g., Castor, Vega)
@@ -285,6 +311,7 @@ pub struct AirVpnConnectArgs {
     pub opts: ConnectOptions,
 }
 
+#[cfg(feature = "mullvad")]
 #[derive(Args, Clone)]
 pub struct MullvadConnectArgs {
     /// Server hostname (e.g., us-nyc-wg-401)
@@ -302,6 +329,7 @@ pub struct MullvadConnectArgs {
     pub opts: ConnectOptions,
 }
 
+#[cfg(feature = "ivpn")]
 #[derive(Args, Clone)]
 pub struct IvpnConnectArgs {
     /// Server hostname or gateway (e.g., us-ny4.wg.ivpn.net, us.wg.ivpn.net)
@@ -319,6 +347,7 @@ pub struct IvpnConnectArgs {
     pub opts: ConnectOptions,
 }
 
+#[cfg(feature = "wgconf")]
 #[derive(Args, Clone)]
 pub struct WgconfConnectArgs {
     /// WireGuard .conf file path
@@ -354,6 +383,7 @@ pub struct WgconfConnectArgs {
     pub mtu: Option<u16>,
 }
 
+#[cfg(feature = "proton")]
 #[derive(Subcommand)]
 pub enum ProtonCommand {
     /// Sign in with Proton VPN credentials
@@ -411,6 +441,7 @@ pub enum ProtonCommand {
     },
 }
 
+#[cfg(feature = "proton")]
 #[derive(Subcommand)]
 pub enum ProtonPortAction {
     /// Request a Proton NAT-PMP forwarded port
@@ -485,6 +516,7 @@ pub enum ProtonPortAction {
     },
 }
 
+#[cfg(feature = "airvpn")]
 #[derive(Subcommand)]
 pub enum AirVpnCommand {
     /// Sign in with AirVPN credentials
@@ -595,6 +627,7 @@ pub enum AirVpnCommand {
     },
 }
 
+#[cfg(feature = "mullvad")]
 #[derive(Subcommand)]
 pub enum MullvadCommand {
     /// Sign in with Mullvad account number
@@ -660,6 +693,7 @@ pub enum MullvadCommand {
     },
 }
 
+#[cfg(feature = "ivpn")]
 #[derive(Subcommand)]
 pub enum IvpnCommand {
     /// Sign in with IVPN account ID
@@ -725,6 +759,7 @@ pub enum IvpnCommand {
     },
 }
 
+#[cfg(feature = "wgconf")]
 #[derive(Subcommand)]
 pub enum WgconfCommand {
     /// Connect from a WireGuard config file or saved profile
@@ -762,6 +797,7 @@ pub enum WgconfCommand {
     },
 }
 
+#[cfg(feature = "mullvad")]
 #[derive(Subcommand)]
 pub enum MullvadPaymentCommand {
     /// Fetch Mullvad Monero payment details from the web account flow
@@ -776,6 +812,7 @@ pub enum MullvadPaymentCommand {
     },
 }
 
+#[cfg(feature = "ivpn")]
 #[derive(Subcommand)]
 pub enum IvpnPaymentCommand {
     /// Fetch Monero payment details for an IVPN account
@@ -789,6 +826,7 @@ pub enum IvpnPaymentCommand {
     },
 }
 
+#[cfg(feature = "airvpn")]
 #[derive(Subcommand)]
 pub enum PortAction {
     /// List forwarded ports
@@ -850,6 +888,7 @@ pub enum PortAction {
     },
 }
 
+#[cfg(feature = "airvpn")]
 #[derive(Subcommand)]
 pub enum DeviceAction {
     /// List all devices (WireGuard keys)
@@ -878,6 +917,7 @@ pub enum DeviceAction {
     },
 }
 
+#[cfg(feature = "airvpn")]
 #[derive(Subcommand)]
 pub enum ApiKeyAction {
     /// List API keys
@@ -908,12 +948,26 @@ pub enum ApiKeyAction {
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        AirVpnCommand, Cli, ConnectProviderCommand, HookBuiltinArg, HookCommand, ProtonCommand,
-        ProtonPortAction, ProviderArg, TopCommand, WgconfCommand,
-    };
+    #[cfg(feature = "airvpn")]
+    use super::AirVpnCommand;
+    #[cfg(any(
+        feature = "proton",
+        feature = "airvpn",
+        feature = "mullvad",
+        feature = "ivpn",
+        feature = "wgconf"
+    ))]
+    use super::ConnectProviderCommand;
+    #[cfg(feature = "wgconf")]
+    use super::ProviderArg;
+    #[cfg(feature = "wgconf")]
+    use super::WgconfCommand;
+    use super::{Cli, HookBuiltinArg, HookCommand, TopCommand};
+    #[cfg(feature = "proton")]
+    use super::{ProtonCommand, ProtonPortAction};
     use clap::Parser;
 
+    #[cfg(feature = "wgconf")]
     #[test]
     fn parse_connect_wgconf_with_file() {
         let cli = Cli::try_parse_from([
@@ -936,6 +990,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "wgconf")]
     #[test]
     fn parse_connect_wgconf_with_profile() {
         let cli = Cli::try_parse_from([
@@ -960,6 +1015,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "wgconf")]
     #[test]
     fn parse_connect_wgconf_requires_exactly_one_source() {
         let missing = Cli::try_parse_from(["tunmux", "connect", "wgconf"]);
@@ -977,6 +1033,7 @@ mod tests {
         assert!(both.is_err());
     }
 
+    #[cfg(feature = "wgconf")]
     #[test]
     fn parse_provider_prefixed_wgconf_commands() {
         let cli = Cli::try_parse_from(["tunmux", "wgconf", "connect", "--profile", "home"])
@@ -999,76 +1056,95 @@ mod tests {
         }
     }
 
+    #[cfg(any(
+        feature = "proton",
+        feature = "airvpn",
+        feature = "mullvad",
+        feature = "ivpn"
+    ))]
     #[test]
     fn parse_disable_ipv6_for_all_provider_connect_commands() {
-        let proton = Cli::try_parse_from(["tunmux", "connect", "proton", "--disable-ipv6"])
-            .expect("parse proton");
-        match proton.command {
-            TopCommand::Connect {
-                provider: ConnectProviderCommand::Proton(args),
-            } => assert!(args.opts.disable_ipv6),
-            _ => panic!("expected proton connect provider"),
+        #[cfg(feature = "proton")]
+        {
+            let cli =
+                Cli::try_parse_from(["tunmux", "connect", "proton", "--disable-ipv6"]).unwrap();
+            match cli.command {
+                TopCommand::Connect {
+                    provider: ConnectProviderCommand::Proton(args),
+                } => assert!(args.opts.disable_ipv6),
+                _ => panic!("expected proton connect"),
+            }
         }
-
-        let airvpn = Cli::try_parse_from(["tunmux", "connect", "airvpn", "--disable-ipv6"])
-            .expect("parse airvpn");
-        match airvpn.command {
-            TopCommand::Connect {
-                provider: ConnectProviderCommand::Airvpn(args),
-            } => assert!(args.opts.disable_ipv6),
-            _ => panic!("expected airvpn connect provider"),
+        #[cfg(feature = "airvpn")]
+        {
+            let cli =
+                Cli::try_parse_from(["tunmux", "connect", "airvpn", "--disable-ipv6"]).unwrap();
+            match cli.command {
+                TopCommand::Connect {
+                    provider: ConnectProviderCommand::Airvpn(args),
+                } => assert!(args.opts.disable_ipv6),
+                _ => panic!("expected airvpn connect"),
+            }
         }
-
-        let mullvad = Cli::try_parse_from(["tunmux", "connect", "mullvad", "--disable-ipv6"])
-            .expect("parse mullvad");
-        match mullvad.command {
-            TopCommand::Connect {
-                provider: ConnectProviderCommand::Mullvad(args),
-            } => assert!(args.opts.disable_ipv6),
-            _ => panic!("expected mullvad connect provider"),
+        #[cfg(feature = "mullvad")]
+        {
+            let cli =
+                Cli::try_parse_from(["tunmux", "connect", "mullvad", "--disable-ipv6"]).unwrap();
+            match cli.command {
+                TopCommand::Connect {
+                    provider: ConnectProviderCommand::Mullvad(args),
+                } => assert!(args.opts.disable_ipv6),
+                _ => panic!("expected mullvad connect"),
+            }
         }
-
-        let ivpn = Cli::try_parse_from(["tunmux", "connect", "ivpn", "--disable-ipv6"])
-            .expect("parse ivpn");
-        match ivpn.command {
-            TopCommand::Connect {
-                provider: ConnectProviderCommand::Ivpn(args),
-            } => assert!(args.opts.disable_ipv6),
-            _ => panic!("expected ivpn connect provider"),
+        #[cfg(feature = "ivpn")]
+        {
+            let cli = Cli::try_parse_from(["tunmux", "connect", "ivpn", "--disable-ipv6"]).unwrap();
+            match cli.command {
+                TopCommand::Connect {
+                    provider: ConnectProviderCommand::Ivpn(args),
+                } => assert!(args.opts.disable_ipv6),
+                _ => panic!("expected ivpn connect"),
+            }
         }
     }
 
+    #[cfg(any(feature = "proton", feature = "wgconf"))]
     #[test]
     fn parse_mtu_for_connect_commands() {
-        let proton = Cli::try_parse_from(["tunmux", "connect", "proton", "--mtu", "1280"])
-            .expect("parse proton mtu");
-        match proton.command {
-            TopCommand::Connect {
-                provider: ConnectProviderCommand::Proton(args),
-            } => assert_eq!(args.opts.mtu, Some(1280)),
-            _ => panic!("expected proton connect provider"),
+        #[cfg(feature = "proton")]
+        {
+            let cli =
+                Cli::try_parse_from(["tunmux", "connect", "proton", "--mtu", "1280"]).unwrap();
+            match cli.command {
+                TopCommand::Connect {
+                    provider: ConnectProviderCommand::Proton(args),
+                } => assert_eq!(args.opts.mtu, Some(1280)),
+                _ => panic!("expected proton connect"),
+            }
         }
-
-        let wgconf = Cli::try_parse_from([
-            "tunmux",
-            "connect",
-            "wgconf",
-            "--file",
-            "/tmp/test.conf",
-            "--backend",
-            "kernel",
-            "--mtu",
-            "1360",
-        ])
-        .expect("parse wgconf mtu");
-        match wgconf.command {
-            TopCommand::Connect {
-                provider: ConnectProviderCommand::Wgconf(args),
-            } => assert_eq!(args.mtu, Some(1360)),
-            _ => panic!("expected wgconf connect provider"),
+        #[cfg(feature = "wgconf")]
+        {
+            let cli = Cli::try_parse_from([
+                "tunmux",
+                "connect",
+                "wgconf",
+                "--file",
+                "/tmp/test.conf",
+                "--mtu",
+                "1360",
+            ])
+            .unwrap();
+            match cli.command {
+                TopCommand::Connect {
+                    provider: ConnectProviderCommand::Wgconf(args),
+                } => assert_eq!(args.mtu, Some(1360)),
+                _ => panic!("expected wgconf connect"),
+            }
         }
     }
 
+    #[cfg(feature = "proton")]
     #[test]
     fn parse_proton_renew_command() {
         let cli = Cli::try_parse_from(["tunmux", "proton", "renew"]).expect("parse proton renew");
@@ -1080,6 +1156,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "proton")]
     #[test]
     fn parse_proton_ports_request_command() {
         let cli = Cli::try_parse_from([
@@ -1121,6 +1198,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "proton")]
     #[test]
     fn parse_proton_ports_renew_command() {
         let cli = Cli::try_parse_from(["tunmux", "proton", "ports", "renew", "--lifetime", "120"])
@@ -1136,6 +1214,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "proton")]
     #[test]
     fn parse_proton_ports_list_current_json_command() {
         let cli = Cli::try_parse_from(["tunmux", "proton", "ports", "list", "--current", "--json"])
@@ -1154,6 +1233,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "proton")]
     #[test]
     fn parse_proton_ports_daemon_command() {
         let cli = Cli::try_parse_from([
@@ -1199,6 +1279,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "proton")]
     #[test]
     fn parse_proton_ports_release_command() {
         let cli =
@@ -1214,6 +1295,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "airvpn")]
     #[test]
     fn parse_airvpn_connect_default_sort_score() {
         let cli = Cli::try_parse_from(["tunmux", "connect", "airvpn"]).expect("parse airvpn");
@@ -1225,6 +1307,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "airvpn")]
     #[test]
     fn parse_airvpn_servers_sort_score() {
         let cli = Cli::try_parse_from(["tunmux", "airvpn", "servers", "--sort", "score"])
@@ -1325,5 +1408,50 @@ mod tests {
 
         let wgconf = Cli::try_parse_from(["tunmux", "wgconf", "disconnect", "x", "--all"]);
         assert!(wgconf.is_err());
+    }
+    #[test]
+    fn test_cli_exposes_only_enabled_providers() {
+        use clap::{CommandFactory, ValueEnum};
+        let command = Cli::command();
+        command.clone().debug_assert();
+        let connect = command.find_subcommand("connect");
+        let providers = [
+            ("proton", cfg!(feature = "proton")),
+            ("airvpn", cfg!(feature = "airvpn")),
+            ("mullvad", cfg!(feature = "mullvad")),
+            ("ivpn", cfg!(feature = "ivpn")),
+            ("wgconf", cfg!(feature = "wgconf")),
+        ];
+        for (name, enabled) in providers {
+            assert_eq!(
+                command.find_subcommand(name).is_some(),
+                enabled,
+                "top-level {name}"
+            );
+            assert_eq!(
+                connect
+                    .and_then(|command| command.find_subcommand(name))
+                    .is_some(),
+                enabled,
+                "connect {name}"
+            );
+            let cli_value = crate::config::Provider::value_variants()
+                .iter()
+                .any(|provider| provider.dir_name() == name);
+            assert_eq!(cli_value, enabled, "provider argument {name}");
+            assert!(
+                crate::config::Provider::from_dir_name(name).is_some(),
+                "saved provider identity {name}"
+            );
+            if !enabled {
+                assert!(Cli::try_parse_from(["tunmux", name, "connect"]).is_err());
+                assert!(Cli::try_parse_from(["tunmux", "connect", name]).is_err());
+                assert!(Cli::try_parse_from(["tunmux", "disconnect", "--provider", name]).is_err());
+            }
+        }
+        assert_eq!(
+            connect.is_some(),
+            providers.iter().any(|(_, enabled)| *enabled)
+        );
     }
 }
