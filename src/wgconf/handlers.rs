@@ -60,17 +60,16 @@ fn cmd_connect(args: WgconfConnectArgs, config: &AppConfig) -> anyhow::Result<()
     if args.mtu.is_some() && args.local_proxy {
         anyhow::bail!("--mtu is not supported with --local-proxy");
     }
-    if args.mtu.is_some()
-        && !args.proxy
-        && !args.local_proxy
-        && backend != wireguard::backend::WgBackend::Kernel
-    {
-        anyhow::bail!(
-            "--mtu for wgconf is supported only in kernel mode (or with --proxy kernel mode)"
+    let mut source = resolve_source(args.file.as_deref(), args.profile.as_deref())?;
+    let parsed = wireguard::config::parse_config(&source.config_text)?;
+    let mtu = wireguard::config::resolve_mtu(args.mtu, parsed.mtu)?;
+    if let Some(override_value) = args.mtu {
+        source.config_text = wireguard::config::with_mtu_override(
+            &source.config_text,
+            wireguard::config::Mtu::new(override_value)?,
         );
     }
-
-    let source = resolve_source(args.file.as_deref(), args.profile.as_deref())?;
+    let mtu = mtu.map(wireguard::config::Mtu::get);
 
     if let Some(save_as) = args.save_as.as_deref() {
         save_profile_content(save_as, &source.config_text)?;
@@ -100,7 +99,7 @@ fn cmd_connect(args: WgconfConnectArgs, config: &AppConfig) -> anyhow::Result<()
         let routed = routed
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("missing parsed routed config"))?;
-        connect_proxy(&source, routed, args.mtu, config)?;
+        connect_proxy(&source, routed, mtu, config)?;
     } else if args.local_proxy {
         let routed = routed
             .as_ref()
@@ -112,7 +111,7 @@ fn cmd_connect(args: WgconfConnectArgs, config: &AppConfig) -> anyhow::Result<()
             backend,
             routed.as_ref(),
             args.disable_ipv6,
-            args.mtu,
+            mtu,
             config,
         )?;
     }
@@ -156,10 +155,13 @@ fn connect_direct(
 ) -> anyhow::Result<()> {
     use wireguard::connection::DIRECT_INSTANCE;
 
-    if wireguard::connection::ConnectionState::exists(DIRECT_INSTANCE) {
-        anyhow::bail!("Already connected via direct VPN. Disconnect first.");
-    }
-    if wireguard::wg_quick::is_interface_active(INTERFACE_NAME)
+    crate::shared::connection_ops::ensure_instance_available(
+        DIRECT_INSTANCE,
+        "direct VPN",
+        "wgconf",
+    )?;
+    if (backend != wireguard::backend::WgBackend::Userspace
+        && wireguard::wg_quick::is_interface_active(INTERFACE_NAME))
         || wireguard::userspace::is_interface_active(INTERFACE_NAME)
     {
         anyhow::bail!("Already connected. Run `tunmux disconnect --provider wgconf` first.");
@@ -170,9 +172,12 @@ fn connect_direct(
     let state_endpoint = routed
         .map(|cfg| format_endpoint(&cfg.server_ip, cfg.server_port))
         .unwrap_or_else(|| best_effort_endpoint(&source.config_text));
-    let state_dns_servers = wireguard::config::parse_config(&source.config_text)
-        .map(|parsed| parsed.dns_servers)
-        .unwrap_or_default();
+    let parsed_config = wireguard::config::parse_config(&source.config_text)?;
+    let state_peer_public_key = parsed_config
+        .peers
+        .first()
+        .map(|peer| peer.public_key.clone());
+    let state_dns_servers = parsed_config.dns_servers;
 
     match backend {
         wireguard::backend::WgBackend::WgQuick => {
@@ -193,7 +198,7 @@ fn connect_direct(
                 socks_port: None,
                 http_port: None,
                 dns_servers: state_dns_servers.clone(),
-                peer_public_key: None,
+                peer_public_key: state_peer_public_key.clone(),
                 local_public_key: None,
                 virtual_ips: vec![],
                 keepalive_secs: None,
@@ -218,7 +223,7 @@ fn connect_direct(
                 socks_port: None,
                 http_port: None,
                 dns_servers: state_dns_servers.clone(),
-                peer_public_key: None,
+                peer_public_key: state_peer_public_key.clone(),
                 local_public_key: None,
                 virtual_ips: vec![],
                 keepalive_secs: None,

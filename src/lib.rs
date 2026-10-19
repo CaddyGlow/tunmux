@@ -49,3 +49,6 @@ pub mod proxy;
 ))]
 #[path = "proxy_stub.rs"]
 pub mod proxy;
+
+#[cfg(not(target_os = "android"))]
+pub mod userspace_helper;

@@ -41,12 +41,20 @@ cargo build
 cargo build --features keyring
 ```
 
+## Android app
+
+The Android app and Rust JNI adapter live in the sibling `../tunmux-android`
+repository. Build and release APKs from that repository. This repository owns
+the shared Rust library, including Android target support and credential callback
+hooks. `.github/workflows/ci-android.yml` checks the shared library for all three
+Android app ABIs. The app pins a revision of this library and the `smoltcp` fork;
+see its README for local development against a sibling checkout.
+
 ## Release CI (Tag-Based)
 
 Pushing a `v*` tag (for example `v1.2.3`) triggers `.github/workflows/release.yml` to:
 - run `cargo test --locked`
-- build release binaries for Linux, macOS, and Android targets via `.github/workflows/manual-build.yml`
-- build an Android app APK from `android/` via `.github/workflows/manual-build-android.yml`
+- build release binaries for Linux and macOS via `.github/workflows/manual-build.yml`
 - upload tarballs and SHA256 files to a GitHub Release for that tag
 
 Publishing that GitHub Release then triggers `.github/workflows/docker.yml` (which calls `.github/workflows/docker-publish.yml`) to build and publish a multi-arch Docker image to GHCR.
@@ -286,8 +294,17 @@ IPv6 interface address.
 
 `--mtu` is supported by provider `connect` commands. For most providers it
 applies to direct and proxy kernel tunnels, as well as generated wg-quick and
-userspace configs. For `wgconf`, `--mtu` is supported in kernel mode (direct
-or `--proxy`) and is not supported with `--local-proxy`.
+userspace configs. For `wgconf`, it also applies to direct userspace and
+wg-quick connections. Precedence is `--mtu`, then `[Interface] MTU`, then the
+backend default. Values must be between 576 and 65535; `--local-proxy` does not
+support an MTU override.
+
+Logging uses target-aware tracing directives. `RUST_LOG` overrides `--verbose`
+(`--debug` is an alias); without explicit directives, dependencies log warnings
+and tunmux logs info, or debug with verbosity enabled. For example,
+`RUST_LOG=tunmux=debug,gotatun=warn tunmux status`. Newly started helpers and
+daemons inherit the resolved filter. Existing daemons retain their startup
+filter until restarted.
 
 ## Linux Namespace Proxy Mode (`--proxy`)
 
@@ -494,6 +511,40 @@ Runtime state (macOS):
   proxy/
   wg/
 ```
+
+## Userspace reliability and recovery
+
+The embedded userspace helper collects passive peer statistics without launching
+`wg` or generating outbound probe traffic. A dedicated network worker serializes
+setup, reconciliation, and restoration. Every ten seconds it checks owned routes,
+endpoint gateways, and DNS; reconciliation preserves configured AllowedIPs and
+adds no implicit LAN bypass routes. Unsettled gateways or ownership conflicts are
+reported without overwriting another owner's settings.
+
+Disconnect waits for the helper's cleanup acknowledgment. Commands have a
+three-second deadline, setup a twenty-second budget, reconciliation a ten-second
+budget, rollback a twenty-second
+budget, and device stop a five-second deadline. An in-progress command may finish
+past its operation budget. The client waits up to seventy seconds for teardown;
+a timeout or incomplete restoration is an error, with recovery information retained.
+
+Privileged recovery journals live at
+`/var/run/wireguard/<interface>.recovery.json` with restrictive permissions and
+contain network restoration data, never WireGuard keys. A session lock prevents
+competing helpers. Restart and disconnect recover a stopped helper's journal only
+when the control endpoint is confirmed unavailable. Conflicting DNS or routes stay
+untouched, and pending actions remain journaled for retry. Because this directory
+is runtime storage, these journals cover helper/process crashes rather than
+recovery across a host reboot.
+
+Status reports observed health separately from saved connection metadata. Missing
+permissions, probe timeouts, legacy records without peer identity, and unverifiable
+proxy sessions report unknown. Connection records are written atomically; corrupt
+records are preserved in quarantine. Status does not retire stale sessions.
+
+Native macOS routing, DNS, roaming, and signal behavior still require validation on
+a macOS host. Optional launchd activation, login autoconnect, installation tooling,
+and structured live log forwarding from the reliability plan are not implemented.
 
 ## License
 

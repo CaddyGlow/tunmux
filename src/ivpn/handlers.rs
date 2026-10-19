@@ -547,13 +547,12 @@ fn ivpn_matches_tags(
     })
 }
 
-async fn cmd_connect(
-    args: crate::cli::IvpnConnectArgs,
-    config: &AppConfig,
-) -> anyhow::Result<()> {
+async fn cmd_connect(args: crate::cli::IvpnConnectArgs, config: &AppConfig) -> anyhow::Result<()> {
     let backend = connection_ops::resolve_opts(&args.opts, &config.general.backend)?;
 
-    let effective_country = args.country.or_else(|| config.default_country_for(PROVIDER).map(str::to_owned));
+    let effective_country = args
+        .country
+        .or_else(|| config.default_country_for(PROVIDER).map(str::to_owned));
 
     let session: IvpnSession = config::load_session(PROVIDER, config)?;
     let client = api_client()?;

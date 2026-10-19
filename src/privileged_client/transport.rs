@@ -16,8 +16,8 @@ use crate::error::{AppError, Result};
 use crate::privileged_api::PrivilegedRequest;
 
 use super::util::{
-    configured_privileged_stdio_log_path, map_sudo_spawn_error, request_kind, shell_quote,
-    startup_lock_dir, stderr_requires_password, run_sudo_validate_with_timeout,
+    configured_privileged_stdio_log_path, map_sudo_spawn_error, request_kind,
+    run_sudo_validate_with_timeout, shell_quote, startup_lock_dir, stderr_requires_password,
 };
 use super::PrivilegedClient;
 
@@ -285,6 +285,7 @@ impl PrivilegedClient {
             .arg("--autostarted")
             .arg("--authorized-group")
             .arg(self.authorized_group.as_str());
+        crate::logging::apply_to_command(&mut command);
         if let Some(idle_timeout_ms) = self.daemon_idle_timeout_ms {
             command
                 .arg("--idle-timeout-ms")
@@ -383,6 +384,7 @@ impl PrivilegedClient {
             .stdin(Stdio::piped())
             .stdout(Stdio::piped());
 
+        crate::logging::apply_to_command(&mut command);
         if let Some(idle_timeout_ms) = self.daemon_idle_timeout_ms {
             command
                 .arg("--idle-timeout-ms")

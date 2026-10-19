@@ -17,22 +17,17 @@ pub struct ResolvedServer<'a> {
 }
 
 /// Resolve the WireGuard backend and validate options from ConnectOptions.
-pub fn resolve_opts(
-    opts: &ConnectOptions,
-    default_backend: &str,
-) -> anyhow::Result<WgBackend> {
+pub fn resolve_opts(opts: &ConnectOptions, default_backend: &str) -> anyhow::Result<WgBackend> {
+    if let Some(mtu) = opts.mtu {
+        wireguard::config::Mtu::new(mtu)?;
+    }
     let backend = resolve_connect_backend(
         opts.backend.as_deref(),
         default_backend,
         opts.proxy,
         opts.local_proxy,
     )?;
-    validate_disable_ipv6_direct_kernel(
-        opts.disable_ipv6,
-        opts.proxy,
-        opts.local_proxy,
-        backend,
-    )?;
+    validate_disable_ipv6_direct_kernel(opts.disable_ipv6, opts.proxy, opts.local_proxy, backend)?;
     Ok(backend)
 }
 
@@ -60,8 +55,7 @@ pub fn connect_routed(
         let instance = derive_instance_name(server.instance_seed, "server", server.display_name)?;
         ensure_instance_available(&instance, "server", server.display_name)?;
 
-        let proxy_config =
-            resolve_proxy_config(opts.socks_port, opts.http_port, proxy_access_log)?;
+        let proxy_config = resolve_proxy_config(opts.socks_port, opts.http_port, proxy_access_log)?;
         connect_proxy_via_netns(&ConnectContext {
             provider,
             instance: &instance,
@@ -77,8 +71,7 @@ pub fn connect_routed(
         let instance = derive_instance_name(server.instance_seed, "server", server.display_name)?;
         ensure_instance_available(&instance, "server", server.display_name)?;
 
-        let proxy_config =
-            resolve_proxy_config(opts.socks_port, opts.http_port, proxy_access_log)?;
+        let proxy_config = resolve_proxy_config(opts.socks_port, opts.http_port, proxy_access_log)?;
         connect_local_proxy_instance(&LocalProxyContext {
             provider,
             instance: &instance,
@@ -327,10 +320,13 @@ pub fn ensure_instance_available(
     target_kind: &str,
     target_name: &str,
 ) -> anyhow::Result<()> {
-    if ConnectionState::exists(instance) {
+    if let Some(state) = ConnectionState::load(instance)? {
+        let health = wireguard::health::inspect(&state);
         anyhow::bail!(
-            "instance {:?} already exists ({} {} already connected). Disconnect first or choose a different {}.",
+            "instance {:?} is {}: {} ({} {}). Disconnect/recover first or choose a different {}.",
             instance,
+            health.kind,
+            health.reason,
             target_kind,
             target_name,
             target_kind
@@ -376,10 +372,8 @@ pub fn connect_direct_wg(
 ) -> anyhow::Result<()> {
     use wireguard::connection::{ConnectionState, DIRECT_INSTANCE};
 
-    if ConnectionState::exists(DIRECT_INSTANCE) {
-        anyhow::bail!("Already connected via direct VPN. Disconnect first.");
-    }
-    if wireguard::wg_quick::is_interface_active(interface_name)
+    ensure_instance_available(DIRECT_INSTANCE, "direct VPN", display_name)?;
+    if (backend != WgBackend::Userspace && wireguard::wg_quick::is_interface_active(interface_name))
         || wireguard::userspace::is_interface_active(interface_name)
     {
         anyhow::bail!(
@@ -399,8 +393,7 @@ pub fn connect_direct_wg(
         }
         WgBackend::Userspace => {
             let wg_config = wireguard::config::generate_config(params);
-            let effective_iface =
-                wireguard::userspace::up(&wg_config, interface_name, provider)?;
+            let effective_iface = wireguard::userspace::up(&wg_config, interface_name, provider)?;
             build_direct_state(params, backend, effective_iface, provider, display_name).save()?;
         }
         WgBackend::Kernel => {
@@ -448,7 +441,7 @@ fn build_direct_state(
         socks_port: None,
         http_port: None,
         dns_servers: params.dns_servers.iter().map(|s| s.to_string()).collect(),
-        peer_public_key: None,
+        peer_public_key: Some(params.server_public_key.to_string()),
         local_public_key: None,
         virtual_ips: vec![],
         keepalive_secs: None,

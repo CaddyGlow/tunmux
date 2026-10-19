@@ -45,10 +45,8 @@ pub fn down_raw(interface_name: &str) -> Result<()> {
     client.gotatun_run(GotaTunAction::Down, interface_name, "")
 }
 
-/// Check if a userspace interface appears active by control socket presence.
+/// Conservatively check control endpoint occupancy without trusting socket presence.
 #[must_use]
 pub fn is_interface_active(interface_name: &str) -> bool {
-    std::path::Path::new("/var/run/wireguard")
-        .join(format!("{interface_name}.sock"))
-        .exists()
+    super::health::userspace_endpoint_occupied(interface_name)
 }

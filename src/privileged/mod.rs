@@ -10,20 +10,18 @@ use std::os::unix::io::FromRawFd;
 use std::os::unix::net::UnixStream;
 use std::time::{Duration, Instant};
 
-use nix::unistd::{chown, Gid};
 #[cfg(target_os = "linux")]
 use nix::sys::socket::{getsockopt, sockopt::PeerCredentials};
 #[cfg(not(target_os = "android"))]
 use nix::unistd::Group;
+use nix::unistd::{chown, Gid};
 use tracing::{debug, info, warn};
 
 use crate::config;
 use crate::privileged_api::{PrivilegedRequest, PrivilegedResponse};
 
 use dispatch::dispatch;
-use managed_pids::{
-    cleanup_stale_managed_pid_registry_entries, ensure_managed_pid_registry_dir,
-};
+use managed_pids::{cleanup_stale_managed_pid_registry_entries, ensure_managed_pid_registry_dir};
 
 const AUTH_GROUP_NAME: &str = "tunmux";
 
@@ -43,7 +41,8 @@ impl ControlState {
     }
 
     fn prune_stale_leases(&mut self) {
-        self.leases.retain(|token| managed_pids::lease_token_is_live(token));
+        self.leases
+            .retain(|token| managed_pids::lease_token_is_live(token));
     }
 
     fn should_exit_now(&mut self) -> bool {
@@ -451,8 +450,7 @@ mod tests {
     use super::*;
     use crate::privileged_api::KillSignal;
     use managed_pids::{
-        managed_pid_entry_path, managed_pid_registry_dir, register_managed_pid,
-        process_start_ticks,
+        managed_pid_entry_path, managed_pid_registry_dir, process_start_ticks, register_managed_pid,
     };
     use std::sync::{Mutex, OnceLock};
     use std::time::{SystemTime, UNIX_EPOCH};

@@ -2,18 +2,6 @@
 /target
 .cargo/
 
-# Android Rust library
-android/rust-lib/target
-
-# Gradle
-android/.gradle
-android/build
-android/app/build
-android/local.properties
-android/gradle/wrapper/gradle-wrapper.jar
-android/gradlew
-android/gradlew.bat
-
 # Nix
 .data
 flake.lock

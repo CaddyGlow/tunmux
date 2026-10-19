@@ -1009,7 +1009,6 @@ fn apply_proton_feature_filters(
     });
 }
 
-
 async fn cmd_connect(
     args: crate::cli::ProtonConnectArgs,
     config: &AppConfig,
@@ -1017,7 +1016,9 @@ async fn cmd_connect(
     let backend = connection_ops::resolve_opts(&args.opts, &config.general.backend)?;
 
     // Apply config defaults -- CLI flags override config
-    let effective_country = args.country.or_else(|| config.default_country_for(PROVIDER).map(str::to_owned));
+    let effective_country = args
+        .country
+        .or_else(|| config.default_country_for(PROVIDER).map(str::to_owned));
 
     let mut session: models::session::Session = config::load_session(PROVIDER, config)?;
     if args.port_forwarding {

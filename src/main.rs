@@ -36,12 +36,16 @@ use cli::{
 };
 use wireguard::connection::ConnectionState;
 
-fn main() {
+fn main() -> std::process::ExitCode {
     if userspace_helper::maybe_run_from_env() {
-        return;
+        return std::process::ExitCode::SUCCESS;
     }
 
     let cli = Cli::parse();
+    if let Err(error) = logging::configure(cli.verbose, cli.log_filter.as_deref()) {
+        eprintln!("logging initialization failed: {error:#}");
+        return std::process::ExitCode::FAILURE;
+    }
 
     match cli.command {
         // Privileged control server.
@@ -52,10 +56,10 @@ fn main() {
             idle_timeout_ms,
             autostarted,
         } => {
-            init_logging(cli.verbose);
+            let _logging_guard = init_logging(cli.verbose);
             if !serve {
                 eprintln!("privileged mode requires --serve");
-                std::process::exit(1);
+                return std::process::ExitCode::FAILURE;
             }
             let run = if stdio {
                 privileged::serve_stdio(idle_timeout_ms, autostarted)
@@ -64,7 +68,7 @@ fn main() {
             };
             if let Err(e) = run {
                 eprintln!("privileged service error: {}", e);
-                std::process::exit(1);
+                return std::process::ExitCode::FAILURE;
             }
         }
         // ProxyDaemon runs its own single-threaded runtime and daemonizes.
@@ -90,7 +94,7 @@ fn main() {
                 &startup_status_file,
             ) {
                 eprintln!("proxy-daemon error: {}", e);
-                std::process::exit(1);
+                return std::process::ExitCode::FAILURE;
             }
         }
 
@@ -105,30 +109,30 @@ fn main() {
         } => {
             if let Err(e) = run_local_proxy_daemon(&pid_file, &log_file, &config_b64) {
                 eprintln!("local-proxy-daemon error: {}", e);
-                std::process::exit(1);
+                return std::process::ExitCode::FAILURE;
             }
         }
 
         // Status and Wg are quick sync commands, no tokio needed.
         TopCommand::Status => {
-            init_logging(cli.verbose);
+            let _logging_guard = init_logging(cli.verbose);
             if let Err(e) = cmd_status() {
                 error!( command = ?"status", error = ?e.to_string(), "command_failed");
-                std::process::exit(1);
+                return std::process::ExitCode::FAILURE;
             }
         }
 
         TopCommand::Wg => {
-            init_logging(cli.verbose);
+            let _logging_guard = init_logging(cli.verbose);
             if let Err(e) = cmd_wg() {
                 error!( command = ?"wg", error = ?e.to_string(), "command_failed");
-                std::process::exit(1);
+                return std::process::ExitCode::FAILURE;
             }
         }
 
         // All other commands use the multi-threaded tokio runtime.
         other => {
-            init_logging(cli.verbose);
+            let _logging_guard = init_logging(cli.verbose);
             let config = config::load_config();
             let _command_scope = privileged_client::CommandScopeGuard::begin(
                 config.general.privileged_autostop_mode,
@@ -137,14 +141,18 @@ fn main() {
             let rt = tokio::runtime::Runtime::new().expect("failed to create tokio runtime");
             if let Err(e) = rt.block_on(run(other, config)) {
                 error!( error = ?e.to_string(), "command_failed");
-                std::process::exit(1);
+                return std::process::ExitCode::FAILURE;
             }
         }
     }
+    std::process::ExitCode::SUCCESS
 }
 
-fn init_logging(verbose: bool) {
-    logging::init_terminal(verbose);
+fn init_logging(verbose: bool) -> logging::LoggingGuard {
+    logging::init_terminal(verbose).unwrap_or_else(|error| {
+        eprintln!("logging initialization failed: {error:#}");
+        std::process::exit(1);
+    })
 }
 
 async fn run(command: TopCommand, config: config::AppConfig) -> anyhow::Result<()> {
@@ -464,12 +472,11 @@ fn run_local_proxy_daemon(pid_file: &str, log_file: &str, config_b64: &str) -> a
         daemonize_local()?;
     }
 
-    if foreground {
-        logging::init_terminal(true);
+    let _logging_guard = if foreground {
+        logging::init_terminal(true)?
     } else {
-        // Init file logging -- all subsequent output goes to the log file.
-        logging::init_file(log_file, false)?;
-    }
+        logging::init_file(log_file, false)?
+    };
 
     if let Some(source) = dns_override_source {
         info!(
@@ -588,12 +595,13 @@ fn cmd_status() -> anyhow::Result<()> {
     }
 
     println!(
-        "{:<12} {:<9} {:<10} {:<5} {:<9} {:<16} HTTP",
+        "{:<12} {:<9} {:<10} {:<5} {:<9} {:<16} HTTP  Health",
         "Instance", "Provider", "Server", "Exit", "Backend", "SOCKS5"
     );
     println!("{}", "-".repeat(76));
 
     for conn in &connections {
+        let health = wireguard::health::inspect(conn);
         let exit = conn
             .server_display_name
             .split('#')
@@ -613,7 +621,7 @@ fn cmd_status() -> anyhow::Result<()> {
             .unwrap_or_else(|| "-".to_string());
 
         println!(
-            "{:<12} {:<9} {:<10} {:<5} {:<9} {:<16} {}",
+            "{:<12} {:<9} {:<10} {:<5} {:<9} {:<16} {}  {} ({})",
             conn.instance_name,
             conn.provider,
             conn.server_display_name,
@@ -621,6 +629,8 @@ fn cmd_status() -> anyhow::Result<()> {
             conn.backend,
             socks,
             http,
+            health.kind,
+            health.reason,
         );
     }
 

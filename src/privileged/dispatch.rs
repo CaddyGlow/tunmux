@@ -11,13 +11,17 @@ use crate::privileged_api::{
 };
 
 use super::commands::{
-    run, run_output, run_resolved_revert_dns, run_resolved_set_dns, run_wg_quick_down,
-    run_wg_quick_up, run_wg_show, run_gotatun_down, run_gotatun_up, set_preshared_key, wg_set,
+    run, run_gotatun_down, run_gotatun_up, run_output, run_resolved_revert_dns,
+    run_resolved_set_dns, run_wg_quick_down, run_wg_quick_up, run_wg_show, set_preshared_key,
+    wg_set,
 };
 use super::daemon::spawn_proxy_daemon;
 use super::managed_pids::{managed_pid_is_current, register_managed_pid, unregister_managed_pid};
 use super::ControlState;
 
+static NEXT_REQUEST_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+#[tracing::instrument(skip_all, fields(operation = "privileged_dispatch", request_id = NEXT_REQUEST_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed)))]
 pub(super) fn dispatch(
     request: PrivilegedRequest,
     control_state: &mut ControlState,
@@ -73,7 +77,7 @@ pub(super) fn dispatch(
             let mut command_args: Vec<&str> = vec!["ip", "netns", "exec", namespace.as_str()];
             command_args.extend(args.iter().map(String::as_str));
 
-            debug!(cmd = command_args.join(" "), "exec");
+            debug!(operation = "netns_exec", "exec");
             let output = Command::new(command_args[0])
                 .args(&command_args[1..])
                 .output();

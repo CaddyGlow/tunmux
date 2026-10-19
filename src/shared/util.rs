@@ -43,6 +43,9 @@ mod tests {
     #[test]
     fn short_key_truncates_long_keys() {
         assert_eq!(short_key("short"), "short");
-        assert_eq!(short_key("abcdefghijklmnopqrstuvwxyz"), "abcdefghijklmnopqrst...");
+        assert_eq!(
+            short_key("abcdefghijklmnopqrstuvwxyz"),
+            "abcdefghijklmnopqrst..."
+        );
     }
 }

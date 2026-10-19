@@ -187,9 +187,7 @@ impl PrivilegedRequest {
             Self::HostIpLinkSetUp { interface } => validate_interface_name(interface),
             Self::HostIpLinkSetMtu { interface, mtu } => {
                 validate_interface_name(interface)?;
-                if *mtu < 576 {
-                    return Err("mtu must be >= 576".into());
-                }
+                crate::wireguard::config::Mtu::new(*mtu).map_err(|error| error.to_string())?;
                 Ok(())
             }
             Self::HostIpRouteAdd {

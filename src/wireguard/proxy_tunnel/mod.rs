@@ -217,7 +217,8 @@ pub async fn run_local_proxy(
                     let notify = notify.clone();
                     let dns_resolver = socks_dns_resolver.clone();
                     tokio::spawn(async move {
-                        if let Err(e) = socks5::socks5_serve(stream, tx, notify, dns_resolver).await {
+                        if let Err(e) = socks5::socks5_serve(stream, tx, notify, dns_resolver).await
+                        {
                             debug!(error = ?e.to_string(), "socks5_error");
                         }
                     });
@@ -247,7 +248,9 @@ pub async fn run_local_proxy(
                     let notify = notify.clone();
                     let dns_resolver = http_dns_resolver.clone();
                     tokio::spawn(async move {
-                        if let Err(e) = http::http_connect_serve(stream, tx, notify, dns_resolver).await {
+                        if let Err(e) =
+                            http::http_connect_serve(stream, tx, notify, dns_resolver).await
+                        {
                             debug!(error = ?e.to_string(), "http_error");
                         }
                     });

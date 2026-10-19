@@ -38,20 +38,11 @@ jobs:
       ref: ${{ github.ref }}
       version: ${{ github.ref_name }}
 
-  build-android:
-    name: Build Android app artifact
-    needs: test
-    uses: ./.github/workflows/manual-build-android.yml
-    with:
-      ref: ${{ github.ref }}
-      version: ${{ github.ref_name }}
-
   release:
     name: Publish GitHub Release
     runs-on: ubuntu-latest
     needs:
       - build
-      - build-android
     permissions:
       contents: write
     steps:

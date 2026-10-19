@@ -81,7 +81,7 @@ pub fn up(
         socks_port: None,
         http_port: None,
         dns_servers: params.dns_servers.iter().map(|s| s.to_string()).collect(),
-        peer_public_key: None,
+        peer_public_key: Some(params.server_public_key.to_owned()),
         local_public_key: None,
         virtual_ips: vec![],
         keepalive_secs: None,
@@ -563,7 +563,7 @@ fn up_macos(
         socks_port: None,
         http_port: None,
         dns_servers: params.dns_servers.iter().map(|s| s.to_string()).collect(),
-        peer_public_key: None,
+        peer_public_key: Some(params.server_public_key.to_owned()),
         local_public_key: None,
         virtual_ips: vec![],
         keepalive_secs: None,
@@ -628,13 +628,7 @@ fn allowed_ips_contains_ipv6_default(allowed_ips: &str) -> bool {
 }
 
 fn validate_mtu(mtu: u16) -> Result<()> {
-    if mtu < 576 {
-        return Err(AppError::WireGuard(format!(
-            "invalid MTU {} (must be >= 576)",
-            mtu
-        )));
-    }
-    Ok(())
+    super::config::Mtu::new(mtu).map(|_| ())
 }
 
 fn is_systemd_resolved_managed_resolv_conf(path: &str) -> bool {

@@ -11,6 +11,7 @@ use crate::error::{AppError, Result};
 use super::managed_pids::pid_is_alive;
 
 #[allow(clippy::too_many_arguments)]
+#[tracing::instrument(skip_all, fields(interface, instance = netns, backend = "kernel", operation = "spawn_proxy"))]
 pub(super) fn spawn_proxy_daemon(
     netns: &str,
     interface: &str,
@@ -41,6 +42,7 @@ pub(super) fn spawn_proxy_daemon(
     let mut command = Command::new(exe);
     use std::os::unix::process::CommandExt;
     command.arg0("tunmux");
+    crate::logging::apply_to_command(&mut command);
     command.args([
         "proxy-daemon",
         "--netns",

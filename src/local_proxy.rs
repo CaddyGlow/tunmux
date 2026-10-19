@@ -110,6 +110,7 @@ pub fn spawn_daemon(
     let http = cfg.http_port.to_string();
 
     let mut cmd = std::process::Command::new(&exe);
+    crate::logging::apply_to_command(&mut cmd);
     cmd.args([
         "local-proxy-daemon",
         "--socks-port",

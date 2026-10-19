@@ -7,6 +7,8 @@ pub mod proxy_tunnel;
 #[cfg(not(target_os = "android"))]
 pub mod handshake;
 #[cfg(not(target_os = "android"))]
+pub mod health;
+#[cfg(not(target_os = "android"))]
 pub mod kernel;
 #[cfg(target_os = "linux")]
 pub(crate) mod netlink;

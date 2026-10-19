@@ -47,8 +47,12 @@ pub struct Cli {
     pub command: TopCommand,
 
     /// Enable verbose logging
-    #[arg(short, long, global = true)]
+    #[arg(short, long, alias = "debug", global = true)]
     pub verbose: bool,
+
+    /// Explicit startup tracing directives (also used for spawned services)
+    #[arg(long, global = true, hide = true)]
+    pub log_filter: Option<String>,
 }
 
 #[derive(Subcommand)]

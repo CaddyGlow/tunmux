@@ -1,3 +1,11 @@
+#[cfg(unix)]
+mod network;
+#[cfg(unix)]
+use network::recover_network;
+#[cfg(unix)]
+mod worker;
+#[cfg(unix)]
+use worker::NetworkWorker;
 #[cfg(not(unix))]
 pub fn maybe_run_from_env() -> bool {
     false
@@ -11,16 +19,12 @@ use std::fs::File;
 use std::io;
 #[cfg(unix)]
 use std::net::{IpAddr, SocketAddr};
-#[cfg(target_os = "macos")]
-use std::net::{Ipv4Addr, Ipv6Addr, UdpSocket};
 #[cfg(unix)]
 use std::os::unix::net::UnixDatagram;
 #[cfg(all(unix, target_os = "linux"))]
 use std::path::Path;
 #[cfg(unix)]
 use std::path::PathBuf;
-#[cfg(unix)]
-use std::process::{Command, Output};
 #[cfg(unix)]
 use std::time::Duration;
 
@@ -38,10 +42,6 @@ use gotatun::tun::tun_async_device::TunDevice;
 use gotatun::x25519::{PublicKey, StaticSecret};
 #[cfg(unix)]
 use tokio::signal::unix::{signal, SignalKind};
-#[cfg(unix)]
-use tracing::info;
-#[cfg(target_os = "macos")]
-use tracing::warn;
 
 #[cfg(unix)]
 const READY_OK: &[u8] = &[1];
@@ -62,57 +62,15 @@ struct RunningDevice {
     control_interface_name: String,
     control_socket_path: PathBuf,
     device: Device<DefaultDeviceTransports>,
-    cleanup: CleanupState,
-}
-
-#[cfg(unix)]
-enum CleanupState {
-    None,
-    #[cfg(target_os = "linux")]
-    Linux(LinuxCleanupState),
-    #[cfg(target_os = "macos")]
-    Macos(MacosCleanupState),
-}
-
-#[cfg(target_os = "linux")]
-struct LinuxCleanupState {
-    routes_added: Vec<LinuxRoute>,
-    original_resolv_conf: Option<String>,
-}
-
-#[cfg(target_os = "linux")]
-struct LinuxRoute {
-    is_ipv6: bool,
-    destination: String,
-    via: Option<String>,
-    dev: Option<String>,
-}
-
-#[cfg(target_os = "macos")]
-struct MacosCleanupState {
-    routes_added: Vec<MacosRoute>,
-    dns_services: Vec<MacosDnsServiceState>,
-}
-
-#[cfg(target_os = "macos")]
-struct MacosRoute {
-    is_ipv6: bool,
-    destination: String,
-    interface: Option<String>,
-    gateway: Option<String>,
-}
-
-#[cfg(target_os = "macos")]
-struct MacosDnsServiceState {
-    service: String,
-    dns_servers: Option<Vec<String>>,
-    search_domains: Option<Vec<String>>,
+    network: NetworkWorker,
+    _session_lock: network::SessionLock,
 }
 
 #[cfg(unix)]
 #[derive(Debug, Clone)]
 struct ParsedUserspaceConfig {
     private_key: [u8; 32],
+    mtu: Option<crate::wireguard::config::Mtu>,
     addresses: Vec<String>,
     #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     dns_servers: Vec<String>,
@@ -127,8 +85,6 @@ pub fn maybe_run_from_env() -> bool {
     if std::env::var_os(HELPER_ENV).is_none() {
         return false;
     }
-
-    crate::logging::init_terminal(false);
 
     let mut args = std::env::args();
     let _program = args.next();
@@ -172,7 +128,9 @@ fn daemonize_and_run(interface: &str) -> anyhow::Result<()> {
             anyhow::bail!("failed to daemonize userspace helper: {}", e);
         }
         daemonize::Outcome::Parent(Ok(_)) => {
+            drop(child_tx);
             let mut status = [0u8; 1];
+            parent_rx.set_read_timeout(Some(Duration::from_secs(60)))?;
             parent_rx
                 .recv(&mut status)
                 .context("failed to receive startup status from helper child")?;
@@ -182,6 +140,7 @@ fn daemonize_and_run(interface: &str) -> anyhow::Result<()> {
             anyhow::bail!("userspace helper child reported startup failure");
         }
         daemonize::Outcome::Child(result) => {
+            drop(parent_rx);
             let signal_parent = |ok: bool| -> io::Result<()> {
                 child_tx.send(if ok { READY_OK } else { READY_ERR })?;
                 Ok(())
@@ -192,25 +151,87 @@ fn daemonize_and_run(interface: &str) -> anyhow::Result<()> {
                 anyhow::bail!("failed to initialize userspace helper child: {}", e);
             }
 
+            let _logging_guard = crate::logging::init_terminal(false)?;
             let rt = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
                 .build()
                 .context("failed to create tokio runtime for userspace helper")?;
-
-            let running = match rt.block_on(start_device(interface)) {
-                Ok(value) => value,
-                Err(e) => {
-                    let _ = signal_parent(false);
-                    return Err(e);
+            let mut session_ownership = None;
+            let mut acknowledgment = None;
+            let outcome = rt.block_on(async {
+                let mut sigint = signal(SignalKind::interrupt()).context("failed to set SIGINT handler")?;
+                let mut sigterm = signal(SignalKind::terminate()).context("failed to set SIGTERM handler")?;
+                let session_lock = match recover_network(interface) {
+                    Ok(lock) => lock,
+                    Err(error) => { let _ = signal_parent(false); return Err(error); }
+                };
+                session_ownership = Some(session_lock.clone());
+                let running = match start_device(interface, session_lock, &mut sigint, &mut sigterm).await {
+                    Ok(value) => value,
+                    Err(error) => {
+                        let _ = signal_parent(false);
+                        return Err(error);
+                    }
+                };
+                let stop_path = PathBuf::from(SOCK_DIR).join(format!("{interface}.stop"));
+                let listener = tokio::net::UnixListener::bind(&stop_path);
+                let outcome = match listener {
+                    Ok(listener) => {
+                        use std::os::unix::fs::PermissionsExt;
+                        let setup = std::fs::set_permissions(
+                            &stop_path,
+                            std::fs::Permissions::from_mode(0o600),
+                        )
+                        .context("failed to protect helper stop socket")
+                        .and_then(|()| {
+                            signal_parent(true)
+                                .context("failed to notify parent about helper startup")
+                        });
+                        match setup {
+                            Ok(()) => match wait_for_shutdown(&running, &listener, &mut sigint, &mut sigterm).await {
+                                Ok(stream) => {
+                                    acknowledgment = stream;
+                                    Ok(())
+                                }
+                                Err(error) => Err(error),
+                            },
+                            Err(error) => Err(error),
+                        }
+                    }
+                    Err(error) => {
+                        Err(anyhow::Error::new(error).context("failed to bind helper stop socket"))
+                    }
+                };
+                let cleanup = running.network.stop().await;
+                let stop = stop_device(running.device).await;
+                let errors: Vec<String> = [outcome, cleanup, stop].into_iter()
+                    .filter_map(|result| result.err().map(|error| format!("{error:#}"))).collect();
+                let result = if errors.is_empty() { Ok(()) } else {
+                    tracing::error!(interface, errors = ?errors, "userspace_helper_teardown_failed");
+                    Err(anyhow::anyhow!(errors.join("; ")))
+                };
+                if result.is_ok() {
+                    let _ = std::fs::remove_file(&running.control_socket_path);
                 }
-            };
-
-            signal_parent(true).context("failed to notify parent about helper startup")?;
-            rt.block_on(wait_for_shutdown(&running))?;
-            cleanup_network(&running);
-            rt.block_on(async {
-                running.device.stop().await;
+                let _ = std::fs::remove_file(stop_path);
+                result
             });
+            // gotatun Drop can spawn async shutdown work; bound runtime shutdown too.
+            rt.shutdown_timeout(Duration::from_secs(1));
+            drop(session_ownership);
+            if let Some(stream) = acknowledgment {
+                use std::io::Write;
+                let message = match &outcome {
+                    Ok(()) => "ok\n".to_string(),
+                    Err(error) => format!("error: {error:#}\n"),
+                };
+                if let Ok(mut stream) = stream.into_std() {
+                    let _ = stream.set_nonblocking(false);
+                    let _ = stream.set_write_timeout(Some(Duration::from_secs(1)));
+                    let _ = stream.write_all(message.as_bytes());
+                }
+            }
+            outcome?;
         }
     }
 
@@ -218,7 +239,22 @@ fn daemonize_and_run(interface: &str) -> anyhow::Result<()> {
 }
 
 #[cfg(unix)]
-async fn start_device(interface: &str) -> anyhow::Result<RunningDevice> {
+#[tracing::instrument(
+    skip_all,
+    fields(interface, backend = "userspace", operation = "start")
+)]
+async fn start_device(
+    interface: &str,
+    session_lock: network::SessionLock,
+    sigint: &mut tokio::signal::unix::Signal,
+    sigterm: &mut tokio::signal::unix::Signal,
+) -> anyhow::Result<RunningDevice> {
+    let stop_path = PathBuf::from(SOCK_DIR).join(format!("{interface}.stop"));
+    match std::fs::remove_file(stop_path) {
+        Ok(()) => {}
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error.into()),
+    }
     let parsed_config = parse_config_from_env()?;
     let tun_name = helper_tun_name(interface);
     let tun = TunDevice::from_name(&tun_name)
@@ -251,25 +287,37 @@ async fn start_device(interface: &str) -> anyhow::Result<RunningDevice> {
         .map_err(|e| anyhow::anyhow!("failed to start gotatun device {}: {}", interface_name, e))?;
 
     if let Some(config) = parsed_config.as_ref() {
-        if let Err(e) = apply_wireguard_config(&device, config).await {
-            device.stop().await;
+        if let Err(e) = tokio::time::timeout(
+            Duration::from_secs(5),
+            apply_wireguard_config(&device, config),
+        )
+        .await
+        .context("device configuration deadline exceeded")
+        .and_then(|result| result)
+        {
+            let _ = stop_device(device).await;
             let _ = std::fs::remove_file(PathBuf::from(SOCK_DIR).join(format!("{interface}.sock")));
             return Err(e);
         }
     }
 
-    let cleanup = if let Some(config) = parsed_config.as_ref() {
-        match configure_network(&interface_name, config) {
-            Ok(cleanup) => cleanup,
-            Err(e) => {
-                device.stop().await;
-                let _ =
-                    std::fs::remove_file(PathBuf::from(SOCK_DIR).join(format!("{interface}.sock")));
-                return Err(e);
-            }
+    let network = match NetworkWorker::start(
+        interface_name.clone(),
+        parsed_config,
+        interface.to_string(),
+        session_lock.clone(),
+        async {
+            tokio::select! { _ = sigint.recv() => {}, _ = sigterm.recv() => {} }
+        },
+    )
+    .await
+    {
+        Ok(worker) => worker,
+        Err(error) => {
+            let _ = stop_device(device).await;
+            let _ = std::fs::remove_file(PathBuf::from(SOCK_DIR).join(format!("{interface}.sock")));
+            return Err(error);
         }
-    } else {
-        CleanupState::None
     };
 
     let control_socket_path = PathBuf::from(SOCK_DIR).join(format!("{}.sock", interface));
@@ -278,158 +326,74 @@ async fn start_device(interface: &str) -> anyhow::Result<RunningDevice> {
         control_interface_name: interface.to_string(),
         control_socket_path,
         device,
-        cleanup,
+        network,
+        _session_lock: session_lock,
     })
 }
 
 #[cfg(unix)]
-async fn wait_for_shutdown(running: &RunningDevice) -> anyhow::Result<()> {
-    let mut sigint = signal(SignalKind::interrupt()).context("failed to set SIGINT handler")?;
-    let mut sigterm = signal(SignalKind::terminate()).context("failed to set SIGTERM handler")?;
-    let mut ticker = tokio::time::interval(Duration::from_secs(1));
-    #[cfg(target_os = "macos")]
-    let diag_enabled = true;
-    #[cfg(target_os = "macos")]
-    let mut next_diag_at = std::time::Instant::now();
-    #[cfg(target_os = "macos")]
-    let mut last_transfer: Option<(u64, u64)> = None;
+#[tracing::instrument(
+    skip_all,
+    fields(backend = "userspace", operation = "stop", deadline_seconds = 5)
+)]
+async fn stop_device(device: Device<DefaultDeviceTransports>) -> anyhow::Result<()> {
+    // stop consumes the device and waits on task joins. Retain the task until the
+    // deadline, then abort it; runtime teardown drops remaining device tasks.
+    finish_device_stop(tokio::spawn(device.stop()), Duration::from_secs(5)).await
+}
 
-    #[cfg(target_os = "macos")]
-    info!(
-        interface = running.control_interface_name,
-        "userspace_helper_dataplane_probe_enabled"
-    );
+#[cfg(unix)]
+async fn finish_device_stop(
+    mut task: tokio::task::JoinHandle<()>,
+    deadline: Duration,
+) -> anyhow::Result<()> {
+    match tokio::time::timeout(deadline, &mut task).await {
+        Ok(result) => result.context("device stop task failed"),
+        Err(_) => {
+            task.abort();
+            let _ = task.await;
+            anyhow::bail!("device stop exceeded 5 seconds; network restoration was attempted")
+        }
+    }
+}
 
+#[cfg(unix)]
+#[tracing::instrument(skip_all, fields(interface = %running.interface_name, backend = "userspace", operation = "wait_for_shutdown"))]
+async fn wait_for_shutdown(
+    running: &RunningDevice,
+    listener: &tokio::net::UnixListener,
+    sigint: &mut tokio::signal::unix::Signal,
+    sigterm: &mut tokio::signal::unix::Signal,
+) -> anyhow::Result<Option<tokio::net::UnixStream>> {
+    let mut ticker = tokio::time::interval(Duration::from_secs(5));
     loop {
         tokio::select! {
-            _ = sigint.recv() => break,
-            _ = sigterm.recv() => break,
+            biased;
+            _ = sigint.recv() => return Ok(None),
+            _ = sigterm.recv() => return Ok(None),
+            result = listener.accept() => return result.map(|(stream, _)| Some(stream)).context("helper stop listener failed"),
             _ = ticker.tick() => {
-                if !running.control_socket_path.exists() {
-                    break;
-                }
-
+                if !running.control_socket_path.exists() { return Ok(None); }
                 #[cfg(target_os = "linux")]
-                {
-                    let iface_path = Path::new("/sys/class/net").join(&running.interface_name);
-                    if !iface_path.exists() {
-                        break;
-                    }
-                }
-
-                #[cfg(target_os = "macos")]
-                {
-                    if diag_enabled && std::time::Instant::now() >= next_diag_at {
-                        next_diag_at = std::time::Instant::now() + Duration::from_secs(5);
-                        log_macos_dataplane_probe(
-                            &running.control_interface_name,
-                            &mut last_transfer,
-                        );
+                if !Path::new("/sys/class/net").join(&running.interface_name).exists() { return Ok(None); }
+                let diagnostic = tokio::time::timeout(Duration::from_secs(1), running.device.peers());
+                tokio::select! {
+                    biased;
+                    _ = sigint.recv() => return Ok(None),
+                    _ = sigterm.recv() => return Ok(None),
+                    result = listener.accept() => return result.map(|(stream, _)| Some(stream)).context("helper stop listener failed"),
+                    result = diagnostic => match result {
+                        Ok(peers) => {
+                            let (rx_bytes, tx_bytes) = peers.iter().fold((0u64, 0u64), |(rx, tx), peer| {
+                                (rx.saturating_add(peer.stats.rx_bytes as u64), tx.saturating_add(peer.stats.tx_bytes as u64))
+                            });
+                            tracing::debug!(interface = running.control_interface_name, rx_bytes, tx_bytes, "userspace_helper_statistics");
+                        }
+                        Err(_) => tracing::debug!(interface = running.control_interface_name, "userspace_helper_statistics_timeout"),
                     }
                 }
             }
         }
-    }
-
-    Ok(())
-}
-
-#[cfg(target_os = "macos")]
-fn log_macos_dataplane_probe(interface: &str, last_transfer: &mut Option<(u64, u64)>) {
-    let ipv4_probe_sent = send_udp_probe(SocketAddr::from((Ipv4Addr::new(8, 8, 8, 8), 53)));
-    let ipv6_probe_sent = send_udp_probe(SocketAddr::from((
-        Ipv6Addr::new(0x2001, 0x4860, 0x4860, 0, 0, 0, 0, 0x8888),
-        53,
-    )));
-
-    match read_wg_transfer_bytes(interface) {
-        Ok(Some((rx_bytes, tx_bytes))) => {
-            let (delta_rx_bytes, delta_tx_bytes) = last_transfer
-                .map(|(prev_rx, prev_tx)| {
-                    (
-                        rx_bytes.saturating_sub(prev_rx),
-                        tx_bytes.saturating_sub(prev_tx),
-                    )
-                })
-                .unwrap_or((0, 0));
-            *last_transfer = Some((rx_bytes, tx_bytes));
-            info!(
-                interface,
-                ipv4_probe_sent,
-                ipv6_probe_sent,
-                rx_bytes,
-                tx_bytes,
-                delta_rx_bytes,
-                delta_tx_bytes,
-                "userspace_helper_dataplane_probe"
-            );
-        }
-        Ok(None) => {
-            info!(
-                interface,
-                ipv4_probe_sent, ipv6_probe_sent, "userspace_helper_dataplane_probe_no_transfer"
-            );
-        }
-        Err(error) => {
-            warn!(
-                interface,
-                ipv4_probe_sent,
-                ipv6_probe_sent,
-                error = %error,
-                "userspace_helper_dataplane_probe_failed"
-            );
-        }
-    }
-}
-
-#[cfg(target_os = "macos")]
-fn send_udp_probe(target: SocketAddr) -> bool {
-    let bind = if target.is_ipv4() {
-        "0.0.0.0:0"
-    } else {
-        "[::]:0"
-    };
-    let Ok(socket) = UdpSocket::bind(bind) else {
-        return false;
-    };
-    socket.send_to(&[0], target).is_ok()
-}
-
-#[cfg(target_os = "macos")]
-fn read_wg_transfer_bytes(interface: &str) -> anyhow::Result<Option<(u64, u64)>> {
-    let output = Command::new("wg")
-        .args(["show", interface, "transfer"])
-        .output()
-        .context("failed to run wg show transfer")?;
-    if !output.status.success() {
-        anyhow::bail!("wg show {} transfer failed", interface);
-    }
-
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let mut parsed_any = false;
-    let mut rx_total: u64 = 0;
-    let mut tx_total: u64 = 0;
-
-    for line in stdout.lines() {
-        let fields: Vec<&str> = line.split_whitespace().collect();
-        if fields.len() < 3 {
-            continue;
-        }
-        let Ok(rx) = fields[1].parse::<u64>() else {
-            continue;
-        };
-        let Ok(tx) = fields[2].parse::<u64>() else {
-            continue;
-        };
-        parsed_any = true;
-        rx_total = rx_total.saturating_add(rx);
-        tx_total = tx_total.saturating_add(tx);
-    }
-
-    if parsed_any {
-        Ok(Some((rx_total, tx_total)))
-    } else {
-        Ok(None)
     }
 }
 
@@ -450,81 +414,28 @@ fn parse_config_from_env() -> anyhow::Result<Option<ParsedUserspaceConfig>> {
 
 #[cfg(unix)]
 fn parse_wg_quick_config(config: &str) -> anyhow::Result<ParsedUserspaceConfig> {
-    enum Section {
-        None,
-        Interface,
-        Peer,
+    let parsed = crate::wireguard::config::parse_config(config)?;
+    if parsed.peers.len() != 1 {
+        anyhow::bail!("userspace helper requires exactly one Peer section");
     }
-
-    let mut section = Section::None;
-    let mut private_key = None;
-    let mut addresses: Vec<String> = Vec::new();
-    let mut dns_servers: Vec<String> = Vec::new();
-    let mut peer_public_key = None;
-    let mut peer_preshared_key = None;
-    let mut allowed_ips: Vec<String> = Vec::new();
-    let mut endpoint = None;
-
-    for raw_line in config.lines() {
-        let line = raw_line.split('#').next().unwrap_or_default().trim();
-        if line.is_empty() {
-            continue;
-        }
-        if line.starts_with('[') && line.ends_with(']') {
-            section = match &line[1..line.len() - 1] {
-                "Interface" => Section::Interface,
-                "Peer" => Section::Peer,
-                _ => Section::None,
-            };
-            continue;
-        }
-
-        let Some((raw_key, raw_value)) = line.split_once('=') else {
-            continue;
-        };
-        let key = raw_key.trim();
-        let value = raw_value.trim();
-        if value.is_empty() {
-            continue;
-        }
-
-        match section {
-            Section::Interface => match key {
-                "PrivateKey" => private_key = Some(decode_key32("PrivateKey", value)?),
-                "Address" => addresses = split_csv(value),
-                "DNS" => dns_servers = split_csv(value),
-                _ => {}
-            },
-            Section::Peer => match key {
-                "PublicKey" => peer_public_key = Some(decode_key32("PublicKey", value)?),
-                "PresharedKey" => peer_preshared_key = Some(decode_key32("PresharedKey", value)?),
-                "AllowedIPs" => allowed_ips = split_csv(value),
-                "Endpoint" => endpoint = Some(parse_endpoint(value)?),
-                _ => {}
-            },
-            Section::None => {}
-        }
-    }
-
-    let private_key = private_key.ok_or_else(|| anyhow::anyhow!("missing Interface.PrivateKey"))?;
-    if addresses.is_empty() {
-        anyhow::bail!("missing Interface.Address");
-    }
-    let peer_public_key =
-        peer_public_key.ok_or_else(|| anyhow::anyhow!("missing Peer.PublicKey"))?;
-    if allowed_ips.is_empty() {
-        anyhow::bail!("missing Peer.AllowedIPs");
-    }
-    let endpoint = endpoint.ok_or_else(|| anyhow::anyhow!("missing Peer.Endpoint"))?;
-
+    let peer = &parsed.peers[0];
+    let endpoint = peer
+        .endpoint
+        .as_deref()
+        .ok_or_else(|| anyhow::anyhow!("missing Peer.Endpoint"))?;
     Ok(ParsedUserspaceConfig {
-        private_key,
-        addresses,
-        dns_servers,
-        peer_public_key,
-        peer_preshared_key,
-        allowed_ips,
-        endpoint,
+        private_key: decode_key32("PrivateKey", &parsed.private_key)?,
+        mtu: parsed.mtu,
+        addresses: parsed.addresses,
+        dns_servers: parsed.dns_servers,
+        peer_public_key: decode_key32("PublicKey", &peer.public_key)?,
+        peer_preshared_key: peer
+            .preshared_key
+            .as_deref()
+            .map(|value| decode_key32("PresharedKey", value))
+            .transpose()?,
+        allowed_ips: split_csv(&peer.allowed_ips),
+        endpoint: parse_endpoint(endpoint)?,
     })
 }
 
@@ -613,703 +524,58 @@ fn helper_tun_name(interface: &str) -> String {
     }
 }
 
-#[cfg(unix)]
-fn configure_network(
-    interface: &str,
-    config: &ParsedUserspaceConfig,
-) -> anyhow::Result<CleanupState> {
-    #[cfg(target_os = "linux")]
-    {
-        let cleanup = configure_network_linux(interface, config)?;
-        Ok(CleanupState::Linux(cleanup))
-    }
+#[cfg(all(test, unix))]
+mod mtu_tests {
+    use super::*;
 
-    #[cfg(target_os = "macos")]
-    {
-        let cleanup = configure_network_macos(interface, config)?;
-        Ok(CleanupState::Macos(cleanup))
-    }
-
-    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-    {
-        let _ = (interface, config);
-        Ok(CleanupState::None)
-    }
-}
-
-#[cfg(unix)]
-fn cleanup_network(running: &RunningDevice) {
-    match &running.cleanup {
-        CleanupState::None => {}
-        #[cfg(target_os = "linux")]
-        CleanupState::Linux(state) => cleanup_network_linux(state),
-        #[cfg(target_os = "macos")]
-        CleanupState::Macos(state) => cleanup_network_macos(state),
-    }
-}
-
-#[cfg(unix)]
-fn run_command(name: &str, args: &[&str]) -> anyhow::Result<()> {
-    let output = run_command_capture_output(name, args)?;
-    if output.status.success() {
-        return Ok(());
-    }
-    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    let detail = if !stderr.is_empty() { stderr } else { stdout };
-    anyhow::bail!("{} {} failed: {}", name, args.join(" "), detail);
-}
-
-#[cfg(unix)]
-fn run_command_with_exists_ok(name: &str, args: &[&str]) -> anyhow::Result<bool> {
-    let output = run_command_capture_output(name, args)?;
-    if output.status.success() {
-        return Ok(true);
-    }
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    if stderr.contains("File exists") || stdout.contains("File exists") {
-        return Ok(false);
-    }
-    let detail = stderr.trim();
-    if detail.is_empty() {
-        anyhow::bail!("{} {} failed", name, args.join(" "));
-    }
-    anyhow::bail!("{} {} failed: {}", name, args.join(" "), detail);
-}
-
-#[cfg(unix)]
-fn run_command_capture_output(name: &str, args: &[&str]) -> anyhow::Result<Output> {
-    info!(command = %format_command_for_log(name, args), "userspace_helper_command");
-    Command::new(name)
-        .args(args)
-        .output()
-        .with_context(|| format!("failed to run {} {}", name, args.join(" ")))
-}
-
-#[cfg(unix)]
-fn format_command_for_log(name: &str, args: &[&str]) -> String {
-    if args.is_empty() {
-        return name.to_string();
-    }
-    format!("{} {}", name, args.join(" "))
-}
-
-#[cfg(target_os = "linux")]
-fn configure_network_linux(
-    interface: &str,
-    config: &ParsedUserspaceConfig,
-) -> anyhow::Result<LinuxCleanupState> {
-    let mut routes_added = Vec::new();
-    let has_ipv6_address = config.addresses.iter().any(|address| address.contains(':'));
-
-    for address in &config.addresses {
-        run_command("ip", &["addr", "add", address, "dev", interface])?;
-    }
-    run_command("ip", &["link", "set", "up", "dev", interface])?;
-
-    let endpoint_route = match config.endpoint.ip() {
-        IpAddr::V4(_) => {
-            let default = get_linux_default_route_v4()?;
-            Some(LinuxRoute {
-                is_ipv6: false,
-                destination: format!("{}/32", config.endpoint.ip()),
-                via: Some(default.gateway),
-                dev: Some(default.dev),
-            })
-        }
-        IpAddr::V6(_) => get_linux_default_route_v6().map(|default| LinuxRoute {
-            is_ipv6: true,
-            destination: format!("{}/128", config.endpoint.ip()),
-            via: Some(default.gateway),
-            dev: Some(default.dev),
-        }),
-    };
-
-    if let Some(route) = endpoint_route {
-        if add_linux_route(&route)? {
-            routes_added.push(route);
-        }
-    }
-
-    for route in linux_allowed_routes(interface, config, has_ipv6_address) {
-        if add_linux_route(&route)? {
-            routes_added.push(route);
-        }
-    }
-
-    let original_resolv_conf = if should_manage_global_resolv_conf() {
-        let original = std::fs::read_to_string("/etc/resolv.conf").ok();
-        if !config.dns_servers.is_empty() {
-            let contents: String = config
-                .dns_servers
-                .iter()
-                .map(|dns| format!("nameserver {}\n", dns))
-                .collect();
-            std::fs::write("/etc/resolv.conf", contents)
-                .context("failed to update /etc/resolv.conf for userspace tunnel")?;
-        }
-        original
-    } else {
-        None
-    };
-
-    Ok(LinuxCleanupState {
-        routes_added,
-        original_resolv_conf,
-    })
-}
-
-#[cfg(target_os = "linux")]
-fn cleanup_network_linux(state: &LinuxCleanupState) {
-    for route in state.routes_added.iter().rev() {
-        let _ = del_linux_route(route);
-    }
-    if let Some(original) = &state.original_resolv_conf {
-        let _ = std::fs::write("/etc/resolv.conf", original);
-    }
-}
-
-#[cfg(target_os = "linux")]
-fn add_linux_route(route: &LinuxRoute) -> anyhow::Result<bool> {
-    let mut args: Vec<String> = if route.is_ipv6 {
-        vec![
-            "-6".into(),
-            "route".into(),
-            "add".into(),
-            route.destination.clone(),
-        ]
-    } else {
-        vec!["route".into(), "add".into(), route.destination.clone()]
-    };
-    if let Some(via) = &route.via {
-        args.push("via".into());
-        args.push(via.clone());
-    }
-    if let Some(dev) = &route.dev {
-        args.push("dev".into());
-        args.push(dev.clone());
-    }
-    let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
-    run_command_with_exists_ok("ip", &arg_refs)
-}
-
-#[cfg(target_os = "linux")]
-fn del_linux_route(route: &LinuxRoute) -> anyhow::Result<()> {
-    let mut args: Vec<String> = if route.is_ipv6 {
-        vec![
-            "-6".into(),
-            "route".into(),
-            "del".into(),
-            route.destination.clone(),
-        ]
-    } else {
-        vec!["route".into(), "del".into(), route.destination.clone()]
-    };
-    if let Some(via) = &route.via {
-        args.push("via".into());
-        args.push(via.clone());
-    }
-    if let Some(dev) = &route.dev {
-        args.push("dev".into());
-        args.push(dev.clone());
-    }
-    let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
-    run_command("ip", &arg_refs)
-}
-
-#[cfg(target_os = "linux")]
-fn linux_allowed_routes(
-    interface: &str,
-    config: &ParsedUserspaceConfig,
-    has_ipv6_address: bool,
-) -> Vec<LinuxRoute> {
-    let mut routes = Vec::new();
-    for allowed in &config.allowed_ips {
-        match allowed.as_str() {
-            "0.0.0.0/0" => {
-                routes.push(LinuxRoute {
-                    is_ipv6: false,
-                    destination: "0.0.0.0/1".to_string(),
-                    via: None,
-                    dev: Some(interface.to_string()),
-                });
-                routes.push(LinuxRoute {
-                    is_ipv6: false,
-                    destination: "128.0.0.0/1".to_string(),
-                    via: None,
-                    dev: Some(interface.to_string()),
-                });
-            }
-            "::/0" => {
-                if !has_ipv6_address {
-                    continue;
-                }
-                routes.push(LinuxRoute {
-                    is_ipv6: true,
-                    destination: "::/1".to_string(),
-                    via: None,
-                    dev: Some(interface.to_string()),
-                });
-                routes.push(LinuxRoute {
-                    is_ipv6: true,
-                    destination: "8000::/1".to_string(),
-                    via: None,
-                    dev: Some(interface.to_string()),
-                });
-            }
-            other => {
-                let is_ipv6 = other.contains(':');
-                if is_ipv6 && !has_ipv6_address {
-                    continue;
-                }
-                routes.push(LinuxRoute {
-                    is_ipv6,
-                    destination: other.to_string(),
-                    via: None,
-                    dev: Some(interface.to_string()),
-                });
-            }
-        }
-    }
-    routes
-}
-
-#[cfg(target_os = "linux")]
-struct LinuxDefaultRoute {
-    gateway: String,
-    dev: String,
-}
-
-#[cfg(target_os = "linux")]
-fn get_linux_default_route_v4() -> anyhow::Result<LinuxDefaultRoute> {
-    let output = Command::new("ip")
-        .args(["route", "show", "default"])
-        .output()
-        .context("failed to run ip route show default")?;
-    if !output.status.success() {
-        anyhow::bail!("ip route show default failed");
-    }
-    parse_linux_default_route(std::str::from_utf8(&output.stdout).unwrap_or_default())
-}
-
-#[cfg(target_os = "linux")]
-fn get_linux_default_route_v6() -> Option<LinuxDefaultRoute> {
-    let output = Command::new("ip")
-        .args(["-6", "route", "show", "default"])
-        .output()
-        .ok()?;
-    if !output.status.success() {
-        return None;
-    }
-    parse_linux_default_route(std::str::from_utf8(&output.stdout).ok()?).ok()
-}
-
-#[cfg(target_os = "linux")]
-fn parse_linux_default_route(output: &str) -> anyhow::Result<LinuxDefaultRoute> {
-    let line = output
-        .lines()
-        .find(|line| line.starts_with("default"))
-        .ok_or_else(|| anyhow::anyhow!("no default route found"))?;
-    let fields: Vec<&str> = line.split_whitespace().collect();
-
-    let via = fields
-        .iter()
-        .position(|value| *value == "via")
-        .and_then(|index| fields.get(index + 1))
-        .ok_or_else(|| anyhow::anyhow!("default route missing gateway"))?;
-    let dev = fields
-        .iter()
-        .position(|value| *value == "dev")
-        .and_then(|index| fields.get(index + 1))
-        .ok_or_else(|| anyhow::anyhow!("default route missing interface"))?;
-
-    Ok(LinuxDefaultRoute {
-        gateway: (*via).to_string(),
-        dev: (*dev).to_string(),
-    })
-}
-
-#[cfg(target_os = "linux")]
-fn should_manage_global_resolv_conf() -> bool {
-    !is_systemd_resolved_managed_resolv_conf("/etc/resolv.conf")
-}
-
-#[cfg(target_os = "linux")]
-fn is_systemd_resolved_managed_resolv_conf(path: &str) -> bool {
-    match std::fs::canonicalize(path) {
-        Ok(real_path) => real_path.starts_with("/run/systemd/resolve/"),
-        Err(_) => false,
-    }
-}
-
-#[cfg(target_os = "macos")]
-fn configure_network_macos(
-    interface: &str,
-    config: &ParsedUserspaceConfig,
-) -> anyhow::Result<MacosCleanupState> {
-    let mut routes_added = Vec::new();
-    let has_ipv4_address = config
-        .addresses
-        .iter()
-        .any(|address| !address.contains(':'));
-    let has_ipv6_address = config.addresses.iter().any(|address| address.contains(':'));
-    for address in &config.addresses {
-        let (ip, prefix) = parse_cidr(address)?;
-        match ip {
-            IpAddr::V4(addr) => {
-                let ip_string = addr.to_string();
-                run_command(
-                    "ifconfig",
-                    &[interface, "inet", address, ip_string.as_str(), "alias"],
-                )?;
-            }
-            IpAddr::V6(addr) => {
-                let ip_string = addr.to_string();
-                let prefix_string = prefix.to_string();
-                run_command(
-                    "ifconfig",
-                    &[
-                        interface,
-                        "inet6",
-                        ip_string.as_str(),
-                        "prefixlen",
-                        prefix_string.as_str(),
-                        "alias",
-                    ],
-                )?;
-            }
-        }
-    }
-    run_command("ifconfig", &[interface, "up"])?;
-    if let Err(error) = run_command("ifconfig", &[interface, "-rxcsum", "-txcsum"]) {
-        warn!(
-            interface,
-            error = %error,
-            "userspace_helper_disable_checksum_offload_failed"
+    #[test]
+    fn test_helper_receives_validated_config_mtu() {
+        let key = base64::engine::general_purpose::STANDARD.encode([1u8; 32]);
+        let config = format!("[Interface]\nPrivateKey = {key}\nAddress = 10.0.0.2/32\nMTU = 1280\n[Peer]\nPublicKey = {key}\nAllowedIPs = 0.0.0.0/0\nEndpoint = 192.0.2.1:51820\n");
+        let parsed = parse_wg_quick_config(&config).unwrap();
+        assert_eq!(parsed.mtu.unwrap().get(), 1280);
+        let overridden = crate::wireguard::config::with_mtu_override(
+            &config,
+            crate::wireguard::config::Mtu::new(1420).unwrap(),
         );
+        assert_eq!(
+            parse_wg_quick_config(&overridden)
+                .unwrap()
+                .mtu
+                .unwrap()
+                .get(),
+            1420
+        );
+        assert!(parse_wg_quick_config(&config.replace("1280", "575")).is_err());
     }
+}
 
-    let endpoint_is_ipv6 = matches!(config.endpoint.ip(), IpAddr::V6(_));
-    if !endpoint_is_ipv6 || has_ipv6_address {
-        if let Some(default_gateway) = get_macos_default_gateway(endpoint_is_ipv6)? {
-            let endpoint_route = MacosRoute {
-                is_ipv6: endpoint_is_ipv6,
-                destination: config.endpoint.ip().to_string(),
-                interface: None,
-                gateway: Some(default_gateway),
-            };
-            if add_macos_route(&endpoint_route)? {
-                routes_added.push(endpoint_route);
+#[cfg(unix)]
+pub fn recover_stopped(interface: &str) -> anyhow::Result<()> {
+    network::recover_stopped_session(interface)
+}
+
+#[cfg(all(test, unix))]
+mod lifecycle_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn test_stalled_device_stop_is_cancelled_and_reaped() {
+        struct Stopped(tokio::sync::oneshot::Sender<()>);
+        impl Drop for Stopped {
+            fn drop(&mut self) {
+                let (replacement, _) = tokio::sync::oneshot::channel();
+                let sender = std::mem::replace(&mut self.0, replacement);
+                let _ = sender.send(());
             }
         }
-    }
-
-    for route in macos_allowed_routes(config, interface, has_ipv4_address, has_ipv6_address) {
-        if add_macos_route(&route)? {
-            routes_added.push(route);
-        }
-    }
-
-    let dns_services = configure_macos_dns(config)?;
-
-    Ok(MacosCleanupState {
-        routes_added,
-        dns_services,
-    })
-}
-
-#[cfg(target_os = "macos")]
-fn cleanup_network_macos(state: &MacosCleanupState) {
-    for route in state.routes_added.iter().rev() {
-        let _ = del_macos_route(route);
-    }
-    for service in state.dns_services.iter().rev() {
-        let _ = restore_macos_dns_service(service);
-    }
-}
-
-#[cfg(target_os = "macos")]
-fn configure_macos_dns(
-    config: &ParsedUserspaceConfig,
-) -> anyhow::Result<Vec<MacosDnsServiceState>> {
-    if config.dns_servers.is_empty() {
-        return Ok(Vec::new());
-    }
-
-    let services = list_macos_network_services()?;
-    let mut saved = Vec::new();
-
-    for service in services {
-        let previous_dns = get_macos_dns_servers(&service)?;
-        let previous_search = get_macos_search_domains(&service)?;
-
-        set_macos_dns_servers(&service, &config.dns_servers)?;
-        set_macos_search_domains_empty(&service)?;
-
-        saved.push(MacosDnsServiceState {
-            service,
-            dns_servers: previous_dns,
-            search_domains: previous_search,
+        let (sender, receiver) = tokio::sync::oneshot::channel();
+        let task = tokio::spawn(async move {
+            let _stopped = Stopped(sender);
+            std::future::pending::<()>().await;
         });
+        let result = finish_device_stop(task, Duration::from_millis(10)).await;
+        assert!(result.is_err());
+        receiver.await.unwrap();
     }
-
-    Ok(saved)
-}
-
-#[cfg(target_os = "macos")]
-fn restore_macos_dns_service(state: &MacosDnsServiceState) -> anyhow::Result<()> {
-    match &state.dns_servers {
-        Some(servers) => set_macos_dns_servers(&state.service, servers)?,
-        None => set_macos_dns_servers_empty(&state.service)?,
-    }
-
-    match &state.search_domains {
-        Some(domains) => set_macos_search_domains(&state.service, domains)?,
-        None => set_macos_search_domains_empty(&state.service)?,
-    }
-
-    Ok(())
-}
-
-#[cfg(target_os = "macos")]
-fn list_macos_network_services() -> anyhow::Result<Vec<String>> {
-    let output = run_command_capture_output("networksetup", &["-listallnetworkservices"])?;
-    if !output.status.success() {
-        anyhow::bail!("networksetup -listallnetworkservices failed");
-    }
-
-    let text = String::from_utf8_lossy(&output.stdout);
-    let mut services = Vec::new();
-    for line in text.lines() {
-        let trimmed = line.trim();
-        if trimmed.is_empty() || trimmed.starts_with("An asterisk") {
-            continue;
-        }
-        let service = trimmed.strip_prefix('*').map(str::trim).unwrap_or(trimmed);
-        if !service.is_empty() {
-            services.push(service.to_string());
-        }
-    }
-
-    Ok(services)
-}
-
-#[cfg(target_os = "macos")]
-fn get_macos_dns_servers(service: &str) -> anyhow::Result<Option<Vec<String>>> {
-    get_macos_networksetup_values(service, "-getdnsservers", "DNS Servers")
-}
-
-#[cfg(target_os = "macos")]
-fn get_macos_search_domains(service: &str) -> anyhow::Result<Option<Vec<String>>> {
-    get_macos_networksetup_values(service, "-getsearchdomains", "Search Domains")
-}
-
-#[cfg(target_os = "macos")]
-fn get_macos_networksetup_values(
-    service: &str,
-    flag: &str,
-    value_label: &str,
-) -> anyhow::Result<Option<Vec<String>>> {
-    let output = run_command_capture_output("networksetup", &[flag, service])?;
-    if !output.status.success() {
-        anyhow::bail!("networksetup {} {} failed", flag, service);
-    }
-
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let marker = format!("There aren't any {} set", value_label);
-    if stdout.lines().any(|line| line.contains(&marker)) {
-        return Ok(None);
-    }
-
-    let values: Vec<String> = stdout
-        .lines()
-        .map(str::trim)
-        .filter(|line| !line.is_empty())
-        .map(str::to_string)
-        .collect();
-
-    if values.is_empty() || values == ["Empty".to_string()] {
-        Ok(None)
-    } else {
-        Ok(Some(values))
-    }
-}
-
-#[cfg(target_os = "macos")]
-fn set_macos_dns_servers(service: &str, dns_servers: &[String]) -> anyhow::Result<()> {
-    let mut args: Vec<&str> = Vec::with_capacity(2 + dns_servers.len());
-    args.push("-setdnsservers");
-    args.push(service);
-    args.extend(dns_servers.iter().map(String::as_str));
-    run_command("networksetup", &args)
-}
-
-#[cfg(target_os = "macos")]
-fn set_macos_dns_servers_empty(service: &str) -> anyhow::Result<()> {
-    run_command("networksetup", &["-setdnsservers", service, "Empty"])
-}
-
-#[cfg(target_os = "macos")]
-fn set_macos_search_domains(service: &str, domains: &[String]) -> anyhow::Result<()> {
-    let mut args: Vec<&str> = Vec::with_capacity(2 + domains.len());
-    args.push("-setsearchdomains");
-    args.push(service);
-    args.extend(domains.iter().map(String::as_str));
-    run_command("networksetup", &args)
-}
-
-#[cfg(target_os = "macos")]
-fn set_macos_search_domains_empty(service: &str) -> anyhow::Result<()> {
-    run_command("networksetup", &["-setsearchdomains", service, "Empty"])
-}
-
-#[cfg(target_os = "macos")]
-fn add_macos_route(route: &MacosRoute) -> anyhow::Result<bool> {
-    let mut args: Vec<String> = vec!["-q".into(), "-n".into(), "add".into()];
-    args.push(if route.is_ipv6 { "-inet6" } else { "-inet" }.into());
-    args.push(route.destination.clone());
-    if let Some(gateway) = &route.gateway {
-        args.push(gateway.clone());
-    }
-    if let Some(interface) = &route.interface {
-        args.push("-interface".into());
-        args.push(interface.clone());
-    }
-    let refs: Vec<&str> = args.iter().map(String::as_str).collect();
-    // Split routes (dev-bound, no explicit gateway) can linger on stale utun
-    // devices; clear any existing entry first so this tunnel owns the route.
-    if route.interface.is_some() && route.gateway.is_none() {
-        let mut delete_args: Vec<String> = vec!["-q".into(), "-n".into(), "delete".into()];
-        delete_args.push(if route.is_ipv6 { "-inet6" } else { "-inet" }.into());
-        delete_args.push(route.destination.clone());
-        let delete_refs: Vec<&str> = delete_args.iter().map(String::as_str).collect();
-        let _ = run_command("route", &delete_refs);
-    }
-
-    run_command_with_exists_ok("route", &refs)
-}
-
-#[cfg(target_os = "macos")]
-fn del_macos_route(route: &MacosRoute) -> anyhow::Result<()> {
-    let mut args: Vec<String> = vec!["-q".into(), "-n".into(), "delete".into()];
-    args.push(if route.is_ipv6 { "-inet6" } else { "-inet" }.into());
-    args.push(route.destination.clone());
-    if let Some(gateway) = &route.gateway {
-        args.push(gateway.clone());
-    }
-    if let Some(interface) = &route.interface {
-        args.push("-interface".into());
-        args.push(interface.clone());
-    }
-    let refs: Vec<&str> = args.iter().map(String::as_str).collect();
-    run_command("route", &refs)
-}
-
-#[cfg(target_os = "macos")]
-fn macos_allowed_routes(
-    config: &ParsedUserspaceConfig,
-    interface: &str,
-    has_ipv4_address: bool,
-    has_ipv6_address: bool,
-) -> Vec<MacosRoute> {
-    let mut routes = Vec::new();
-    for allowed in &config.allowed_ips {
-        match allowed.as_str() {
-            "0.0.0.0/0" => {
-                if !has_ipv4_address {
-                    continue;
-                }
-                routes.push(MacosRoute {
-                    is_ipv6: false,
-                    destination: "0.0.0.0/1".to_string(),
-                    interface: Some(interface.to_string()),
-                    gateway: None,
-                });
-                routes.push(MacosRoute {
-                    is_ipv6: false,
-                    destination: "128.0.0.0/1".to_string(),
-                    interface: Some(interface.to_string()),
-                    gateway: None,
-                });
-            }
-            "::/0" => {
-                if !has_ipv6_address {
-                    continue;
-                }
-                routes.push(MacosRoute {
-                    is_ipv6: true,
-                    destination: "::/1".to_string(),
-                    interface: Some(interface.to_string()),
-                    gateway: None,
-                });
-                routes.push(MacosRoute {
-                    is_ipv6: true,
-                    destination: "8000::/1".to_string(),
-                    interface: Some(interface.to_string()),
-                    gateway: None,
-                });
-            }
-            other => {
-                if other.contains(':') && !has_ipv6_address {
-                    continue;
-                }
-                if !other.contains(':') && !has_ipv4_address {
-                    continue;
-                }
-                routes.push(MacosRoute {
-                    is_ipv6: other.contains(':'),
-                    destination: other.to_string(),
-                    interface: Some(interface.to_string()),
-                    gateway: None,
-                });
-            }
-        }
-    }
-    routes
-}
-
-#[cfg(target_os = "macos")]
-fn get_macos_default_gateway(is_ipv6: bool) -> anyhow::Result<Option<String>> {
-    let mut args = vec!["-n", "get"];
-    if is_ipv6 {
-        args.push("-inet6");
-    }
-    args.push("default");
-
-    let output = Command::new("route")
-        .args(args)
-        .output()
-        .context("failed to run route -n get default")?;
-    if !output.status.success() {
-        if is_ipv6 {
-            return Ok(None);
-        }
-        anyhow::bail!("route -n get default failed");
-    }
-    let text = String::from_utf8_lossy(&output.stdout);
-    for line in text.lines() {
-        if let Some(value) = line.trim().strip_prefix("gateway:") {
-            return Ok(Some(value.trim().to_string()));
-        }
-    }
-    if is_ipv6 {
-        Ok(None)
-    } else {
-        anyhow::bail!("default gateway not found")
-    }
-}
-
-#[cfg(target_os = "macos")]
-fn parse_cidr(value: &str) -> anyhow::Result<(IpAddr, u8)> {
-    let (ip, prefix) = value
-        .split_once('/')
-        .ok_or_else(|| anyhow::anyhow!("invalid cidr {}", value))?;
-    let ip: IpAddr = ip
-        .parse()
-        .with_context(|| format!("invalid cidr IP {}", ip))?;
-    let prefix: u8 = prefix
-        .parse()
-        .with_context(|| format!("invalid cidr prefix {}", prefix))?;
-    Ok((ip, prefix))
 }

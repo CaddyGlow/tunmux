@@ -73,7 +73,7 @@ pub fn run(
         .open(log_file)?;
     fs::set_permissions(log_file, fs::Permissions::from_mode(0o644))?;
     drop(log_fd);
-    logging::init_file(log_file, false)?;
+    let _logging_guard = logging::init_file(log_file, false)?;
 
     // 4. Write PID file (world-readable so the unprivileged parent can poll it)
     let pid = std::process::id();

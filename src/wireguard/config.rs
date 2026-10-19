@@ -1,11 +1,68 @@
 use crate::error::{AppError, Result};
 
+/// Validated IP interface MTU. The backend default remains in use when absent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Mtu(u16);
+
+impl Mtu {
+    pub fn new(value: u16) -> Result<Self> {
+        if value < 576 {
+            return Err(AppError::WireGuard(format!(
+                "invalid MTU {value} (must be >= 576)"
+            )));
+        }
+        Ok(Self(value))
+    }
+
+    #[must_use]
+    pub fn get(self) -> u16 {
+        self.0
+    }
+}
+
+/// Resolve explicit CLI values before profile values, preserving backend defaults.
+pub fn resolve_mtu(override_value: Option<u16>, configured: Option<Mtu>) -> Result<Option<Mtu>> {
+    override_value
+        .map(Mtu::new)
+        .transpose()
+        .map(|value| value.or(configured))
+}
+
+/// Replace the interface MTU while preserving provider and wg-quick directives.
+pub fn with_mtu_override(config: &str, mtu: Mtu) -> String {
+    let mut result = String::new();
+    let mut in_interface = false;
+    for line in config.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with('[') {
+            in_interface = trimmed.eq_ignore_ascii_case("[Interface]");
+            result.push_str(line);
+            result.push('\n');
+            if in_interface {
+                result.push_str(&format!("MTU = {}\n", mtu.get()));
+            }
+            continue;
+        }
+        if in_interface
+            && trimmed
+                .split_once('=')
+                .is_some_and(|(key, _)| key.trim().eq_ignore_ascii_case("mtu"))
+        {
+            continue;
+        }
+        result.push_str(line);
+        result.push('\n');
+    }
+    result
+}
+
 /// Parsed WireGuard config with owned data.
 #[derive(Debug, Clone)]
 pub struct WgParsedConfig {
     pub private_key: String,
     pub addresses: Vec<String>,
     pub dns_servers: Vec<String>,
+    pub mtu: Option<Mtu>,
     pub peers: Vec<WgParsedPeer>,
 }
 
@@ -50,6 +107,7 @@ pub fn parse_config(input: &str) -> Result<WgParsedConfig> {
     let mut private_key: Option<String> = None;
     let mut addresses: Vec<String> = Vec::new();
     let mut dns_servers: Vec<String> = Vec::new();
+    let mut mtu = None;
     let mut peers: Vec<WgParsedPeer> = Vec::new();
 
     // Per-peer accumulators
@@ -80,7 +138,7 @@ pub fn parse_config(input: &str) -> Result<WgParsedConfig> {
     };
 
     for line in input.lines() {
-        let line = line.trim();
+        let line = line.split('#').next().unwrap_or_default().trim();
         if line.is_empty() || line.starts_with('#') || line.starts_with(';') {
             continue;
         }
@@ -120,6 +178,12 @@ pub fn parse_config(input: &str) -> Result<WgParsedConfig> {
 
         match section {
             Section::Interface => match key.to_ascii_lowercase().as_str() {
+                "mtu" => {
+                    let value = value.parse::<u16>().map_err(|_| {
+                        AppError::WireGuard("MTU must be an integer between 576 and 65535".into())
+                    })?;
+                    mtu = Some(Mtu::new(value)?);
+                }
                 "privatekey" => private_key = Some(value.into()),
                 "address" => {
                     addresses.extend(value.split(',').map(|s| s.trim().to_owned()));
@@ -164,6 +228,7 @@ pub fn parse_config(input: &str) -> Result<WgParsedConfig> {
         private_key,
         addresses,
         dns_servers,
+        mtu,
         peers,
     })
 }
@@ -222,6 +287,36 @@ pub fn generate_config(params: &WgConfigParams<'_>) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_mtu_validation_and_override_precedence() {
+        let configured = Mtu::new(1280).unwrap();
+        assert_eq!(
+            resolve_mtu(Some(1420), Some(configured))
+                .unwrap()
+                .unwrap()
+                .get(),
+            1420
+        );
+        assert_eq!(
+            resolve_mtu(None, Some(configured)).unwrap(),
+            Some(configured)
+        );
+        assert_eq!(resolve_mtu(None, None).unwrap(), None);
+        assert!(resolve_mtu(Some(575), Some(configured)).is_err());
+    }
+
+    #[test]
+    fn test_config_mtu_roundtrip_and_invalid_values() {
+        let input = "[Interface]\nPrivateKey = key\nAddress = 10.0.0.2/32\nMTU = 1280\n[Peer]\nPublicKey = peer\nAllowedIPs = 0.0.0.0/0\n";
+        assert_eq!(parse_config(input).unwrap().mtu.unwrap().get(), 1280);
+        let overridden = with_mtu_override(input, Mtu::new(1420).unwrap());
+        assert_eq!(parse_config(&overridden).unwrap().mtu.unwrap().get(), 1420);
+        assert_eq!(overridden.matches("MTU =").count(), 1);
+        for invalid in ["0", "575", "65536", "auto", "-1"] {
+            assert!(parse_config(&input.replace("1280", invalid)).is_err());
+        }
+    }
 
     #[test]
     fn test_wg_config_generation() {

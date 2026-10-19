@@ -1,5 +1,7 @@
 use std::fs;
-use std::os::unix::fs::PermissionsExt;
+use std::io::Write;
+use std::os::unix::fs::OpenOptionsExt;
+use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 use tracing::info;
@@ -49,8 +51,7 @@ impl ConnectionState {
         config::ensure_connections_dir()?;
         let path = config::connections_dir().join(format!("{}.json", self.instance_name));
         let json = serde_json::to_string_pretty(self)?;
-        fs::write(&path, &json)?;
-        fs::set_permissions(&path, fs::Permissions::from_mode(0o600))?;
+        atomic_write(&path, json.as_bytes())?;
         info!( path = ?path.display().to_string(), "connection_state_saved");
         Ok(())
     }
@@ -62,8 +63,7 @@ impl ConnectionState {
             return Ok(None);
         }
         let json = fs::read_to_string(&path)?;
-        let state: Self = serde_json::from_str(&json)?;
-        Ok(Some(state))
+        parse_or_quarantine(&path, &json)
     }
 
     /// Load all active connections.
@@ -78,13 +78,8 @@ impl ConnectionState {
             let path = entry.path();
             if path.extension().and_then(|e| e.to_str()) == Some("json") {
                 let json = fs::read_to_string(&path)?;
-                match serde_json::from_str::<Self>(&json) {
-                    Ok(state) => connections.push(state),
-                    Err(e) => {
-                        tracing::warn!(
-                            path = ?path.display().to_string(),
-                            error = ?e.to_string(), "connection_state_entry_skipped");
-                    }
+                if let Some(state) = parse_or_quarantine(&path, &json)? {
+                    connections.push(state);
                 }
             }
         }
@@ -100,12 +95,74 @@ impl ConnectionState {
         }
         Ok(())
     }
+}
 
-    /// Check if an instance name is already in use.
-    #[must_use]
-    pub fn exists(instance: &str) -> bool {
-        config::connections_dir()
-            .join(format!("{}.json", instance))
-            .exists()
+fn atomic_write(path: &Path, bytes: &[u8]) -> Result<()> {
+    let temporary = path.with_extension(format!(
+        "tmp-{}-{}",
+        std::process::id(),
+        rand::random::<u64>()
+    ));
+    let result = (|| -> Result<()> {
+        let mut file = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&temporary)?;
+        file.write_all(bytes)?;
+        file.sync_all()?;
+        fs::rename(&temporary, path)?;
+        if let Some(parent) = path.parent() {
+            fs::File::open(parent)?.sync_all()?;
+        }
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&temporary);
+    }
+    result
+}
+
+fn parse_or_quarantine(path: &Path, json: &str) -> Result<Option<ConnectionState>> {
+    match serde_json::from_str(json) {
+        Ok(state) => Ok(Some(state)),
+        Err(error) => {
+            let quarantine = path.with_extension(format!("corrupt-{}", rand::random::<u64>()));
+            fs::rename(path, &quarantine)?;
+            tracing::warn!(path = %path.display(), quarantine = %quarantine.display(), %error, "connection_state_quarantined");
+            Ok(None)
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+
+    #[test]
+    fn test_atomic_write_replaces_restrictively() {
+        let path = std::env::temp_dir().join(format!("tunmux-state-{}", rand::random::<u64>()));
+        atomic_write(&path, b"old").unwrap();
+        atomic_write(&path, b"new").unwrap();
+        assert_eq!(fs::read(&path).unwrap(), b"new");
+        assert_eq!(
+            fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn test_corrupt_state_is_preserved_in_quarantine() {
+        let dir = std::env::temp_dir().join(format!("tunmux-state-{}", rand::random::<u64>()));
+        fs::create_dir(&dir).unwrap();
+        let path = dir.join("broken.json");
+        fs::write(&path, b"broken").unwrap();
+        assert!(parse_or_quarantine(&path, "broken").unwrap().is_none());
+        assert!(!path.exists());
+        let preserved = fs::read_dir(&dir).unwrap().next().unwrap().unwrap().path();
+        assert_eq!(fs::read(preserved).unwrap(), b"broken");
+        fs::remove_dir_all(dir).unwrap();
     }
 }

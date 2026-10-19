@@ -1,41 +1,29 @@
-name: CI Android
+name: CI Android library
 
 on:
   push:
   pull_request:
 
 jobs:
-  android:
-    name: Build Android app
+  android-library:
+    name: Check shared library for Android
     runs-on: ubuntu-latest
-
     steps:
       - name: Checkout
         uses: actions/checkout@v4
         with:
           submodules: recursive
-
-      - name: Install Java
-        uses: actions/setup-java@v4
-        with:
-          distribution: temurin
-          java-version: '17'
-
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
         with:
           targets: aarch64-linux-android,armv7-linux-androideabi,x86_64-linux-android
-
       - name: Set up Android SDK
         uses: android-actions/setup-android@v3
-
-      - name: Install Android SDK components
-        run: sdkmanager "platform-tools" "platforms;android-35" "build-tools;35.0.0" "ndk;27.3.13750724"
-
-      - name: Set up Gradle cache
-        uses: gradle/actions/setup-gradle@v4
-        with:
-          gradle-version: '8.9'
-
-      - name: Assemble Android debug app
-        run: gradle --no-daemon -p android :app:assembleDebug
+      - name: Install NDK
+        run: sdkmanager "ndk;27.3.13750724"
+      - name: Install cargo-ndk
+        run: cargo install cargo-ndk --locked
+      - name: Check shared library for app ABIs
+        env:
+          ANDROID_NDK_HOME: ${{ env.ANDROID_HOME }}/ndk/27.3.13750724
+        run: cargo ndk -t arm64-v8a -t armeabi-v7a -t x86_64 check --locked --lib --no-default-features
