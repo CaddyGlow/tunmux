@@ -42,6 +42,69 @@ cargo build
 cargo build --features keyring
 ```
 
+## Offline benchmarks
+
+The Criterion suite measures WireGuard config generation, parsing with 1/10/100
+peers, CLI argument parsing, and deterministic VPN key derivation (when Proton,
+Mullvad, or IVPN is enabled). Fixtures are synthetic and prepared outside the
+timed loops. Timings include output allocation and destruction. No credentials,
+network access, root privileges, or running VPN are needed at benchmark runtime.
+These are CPU microbenchmarks, not tunnel throughput or connection latency tests.
+
+Run inside the development shell (`direnv allow`, or prefix commands with
+`nix develop path:$HOME/projects-caddy/nix-dev-shells/android -c`):
+
+```sh
+# Cargo uses the optimized bench profile automatically.
+cargo bench --locked --bench offline
+# Run only config parsing; smoke-check every fixture without collecting timings.
+cargo bench --locked --bench offline -- wireguard/parse
+cargo bench --locked --bench offline -- --test
+# Save a baseline, then compare after making changes.
+cargo bench --locked --bench offline -- --save-baseline before
+cargo bench --locked --bench offline -- --baseline before
+```
+
+Criterion stores measurements under the Cargo target directory's `criterion/`
+folder. Compare runs on the same machine with the same toolchain and feature set,
+and minimize other CPU activity. Key benchmarks are omitted when their provider
+features are disabled; the rest also run with `--no-default-features`.
+
+## Kernel versus userspace WireGuard benchmark
+
+On Linux, compare the kernel client with tunmux's embedded GotaTun client using
+two temporary network namespaces and a local kernel WireGuard server. The test
+measures TCP upload/download throughput, idle and loaded ping RTT, and CPU usage.
+It alternates backend order each round, uses identical MTUs, and saves raw iperf3
+JSON alongside the measurements. No VPN account or internet traffic is needed.
+
+Recorded results: [2026-10-19 kernel versus GotaTun comparison](docs/benchmarks/2026-10-19-wg-backends.md),
+including measurements, setup, limitations, and archived raw data.
+
+Requirements: Python 3, `ip`, `wg`, `iperf3`, `ping`, `mount`, `unshare`, kernel
+WireGuard, and `/dev/net/tun`. Run in the development shell. Unprivileged user
+namespaces allow running as your normal user; systems that disable them require
+root. A private mount namespace isolates helper sockets and namespace handles.
+
+```sh
+cargo build --release --locked --no-default-features
+python3 scripts/wg_backend_bench.py --bin target/release/tunmux \
+  --seconds 5 --repeats 3 --output /tmp/wg-backends.json
+# Repeat with concurrent TCP streams:
+python3 scripts/wg_backend_bench.py --bin target/release/tunmux \
+  --streams 4 --output /tmp/wg-backends-4streams.json
+```
+
+Use Cargo's actual target directory for `--bin` if you override it. Both peers
+share the host CPU, so these results describe local dataplane performance.
+Host CPU measurements include both peers and unrelated activity; helper CPU is
+the client GotaTun process only. One fully occupied core is 100%. This benchmark
+does not exercise the SOCKS/HTTP proxy paths.
+
+The userspace helper writes daemon output to `/var/run/wireguard/<interface>.log`
+instead of retaining its launcher's stdout/stderr. Startup failures report that
+path. In this benchmark those logs live in the disposable mount namespace.
+
 ## Provider features
 
 Provider implementations and their CLI commands are controlled by independent

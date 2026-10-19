@@ -20,6 +20,8 @@ use std::io;
 #[cfg(unix)]
 use std::net::{IpAddr, SocketAddr};
 #[cfg(unix)]
+use std::os::unix::fs::OpenOptionsExt;
+#[cfg(unix)]
 use std::os::unix::net::UnixDatagram;
 #[cfg(all(unix, target_os = "linux"))]
 use std::path::Path;
@@ -110,18 +112,16 @@ pub fn maybe_run_from_env() -> bool {
 #[cfg(unix)]
 fn daemonize_and_run(interface: &str) -> anyhow::Result<()> {
     let (child_tx, parent_rx) = UnixDatagram::pair().context("failed to create status socket")?;
-    let stdout = File::options()
-        .write(true)
-        .open("/dev/stdout")
-        .context("failed to open /dev/stdout for helper logging")?;
-    let stderr = File::options()
-        .write(true)
-        .open("/dev/stderr")
-        .context("failed to open /dev/stderr for helper logging")?;
-    let daemonize = Daemonize::new()
-        .working_directory("/tmp")
-        .stdout(stdout)
-        .stderr(stderr);
+    anyhow::ensure!(
+        !interface.is_empty()
+            && interface
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-'),
+        "invalid helper interface name"
+    );
+    std::fs::create_dir_all(SOCK_DIR).context("failed to create helper runtime directory")?;
+    let log_path = PathBuf::from(SOCK_DIR).join(format!("{interface}.log"));
+    let daemonize = helper_daemon(open_helper_log(&log_path)?)?;
 
     match daemonize.execute() {
         daemonize::Outcome::Parent(Err(e)) => {
@@ -137,7 +137,10 @@ fn daemonize_and_run(interface: &str) -> anyhow::Result<()> {
             if status == READY_OK {
                 return Ok(());
             }
-            anyhow::bail!("userspace helper child reported startup failure");
+            anyhow::bail!(
+                "userspace helper child reported startup failure; see {}",
+                log_path.display()
+            );
         }
         daemonize::Outcome::Child(result) => {
             drop(parent_rx);
@@ -236,6 +239,36 @@ fn daemonize_and_run(interface: &str) -> anyhow::Result<()> {
     }
 
     Ok(())
+}
+
+#[cfg(unix)]
+fn open_helper_log(path: &std::path::Path) -> anyhow::Result<File> {
+    File::options()
+        .create(true)
+        .append(true)
+        .mode(0o600)
+        .custom_flags(nix::libc::O_NOFOLLOW | nix::libc::O_NONBLOCK)
+        .open(path)
+        .with_context(|| format!("failed to open helper log {}", path.display()))
+        .and_then(|file| {
+            anyhow::ensure!(
+                file.metadata()?.is_file(),
+                "helper log must be a regular file"
+            );
+            Ok(file)
+        })
+}
+
+#[cfg(unix)]
+fn helper_daemon(log: File) -> anyhow::Result<Daemonize<()>> {
+    // The daemon must not keep a launcher's captured output pipes open.
+    let stderr = log
+        .try_clone()
+        .context("failed to clone helper log descriptor")?;
+    Ok(Daemonize::new()
+        .working_directory("/tmp")
+        .stdout(log)
+        .stderr(stderr))
 }
 
 #[cfg(unix)]
@@ -558,6 +591,102 @@ pub fn recover_stopped(interface: &str) -> anyhow::Result<()> {
 #[cfg(all(test, unix))]
 mod lifecycle_tests {
     use super::*;
+
+    #[test]
+    fn test_daemon_stdio_child() {
+        let Some(directory) = std::env::var_os("TUNMUX_TEST_DAEMON_DIRECTORY") else {
+            return;
+        };
+        let directory = PathBuf::from(directory);
+        let daemon =
+            helper_daemon(open_helper_log(&directory.join("helper.log")).unwrap()).unwrap();
+        match daemon.execute() {
+            daemonize::Outcome::Parent(result) => {
+                result.unwrap();
+                let deadline = std::time::Instant::now() + Duration::from_secs(2);
+                while !directory.join("ready").exists() {
+                    assert!(std::time::Instant::now() < deadline, "daemon did not start");
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+            }
+            daemonize::Outcome::Child(result) => {
+                result.unwrap();
+                println!("daemon stdout marker");
+                eprintln!("daemon stderr marker");
+                std::fs::write(directory.join("ready"), std::process::id().to_string()).unwrap();
+                let deadline = std::time::Instant::now() + Duration::from_secs(10);
+                while directory.exists()
+                    && !directory.join("release").exists()
+                    && std::time::Instant::now() < deadline
+                {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                std::process::exit(0);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn test_daemon_closes_captured_pipes_while_remaining_alive() {
+        use std::os::unix::fs::PermissionsExt;
+
+        struct TestDirectory(PathBuf);
+        impl Drop for TestDirectory {
+            fn drop(&mut self) {
+                // Removing the directory also releases the subprocess daemon.
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        let directory = TestDirectory(std::env::temp_dir().join(format!(
+            "tunmux-daemon-stdio-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        )));
+        std::fs::create_dir(&directory.0).unwrap();
+        let output = tokio::time::timeout(
+            Duration::from_secs(3),
+            tokio::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "userspace_helper::lifecycle_tests::test_daemon_stdio_child",
+                    "--nocapture",
+                ])
+                .env("TUNMUX_TEST_DAEMON_DIRECTORY", &directory.0)
+                .kill_on_drop(true)
+                .output(),
+        )
+        .await
+        .expect("launcher must close both captured pipes before the daemon stops")
+        .unwrap();
+        assert!(output.status.success(), "{output:?}");
+        let pid = std::fs::read_to_string(directory.0.join("ready"))
+            .unwrap()
+            .parse::<i32>()
+            .unwrap();
+        nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid), None).unwrap();
+        let log_path = directory.0.join("helper.log");
+        let log = std::fs::read_to_string(&log_path).unwrap();
+        assert!(log.contains("daemon stdout marker"));
+        assert!(log.contains("daemon stderr marker"));
+        assert_eq!(
+            std::fs::metadata(log_path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+    }
+
+    #[test]
+    fn test_helper_log_rejects_symlinks_and_special_files() {
+        let path =
+            std::env::temp_dir().join(format!("tunmux-helper-log-link-{}", std::process::id()));
+        std::os::unix::fs::symlink("/dev/null", &path).unwrap();
+        let result = open_helper_log(&path);
+        std::fs::remove_file(path).unwrap();
+        assert!(result.is_err());
+        assert!(open_helper_log(std::path::Path::new("/dev/null")).is_err());
+    }
 
     #[tokio::test]
     async fn test_stalled_device_stop_is_cancelled_and_reaped() {

@@ -16,6 +16,10 @@ path = "src/lib.rs"
 name = "tunmux"
 path = "src/main.rs"
 
+[[bench]]
+name = "offline"
+harness = false
+
 [features]
 default = ["proxy", "all-providers"]
 all-providers = ["proton", "airvpn", "mullvad", "ivpn", "wgconf"]
@@ -114,3 +118,6 @@ gotatun = { version = "0.10", default-features = false, features = ["device", "t
 
 [patch.crates-io]
 smoltcp = { path = "third_party/smoltcp" }
+
+[dev-dependencies]
+criterion = { version = "0.5.1", default-features = false, features = ["cargo_bench_support"] }
