@@ -406,8 +406,8 @@ privileged_elevation = "auto"     # auto, none, passwordless, or a path such as 
 privileged_autostart = true
 privileged_autostart_timeout_ms = 5000
 privileged_authorized_group = "tunmux"
-privileged_autostop_mode = "never"      # never, command, timeout
-privileged_autostop_timeout_ms = 30000
+privileged_autostop_mode = "timeout"    # never, command, timeout (default: timeout)
+privileged_autostop_timeout_ms = 300000 # idle time before the daemon exits (default: 5 min)
 
 [proton]
 default_country = "CH"

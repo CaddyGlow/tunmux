@@ -73,8 +73,8 @@ impl Default for GeneralConfig {
             privileged_autostart: true,
             privileged_autostart_timeout_ms: 5000,
             privileged_authorized_group: String::new(),
-            privileged_autostop_mode: PrivilegedAutostopMode::Never,
-            privileged_autostop_timeout_ms: 30000,
+            privileged_autostop_mode: PrivilegedAutostopMode::Timeout,
+            privileged_autostop_timeout_ms: 300_000,
             hooks: HookConfig::default(),
         }
     }
@@ -126,9 +126,9 @@ fn default_credential_store() -> CredentialStore {
 #[derive(Debug, Clone, Copy, Default, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PrivilegedAutostopMode {
-    #[default]
     Never,
     Command,
+    #[default]
     Timeout,
 }
 
