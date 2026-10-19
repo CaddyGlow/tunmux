@@ -3,35 +3,65 @@ use clap::{Args, Parser, Subcommand, ValueEnum};
 /// Common connect options shared across VPN providers.
 #[derive(Args, Clone, Debug)]
 pub struct ConnectOptions {
-    /// WireGuard backend: wg-quick, userspace, kernel
+    /// Select the WireGuard implementation for this connection
+    ///
+    /// Accepts kernel, userspace, or wg-quick. Overrides general.backend in config.toml; the
+    /// platform default is kernel on Linux and userspace on macOS. Kernel mode uses native
+    /// WireGuard, userspace uses the embedded helper, and wg-quick invokes the installed wg-quick
+    /// tool. --proxy requires kernel mode.
     #[arg(short = 'b', long)]
     pub backend: Option<String>,
 
-    /// Start a SOCKS5/HTTP proxy (Linux only; VPN traffic isolated in network namespace)
+    /// Expose the VPN through a Linux namespace SOCKS5/HTTP proxy
+    ///
+    /// Requires Linux, the proxy build feature, and the kernel backend. Routes proxy traffic
+    /// through an isolated network namespace rather than changing the host default route.
+    /// Mutually exclusive with --local-proxy.
     #[arg(long, conflicts_with = "local_proxy")]
     pub proxy: bool,
 
-    /// Start a userspace SOCKS5/HTTP proxy without root or VpnService
+    /// Expose a rootless userspace SOCKS5/HTTP proxy
+    ///
+    /// Runs WireGuard inside the proxy process without a host tunnel interface, root privileges,
+    /// or Android VpnService. Only applications configured to use the proxy send traffic through
+    /// it. Mutually exclusive with --proxy.
     #[arg(long, conflicts_with = "proxy")]
     pub local_proxy: bool,
 
-    /// Disable host IPv6 egress while connected (direct kernel mode, IPv4-only profile)
+    /// Block host IPv6 egress during an IPv4-only direct kernel tunnel
+    ///
+    /// Valid only with the kernel backend, an IPv4-only profile, and neither proxy mode. Adds
+    /// IPv6 blocking routes while connected and removes them on disconnect; it does not disable
+    /// IPv6 globally or rewrite the profile.
     #[arg(long)]
     pub disable_ipv6: bool,
 
-    /// Set WireGuard interface MTU (direct mode)
+    /// Override the WireGuard interface MTU in bytes
+    ///
+    /// Accepts 576 through 65535. Overrides the profile MTU; when omitted, the profile value or
+    /// backend default applies. Used for direct tunnels and kernel namespace proxies. Rootless
+    /// local-proxy mode has no host interface MTU to set.
     #[arg(long)]
     pub mtu: Option<u16>,
 
-    /// SOCKS5 proxy port (default: auto-assign from 1080)
+    /// Choose the local SOCKS5 listening port for proxy mode
+    ///
+    /// Applies with --proxy or --local-proxy. When omitted, selects an available port starting at
+    /// 1080. Use tunmux status to find the assigned port; an explicit port must be available.
     #[arg(long)]
     pub socks_port: Option<u16>,
 
-    /// HTTP proxy port (default: auto-assign from 8118)
+    /// Choose the local HTTP proxy listening port
+    ///
+    /// Applies with --proxy or --local-proxy. When omitted, selects an available port starting at
+    /// 8118. Use tunmux status to find the assigned port; an explicit port must be available.
     #[arg(long)]
     pub http_port: Option<u16>,
 
-    /// Enable proxy access logging to the instance log file
+    /// Record proxy request activity in the instance log
+    ///
+    /// Applies to --proxy and --local-proxy instances. Enables access logging even when
+    /// general.proxy_access_log is disabled. Logs are written to the instance log file.
     #[arg(long)]
     pub proxy_access_log: bool,
 }
@@ -46,11 +76,20 @@ pub struct Cli {
     #[command(subcommand)]
     pub command: TopCommand,
 
-    /// Enable verbose logging
+    /// Enable debug-level tunmux logs; --debug is an alias
+    ///
+    /// The default is info-level tunmux logs and warnings from dependencies. Explicit RUST_LOG
+    /// directives take precedence over this flag. For example: RUST_LOG=tunmux=debug,gotatun=warn
+    /// tunmux status. Newly spawned services inherit the resolved filter; existing daemons keep
+    /// their startup filter.
     #[arg(short, long, alias = "debug", global = true)]
     pub verbose: bool,
 
-    /// Explicit startup tracing directives (also used for spawned services)
+    /// Set explicit target-aware tracing directives for this process
+    ///
+    /// Overrides RUST_LOG and --verbose. Accepts directives such as tunmux=debug,gotatun=warn.
+    /// The resolved filter is forwarded to newly spawned services; this internal option does not
+    /// reconfigure an already running daemon.
     #[arg(long, global = true, hide = true)]
     pub log_filter: Option<String>,
 }
@@ -107,14 +146,26 @@ pub enum TopCommand {
 
     /// Disconnect VPN connection(s)
     Disconnect {
-        /// Instance name to disconnect (from `tunmux status`)
+        /// Select a saved connection instance from tunmux status
+        ///
+        /// Use the instance name printed by tunmux status. If omitted, selection uses the
+        /// provider filter, when supplied, and requires an unambiguous connection; multiple
+        /// candidates are listed for selection.
         instance: Option<String>,
 
-        /// Provider to scope disconnect operations
+        /// Restrict the operation to one enabled VPN provider
+        ///
+        /// Only providers compiled into this build are accepted. Omit to consider connections
+        /// across providers; combine with an instance name to verify that it belongs to the
+        /// selected provider.
         #[arg(short = 'p', long, value_enum)]
         provider: Option<ProviderArg>,
 
-        /// Disconnect all active connections (all providers unless --provider is set)
+        /// Disconnect all saved connections, optionally scoped by --provider
+        ///
+        /// Without --provider, considers every provider. With --provider, disconnects only that
+        /// provider's sessions. Cannot be combined with an instance name; cleanup failures are
+        /// reported rather than silently retiring the session.
         #[arg(short = 'a', long, conflicts_with = "instance")]
         all: bool,
     },
@@ -134,20 +185,59 @@ pub enum TopCommand {
     /// Internal: proxy daemon process (hidden)
     #[command(hide = true)]
     ProxyDaemon {
+        /// Use this existing Linux network namespace for the proxy daemon
+        ///
+        /// Internal daemon option. The privileged setup code creates the namespace and its tunnel
+        /// before starting this process.
         #[arg(long)]
         netns: String,
+
+        /// Use this WireGuard interface inside the proxy namespace
+        ///
+        /// Internal daemon option identifying the tunnel created by privileged setup. It is not a
+        /// request to create a new interface.
         #[arg(long)]
         interface: String,
+
+        /// Choose the local SOCKS5 listening port for proxy mode
+        ///
+        /// Internal daemon option supplied by the parent for this instance. The parent resolves
+        /// the listening port before launch; this value is not auto-assigned by the daemon.
         #[arg(long)]
         socks_port: u16,
+
+        /// Choose the local HTTP proxy listening port
+        ///
+        /// Internal daemon option supplied by the parent for this instance. The parent resolves
+        /// the listening port before launch; this value is not auto-assigned by the daemon.
         #[arg(long)]
         http_port: u16,
+
+        /// Record proxy request activity in the instance log
+        ///
+        /// Applies to --proxy and --local-proxy instances. Enables access logging even when
+        /// general.proxy_access_log is disabled. Logs are written to the instance log file.
         #[arg(long)]
         proxy_access_log: bool,
+
+        /// Write the daemon process ID to this runtime file
+        ///
+        /// Internal daemon bookkeeping used for lifecycle tracking and stop requests. The
+        /// launching client supplies the instance-specific path.
         #[arg(long)]
         pid_file: String,
+
+        /// Append daemon logs to this instance log file
+        ///
+        /// Internal daemon option. The parent supplies the runtime path; log filtering comes from
+        /// the inherited logging configuration.
         #[arg(long)]
         log_file: String,
+
+        /// Report proxy daemon readiness or startup failure in this file
+        ///
+        /// Internal startup acknowledgment consumed by the launching client. The client supplies
+        /// a per-instance runtime path.
         #[arg(long)]
         startup_status_file: String,
     },
@@ -155,17 +245,45 @@ pub enum TopCommand {
     /// Internal: userspace WireGuard local-proxy daemon (hidden)
     #[command(hide = true)]
     LocalProxyDaemon {
+        /// Choose the local SOCKS5 listening port for proxy mode
+        ///
+        /// Internal compatibility argument supplied by the parent. The effective listening port
+        /// comes from --config-b64; this value does not override the serialized configuration.
         #[arg(long)]
         socks_port: u16,
+
+        /// Choose the local HTTP proxy listening port
+        ///
+        /// Internal compatibility argument supplied by the parent. The effective listening port
+        /// comes from --config-b64; this value does not override the serialized configuration.
         #[arg(long)]
         http_port: u16,
+
+        /// Record proxy request activity in the instance log
+        ///
+        /// Internal compatibility argument supplied by the parent. The effective access-log setting
+        /// is read from --config-b64 and controls per-request proxy activity logging.
         #[arg(long)]
         proxy_access_log: bool,
+
+        /// Write the daemon process ID to this runtime file
+        ///
+        /// Internal daemon bookkeeping used for lifecycle tracking and stop requests. The
+        /// launching client supplies the instance-specific path.
         #[arg(long)]
         pid_file: String,
+
+        /// Append daemon logs to this instance log file
+        ///
+        /// Internal daemon option. The parent supplies the runtime path; log filtering comes from
+        /// the inherited logging configuration.
         #[arg(long)]
         log_file: String,
-        /// base64(JSON(LocalProxyConfig))
+
+        /// Read the local-proxy configuration as base64-encoded JSON
+        ///
+        /// Internal serialization of LocalProxyConfig, including WireGuard credentials. Supplied
+        /// by the launching process; do not include this value in diagnostic logs.
         #[arg(long)]
         config_b64: String,
     },
@@ -173,22 +291,46 @@ pub enum TopCommand {
     /// Internal privileged service mode (hidden)
     #[command(hide = true)]
     Privileged {
+        /// Run the privileged request service
+        ///
+        /// Required to enter privileged service mode. Normally started through the client or a
+        /// service manager rather than invoked directly.
         #[arg(long)]
         serve: bool,
 
-        /// Use stdin/stdout request transport instead of Unix socket.
+        /// Exchange privileged requests over stdin/stdout instead of a Unix socket
+        ///
+        /// Internal transport used by an elevated client subprocess. Keep stdout reserved for
+        /// protocol responses. Cannot be combined with --detach.
         #[arg(long, hide = true)]
         stdio: bool,
 
-        /// Optional group name for privileged socket authorization.
+        /// Detach the privileged socket service into the background
+        ///
+        /// Used by client autostart. The detached process serves requests independently of the
+        /// launching terminal. Cannot be combined with --stdio.
+        #[arg(long, hide = true, conflicts_with = "stdio")]
+        detach: bool,
+
+        /// Allow members of this group to use the privileged control socket
+        ///
+        /// Overrides TUNMUX_PRIVILEGED_GROUP; otherwise the default group is tunmux. Root remains
+        /// authorized. The group must exist for group-based socket authorization to be
+        /// configured.
         #[arg(long)]
         authorized_group: Option<String>,
 
-        /// Exit after this many idle milliseconds without requests.
+        /// Set the privileged service idle timeout in milliseconds
+        ///
+        /// Socket service idle timeouts are bounded below by 100 milliseconds. When omitted, no
+        /// explicit CLI idle deadline is installed. Active control leases prevent idle shutdown.
         #[arg(long)]
         idle_timeout_ms: Option<u64>,
 
-        /// Internal marker: daemon was launched by client autostart logic.
+        /// Mark the privileged service as launched by client autostart
+        ///
+        /// Internal lifecycle marker used by the client; service-manager launches should normally
+        /// omit it.
         #[arg(long, hide = true)]
         autostarted: bool,
     },
@@ -198,21 +340,37 @@ pub enum TopCommand {
 pub enum HookCommand {
     /// Run a predefined hook check now
     Run {
-        /// Builtin hook entry
+        /// Choose a builtin diagnostic check to run for an active connection
+        ///
+        /// connectivity checks connectivity, external-ip reports the observed public IP, and dns-
+        /// detection checks DNS behavior. Requires an unambiguous saved connection. These checks
+        /// can generate outbound network traffic.
         #[arg(value_enum)]
         builtin: HookBuiltinArg,
     },
 
     /// Print the hook environment payload for an active instance
     Debug {
-        /// Instance name (from `tunmux status`)
+        /// Select a saved connection instance from tunmux status
+        ///
+        /// Use the instance name printed by tunmux status. If omitted, selection uses the
+        /// provider filter, when supplied, and requires an unambiguous connection; multiple
+        /// candidates are listed for selection.
         instance: Option<String>,
 
-        /// Provider to scope instance selection when `instance` is omitted
+        /// Restrict the operation to one enabled VPN provider
+        ///
+        /// Only providers compiled into this build are accepted. Omit to consider connections
+        /// across providers; combine with an instance name to verify that it belongs to the
+        /// selected provider.
         #[arg(short = 'p', long, value_enum)]
         provider: Option<ProviderArg>,
 
-        /// Hook event payload to print
+        /// Choose which hook event environment to print
+        ///
+        /// ifup shows the connection-start payload; ifdown shows the disconnect payload. This
+        /// changes the displayed event environment and does not connect, disconnect, or execute
+        /// configured hooks.
         #[arg(long, value_enum, default_value = "ifup")]
         event: HookEventArg,
     },
@@ -220,14 +378,19 @@ pub enum HookCommand {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 pub enum HookEventArg {
+    /// Environment for connection-start hooks
     Ifup,
+    /// Environment for disconnect hooks
     Ifdown,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 pub enum HookBuiltinArg {
+    /// Probe connectivity through the selected connection
     Connectivity,
+    /// Query and display the observed public IP address
     ExternalIp,
+    /// Run the DNS detection check for the selected connection
     DnsDetection,
 }
 
@@ -266,22 +429,42 @@ pub enum ConnectProviderCommand {
 #[cfg(feature = "proton")]
 #[derive(Args, Clone)]
 pub struct ProtonConnectArgs {
-    /// Server name (e.g., US#1, CH#5)
+    /// Connect to a specific server, such as US#1 or CH#5
+    ///
+    /// Use a server name from this provider's servers command. When omitted, selects a candidate
+    /// using --country or the configured country default, then --sort. Quote names containing
+    /// shell metacharacters, for example 'US#1'.
     pub server: Option<String>,
 
-    /// Connect to a server in this country
+    /// Filter servers by a two-letter country code, such as US or CH
+    ///
+    /// Country codes are case-insensitive. For automatic connection selection, this overrides the
+    /// provider default_country setting in config.toml. An explicitly named server takes
+    /// precedence over automatic country-based selection.
     #[arg(short, long)]
     pub country: Option<String>,
 
-    /// Prefer P2P-capable servers
+    /// Limit automatic Proton selection to P2P-capable servers
+    ///
+    /// Applies when no server is explicitly named. Uses the same P2P eligibility filter as
+    /// --port-forwarding, without enabling port-forwarding certificate features.
     #[arg(long)]
     pub p2p: bool,
 
-    /// Prefer port-forwarding-capable servers and enable PF certificate features
+    /// Enable Proton port-forwarding certificate features
+    ///
+    /// Refreshes the VPN certificate when needed and limits automatic selection to P2P-capable
+    /// servers. After connecting, request a forwarded port with tunmux proton ports request; this
+    /// flag alone does not create a port mapping.
     #[arg(long)]
     pub port_forwarding: bool,
 
-    /// Server selection order when auto-selecting
+    /// Choose how to rank candidate servers
+    ///
+    /// name sorts alphabetically; latency probes candidate endpoints and ranks reachable servers
+    /// by measured latency, which can take longer. Where supported, load prefers lower reported
+    /// load and score uses the provider-specific ranking. An explicitly named connection server
+    /// bypasses automatic ranking.
     #[arg(short = 's', long, default_value = "score", value_parser = ["score", "load", "name", "latency"])]
     pub sort: String,
 
@@ -292,18 +475,34 @@ pub struct ProtonConnectArgs {
 #[cfg(feature = "airvpn")]
 #[derive(Args, Clone)]
 pub struct AirVpnConnectArgs {
-    /// Server name (e.g., Castor, Vega)
+    /// Connect to a specific server, such as Castor or Vega
+    ///
+    /// Use a server name from this provider's servers command. When omitted, selects a candidate
+    /// using --country or the configured country default, then --sort. An explicitly named
+    /// server bypasses automatic country filtering and ranking.
     pub server: Option<String>,
 
-    /// Connect to a server in this country
+    /// Filter servers by a two-letter country code, such as US or CH
+    ///
+    /// Country codes are case-insensitive. For automatic connection selection, this overrides the
+    /// provider default_country setting in config.toml. An explicitly named server takes
+    /// precedence over automatic country-based selection.
     #[arg(short, long)]
     pub country: Option<String>,
 
-    /// WireGuard key name (see `airvpn info` for available keys)
+    /// Select the AirVPN WireGuard key to use for this connection
+    ///
+    /// Names are matched case-insensitively. Overrides airvpn.default_device in config.toml;
+    /// otherwise uses the first saved WireGuard key. Run airvpn info to see available keys.
     #[arg(short, long)]
     pub key: Option<String>,
 
-    /// Server selection order when auto-selecting
+    /// Choose how to rank candidate servers
+    ///
+    /// name sorts alphabetically; latency probes candidate endpoints and ranks reachable servers
+    /// by measured latency, which can take longer. Where supported, load prefers lower reported
+    /// load and score uses the provider-specific ranking. An explicitly named connection server
+    /// bypasses automatic ranking.
     #[arg(short = 's', long, default_value = "score", value_parser = ["score", "load", "name", "latency"])]
     pub sort: String,
 
@@ -314,14 +513,27 @@ pub struct AirVpnConnectArgs {
 #[cfg(feature = "mullvad")]
 #[derive(Args, Clone)]
 pub struct MullvadConnectArgs {
-    /// Server hostname (e.g., us-nyc-wg-401)
+    /// Connect to a specific server, such as us-nyc-wg-401
+    ///
+    /// Use a server name from this provider's servers command. When omitted, selects a candidate
+    /// using --country or the configured country default, then --sort. An explicitly named
+    /// server bypasses automatic country filtering and ranking.
     pub server: Option<String>,
 
-    /// Connect to a server in this country
+    /// Filter servers by a two-letter country code, such as US or CH
+    ///
+    /// Country codes are case-insensitive. For automatic connection selection, this overrides the
+    /// provider default_country setting in config.toml. An explicitly named server takes
+    /// precedence over automatic country-based selection.
     #[arg(short, long)]
     pub country: Option<String>,
 
-    /// Server selection order when auto-selecting
+    /// Choose how to rank candidate servers
+    ///
+    /// name sorts alphabetically; latency probes candidate endpoints and ranks reachable servers
+    /// by measured latency, which can take longer. Where supported, load prefers lower reported
+    /// load and score uses the provider-specific ranking. An explicitly named connection server
+    /// bypasses automatic ranking.
     #[arg(short = 's', long, default_value = "name", value_parser = ["name", "latency"])]
     pub sort: String,
 
@@ -332,14 +544,27 @@ pub struct MullvadConnectArgs {
 #[cfg(feature = "ivpn")]
 #[derive(Args, Clone)]
 pub struct IvpnConnectArgs {
-    /// Server hostname or gateway (e.g., us-ny4.wg.ivpn.net, us.wg.ivpn.net)
+    /// Connect to a specific server, such as us-ny4.wg.ivpn.net or us.wg.ivpn.net
+    ///
+    /// Use a server name from this provider's servers command. When omitted, selects a candidate
+    /// using --country or the configured country default, then --sort. An explicitly named
+    /// server bypasses automatic country filtering and ranking.
     pub server: Option<String>,
 
-    /// Connect to a server in this country
+    /// Filter servers by a two-letter country code, such as US or CH
+    ///
+    /// Country codes are case-insensitive. For automatic connection selection, this overrides the
+    /// provider default_country setting in config.toml. An explicitly named server takes
+    /// precedence over automatic country-based selection.
     #[arg(short, long)]
     pub country: Option<String>,
 
-    /// Server selection order when auto-selecting
+    /// Choose how to rank candidate servers
+    ///
+    /// name sorts alphabetically; latency probes candidate endpoints and ranks reachable servers
+    /// by measured latency, which can take longer. Where supported, load prefers lower reported
+    /// load and score uses the provider-specific ranking. An explicitly named connection server
+    /// bypasses automatic ranking.
     #[arg(short = 's', long, default_value = "load", value_parser = ["load", "name", "latency"])]
     pub sort: String,
 
@@ -350,35 +575,68 @@ pub struct IvpnConnectArgs {
 #[cfg(feature = "wgconf")]
 #[derive(Args, Clone)]
 pub struct WgconfConnectArgs {
-    /// WireGuard .conf file path
+    /// Read a WireGuard .conf file from this path
+    ///
+    /// For connect, supply exactly one of --file and --profile. The file is read from disk
+    /// without changing its source contents. Use --save-as with connect, or wgconf save, to keep
+    /// a reusable named copy.
     #[arg(long, required_unless_present = "profile", conflicts_with = "profile")]
     pub file: Option<String>,
 
-    /// Saved profile name
+    /// Load a saved WireGuard profile by name
+    ///
+    /// Supply exactly one of --profile and --file. Profiles are stored in the wgconf/profiles
+    /// directory under the tunmux configuration directory; use wgconf list to see saved names.
     #[arg(long, required_unless_present = "file", conflicts_with = "file")]
     pub profile: Option<String>,
 
-    /// Save loaded config as a reusable profile name
+    /// Save the loaded configuration under this reusable profile name
+    ///
+    /// Stores a copy for later use with --profile, including an explicit MTU override when
+    /// supplied. Existing profiles with this name are overwritten. Names may contain lowercase
+    /// letters, digits, dots, underscores, and hyphens, up to 64 characters.
     #[arg(long)]
     pub save_as: Option<String>,
 
-    /// WireGuard backend: wg-quick, userspace, kernel
+    /// Select the WireGuard implementation for this connection
+    ///
+    /// Accepts kernel, userspace, or wg-quick. Overrides general.backend in config.toml; the
+    /// platform default is kernel on Linux and userspace on macOS. Kernel mode uses native
+    /// WireGuard, userspace uses the embedded helper, and wg-quick invokes the installed wg-quick
+    /// tool. --proxy requires kernel mode.
     #[arg(short = 'b', long)]
     pub backend: Option<String>,
 
-    /// Start a SOCKS5/HTTP proxy (Linux only; VPN traffic isolated in network namespace)
+    /// Expose the VPN through a Linux namespace SOCKS5/HTTP proxy
+    ///
+    /// Requires Linux, the proxy build feature, and the kernel backend. Routes proxy traffic
+    /// through an isolated network namespace rather than changing the host default route.
+    /// Mutually exclusive with --local-proxy.
     #[arg(long, conflicts_with = "local_proxy")]
     pub proxy: bool,
 
-    /// Start a userspace SOCKS5/HTTP proxy without root or VpnService
+    /// Expose a rootless userspace SOCKS5/HTTP proxy
+    ///
+    /// Runs WireGuard inside the proxy process without a host tunnel interface, root privileges,
+    /// or Android VpnService. Only applications configured to use the proxy send traffic through
+    /// it. Mutually exclusive with --proxy.
     #[arg(long, conflicts_with = "proxy")]
     pub local_proxy: bool,
 
-    /// Disable host IPv6 egress while connected (only valid for direct kernel mode with IPv4-only config)
+    /// Block host IPv6 egress during an IPv4-only direct kernel tunnel
+    ///
+    /// Valid only with the kernel backend, an IPv4-only profile, and neither proxy mode. Adds
+    /// IPv6 blocking routes while connected and removes them on disconnect; it does not disable
+    /// IPv6 globally or rewrite the profile.
     #[arg(long)]
     pub disable_ipv6: bool,
 
-    /// Set WireGuard interface MTU (direct kernel mode)
+    /// Override the WireGuard interface MTU in bytes
+    ///
+    /// Accepts 576 through 65535. Overrides the profile MTU; when omitted, the profile value or
+    /// backend default applies. Used for direct tunnels and kernel namespace proxies. Rootless
+    /// local-proxy mode has no host interface MTU to set. An explicit --mtu is rejected with
+    /// --local-proxy.
     #[arg(long)]
     pub mtu: Option<u16>,
 }
@@ -388,7 +646,10 @@ pub struct WgconfConnectArgs {
 pub enum ProtonCommand {
     /// Sign in with Proton VPN credentials
     Login {
-        /// Proton account username
+        /// Sign in with the Proton account username
+        ///
+        /// The password is requested interactively rather than supplied as a command-line
+        /// argument. Successful login saves credentials using the configured credential store.
         username: String,
     },
 
@@ -403,19 +664,35 @@ pub enum ProtonCommand {
 
     /// List available VPN servers
     Servers {
-        /// Filter by country code (e.g., US, CH, JP)
+        /// Filter servers by a two-letter country code, such as US or CH
+        ///
+        /// Country codes are case-insensitive. For example, --country CH lists servers in
+        /// Switzerland. Omit to list all countries; this filter does not change the configured
+        /// default country used by connect.
         #[arg(short, long)]
         country: Option<String>,
 
-        /// Show only free servers
+        /// Restrict the server list to Proton free-tier servers
+        ///
+        /// Only displays servers in the free tier. Omit this flag to include paid-tier servers
+        /// in the listing as well.
         #[arg(short, long)]
         free: bool,
 
-        /// Filter by server feature tag (repeatable or comma-separated): secure-core, tor, p2p, streaming, ipv6
+        /// Require matching server features
+        ///
+        /// Repeat --tag or separate values with commas; all requested tags must match. Accepts
+        /// secure-core, tor, p2p, streaming, and ipv6. Unsupported feature combinations can yield
+        /// no servers.
         #[arg(short = 't', long, value_delimiter = ',')]
         tag: Vec<String>,
 
-        /// Sort order for server listing
+        /// Choose how to rank the server list
+        ///
+        /// name sorts alphabetically; latency probes candidate endpoints and ranks reachable
+        /// servers by measured latency, which can take longer. Where supported, load prefers
+        /// lower reported load and score uses the provider-specific ranking. The accepted values
+        /// and default are shown below; latency-based rankings generate outbound probes.
         #[arg(short = 's', long, default_value = "score", value_parser = ["score", "load", "name", "latency"])]
         sort: String,
     },
@@ -431,11 +708,18 @@ pub enum ProtonCommand {
 
     /// Disconnect from VPN
     Disconnect {
-        /// Instance name to disconnect (from `tunmux status`). If omitted,
-        /// disconnects the sole active connection or lists choices.
+        /// Select a saved connection instance from tunmux status
+        ///
+        /// Use the instance name printed by tunmux status. If omitted, selection uses the
+        /// provider filter, when supplied, and requires an unambiguous connection; multiple
+        /// candidates are listed for selection.
         instance: Option<String>,
 
-        /// Disconnect all active connections for this provider
+        /// Disconnect every saved connection for this provider
+        ///
+        /// Includes direct tunnels and proxy instances owned by this provider. Cannot be combined
+        /// with an instance name. Without --all, the command disconnects an unambiguous
+        /// connection or displays the available choices.
         #[arg(short = 'a', long, conflicts_with = "instance")]
         all: bool,
     },
@@ -446,41 +730,66 @@ pub enum ProtonCommand {
 pub enum ProtonPortAction {
     /// Request a Proton NAT-PMP forwarded port
     Request {
-        /// Protocol: both, tcp, udp
+        /// Choose whether to map TCP, UDP, or both protocols
+        ///
+        /// both creates or maintains separate TCP and UDP NAT-PMP mappings. Defaults to both;
+        /// requires a direct Proton connection with port-forwarding support.
         #[arg(long, default_value = "both", value_parser = ["both", "tcp", "udp"])]
         protocol: String,
 
-        /// Requested public port (0 = auto-assign)
+        /// Request this public NAT-PMP port, or 0 for automatic assignment
+        ///
+        /// The gateway chooses the effective external port, which is saved and displayed after
+        /// the request. The default 0 asks it to assign an available port.
         #[arg(short = 'p', long, default_value_t = 0)]
         public_port: u16,
 
-        /// Internal/local port value in NAT-PMP request
+        /// Set the internal port number sent in the NAT-PMP request
+        ///
+        /// Defaults to 1. This is the local-port field of the gateway mapping request; it does
+        /// not open a local listening socket or configure an application.
         #[arg(short = 'l', long, default_value_t = 1)]
         local_port: u16,
 
-        /// Port mapping lifetime in seconds
+        /// Request a NAT-PMP mapping lease length in seconds
+        ///
+        /// Defaults to 60 seconds. The gateway returns the granted lifetime; mappings must be
+        /// renewed before they expire. Use ports release to explicitly release saved mappings.
         #[arg(long, default_value_t = 60)]
         lifetime: u32,
 
-        /// Do not auto-start the background renew daemon
+        /// Request the port mapping without starting automatic renewal
+        ///
+        /// By default, a successful request starts a background renew daemon. With this flag,
+        /// mappings can expire unless renewed manually with ports renew or maintained by ports
+        /// daemon.
         #[arg(long)]
         no_daemon: bool,
     },
 
     /// List saved Proton NAT-PMP forwarded ports
     List {
-        /// Show only active mappings for the current direct Proton connection
+        /// Show only mappings associated with the current direct Proton tunnel
+        ///
+        /// Filters saved mapping records by the current direct Proton connection instead of
+        /// listing all saved mappings. Connect directly to Proton before using this filter.
         #[arg(long)]
         current: bool,
 
-        /// Output as JSON
+        /// Print the result as JSON instead of the human-readable summary
+        ///
+        /// Use this for scripts that need structured output. Only the command result is formatted
+        /// as JSON; diagnostic logs are written separately to stderr.
         #[arg(long)]
         json: bool,
     },
 
     /// Renew saved Proton NAT-PMP forwarded ports
     Renew {
-        /// Port mapping lifetime in seconds
+        /// Request a NAT-PMP mapping lease length in seconds
+        ///
+        /// Defaults to 60 seconds. The gateway returns the granted lifetime; mappings must be
+        /// renewed before they expire. Use ports release to explicitly release saved mappings.
         #[arg(long, default_value_t = 60)]
         lifetime: u32,
     },
@@ -490,27 +799,46 @@ pub enum ProtonPortAction {
 
     /// Keep Proton NAT-PMP mappings alive (runs until interrupted)
     Daemon {
-        /// Protocol: both, tcp, udp
+        /// Choose whether to map TCP, UDP, or both protocols
+        ///
+        /// both creates or maintains separate TCP and UDP NAT-PMP mappings. Defaults to both;
+        /// requires a direct Proton connection with port-forwarding support.
         #[arg(long, default_value = "both", value_parser = ["both", "tcp", "udp"])]
         protocol: String,
 
-        /// Requested public port (0 = auto-assign)
+        /// Request this public NAT-PMP port, or 0 for automatic assignment
+        ///
+        /// The gateway chooses the effective external port, which is saved and displayed after
+        /// the request. The default 0 asks it to assign an available port.
         #[arg(short = 'p', long, default_value_t = 0)]
         public_port: u16,
 
-        /// Internal/local port value in NAT-PMP request
+        /// Set the internal port number sent in the NAT-PMP request
+        ///
+        /// Defaults to 1. This is the local-port field of the gateway mapping request; it does
+        /// not open a local listening socket or configure an application.
         #[arg(short = 'l', long, default_value_t = 1)]
         local_port: u16,
 
-        /// Port mapping lifetime in seconds
+        /// Request a NAT-PMP mapping lease length in seconds
+        ///
+        /// Defaults to 60 seconds. The gateway returns the granted lifetime; mappings must be
+        /// renewed before they expire. Use ports release to explicitly release saved mappings.
         #[arg(long, default_value_t = 60)]
         lifetime: u32,
 
-        /// Renew interval in seconds
+        /// Set the interval between port-mapping renewals in seconds
+        ///
+        /// Defaults to 45 seconds. Choose an interval shorter than the requested mapping lifetime
+        /// so renewals run before the lease expires. The foreground daemon runs until
+        /// interrupted.
         #[arg(long, default_value_t = 45)]
         renew_every: u64,
 
-        /// Internal: skip initial request and only run renew loop
+        /// Skip the initial mapping request and renew saved mappings only
+        ///
+        /// Internal option used when a successful request already established the mappings before
+        /// launching the renew loop.
         #[arg(long, hide = true)]
         no_initial_request: bool,
     },
@@ -521,7 +849,10 @@ pub enum ProtonPortAction {
 pub enum AirVpnCommand {
     /// Sign in with AirVPN credentials
     Login {
-        /// AirVPN username
+        /// Sign in with the AirVPN username
+        ///
+        /// The password is requested interactively rather than supplied as a command-line
+        /// argument. Successful login saves credentials using the configured credential store.
         username: String,
     },
 
@@ -533,15 +864,27 @@ pub enum AirVpnCommand {
 
     /// List available VPN servers
     Servers {
-        /// Filter by country code (e.g., US, CH, JP)
+        /// Filter servers by a two-letter country code, such as US or CH
+        ///
+        /// Country codes are case-insensitive. For example, --country CH lists servers in
+        /// Switzerland. Omit to list all countries; this filter does not change the configured
+        /// default country used by connect.
         #[arg(short, long)]
         country: Option<String>,
 
-        /// Filter by keyword tag (repeatable or comma-separated)
+        /// Require matching server keywords
+        ///
+        /// Repeat --tag or separate values with commas; all requested tags must match. Matches
+        /// provider server metadata such as names and locations; matching is case-insensitive.
         #[arg(short = 't', long, value_delimiter = ',')]
         tag: Vec<String>,
 
-        /// Sort order for server listing
+        /// Choose how to rank the server list
+        ///
+        /// name sorts alphabetically; latency probes candidate endpoints and ranks reachable
+        /// servers by measured latency, which can take longer. Where supported, load prefers
+        /// lower reported load and score uses the provider-specific ranking. The accepted values
+        /// and default are shown below; latency-based rankings generate outbound probes.
         #[arg(short = 's', long, default_value = "name", value_parser = ["name", "score", "load", "latency"])]
         sort: String,
     },
@@ -551,11 +894,18 @@ pub enum AirVpnCommand {
 
     /// Disconnect from VPN
     Disconnect {
-        /// Instance name to disconnect (from `tunmux status`). If omitted,
-        /// disconnects the sole active connection or lists choices.
+        /// Select a saved connection instance from tunmux status
+        ///
+        /// Use the instance name printed by tunmux status. If omitted, selection uses the
+        /// provider filter, when supplied, and requires an unambiguous connection; multiple
+        /// candidates are listed for selection.
         instance: Option<String>,
 
-        /// Disconnect all active connections for this provider
+        /// Disconnect every saved connection for this provider
+        ///
+        /// Includes direct tunnels and proxy instances owned by this provider. Cannot be combined
+        /// with an instance name. Without --all, the command disconnects an unambiguous
+        /// connection or displays the available choices.
         #[arg(short = 'a', long, conflicts_with = "instance")]
         all: bool,
     },
@@ -565,44 +915,71 @@ pub enum AirVpnCommand {
 
     /// Generate a config file via the AirVPN API
     Generate {
-        /// Server name or country code (repeatable, e.g., -s be -s nl)
+        /// Select servers or countries for generated configurations
+        ///
+        /// Required and repeatable: for example, -s be -s nl. Multiple server values or protocol
+        /// values produce an archive instead of a single configuration.
         #[arg(short, long, required = true)]
         server: Vec<String>,
 
-        /// Protocol (repeatable). Options:
-        ///   wg-1637 (default), wg-47107, wg-51820,
-        ///   openvpn-udp-443, openvpn-udp-80, openvpn-udp-53, openvpn-udp-1194,
-        ///   openvpn-tcp-443, openvpn-tcp-80,
-        ///   openvpn-ssh-22, openvpn-ssl-443.
-        /// Raw format also accepted: wireguard_3_udp_PORT, openvpn_1_tcp_PORT
+        /// Select one or more protocols for generated configurations
+        ///
+        /// Repeat --protocol for multiple outputs. Aliases include wg-1637, wg-47107, wg-51820,
+        /// openvpn-udp-443, openvpn-udp-80, openvpn-udp-53, openvpn-udp-1194, openvpn-tcp-443,
+        /// openvpn-tcp-80, openvpn-ssh-22, and openvpn-ssl-443. Raw API values such as
+        /// wireguard_3_udp_PORT and openvpn_1_tcp_PORT are accepted. When omitted, uses the first
+        /// WireGuard mode advertised in the saved manifest.
         #[arg(short, long, verbatim_doc_comment)]
         protocol: Vec<String>,
 
-        /// Device/key name (default: first device)
+        /// Select an AirVPN device or WireGuard key by name
+        ///
+        /// Use airvpn devices list or airvpn info to find names. For configuration generation,
+        /// omission uses the first saved device/key.
         #[arg(short, long)]
         device: Option<String>,
 
-        /// Entry IP layer: ipv4, ipv6
+        /// Choose the IP family used to reach the VPN server
+        ///
+        /// Accepts ipv4 or ipv6; defaults to ipv4. Controls the entry endpoint family in
+        /// generated configurations, rather than the IP families routed out of the VPN.
         #[arg(long, default_value = "ipv4")]
         entry: String,
 
-        /// Exit IP layer: both, ipv4, ipv6
+        /// Choose the IP families routed through the generated VPN configuration
+        ///
+        /// Accepts both, ipv4, or ipv6; defaults to both. This is independent of --entry, which
+        /// selects the family used to reach the server.
         #[arg(long, default_value = "both")]
         exit: String,
 
-        /// WireGuard MTU
+        /// Set the MTU written into generated WireGuard configurations
+        ///
+        /// Defaults to 1320 bytes. This setting is sent to the AirVPN configuration generator and
+        /// does not change an active tunnel on this host.
         #[arg(long, default_value = "1320")]
         mtu: u16,
 
-        /// WireGuard persistent keepalive (seconds)
+        /// Set generated WireGuard persistent keepalive in seconds
+        ///
+        /// Defaults to 15 seconds. Controls periodic keepalive packets in the generated
+        /// configuration; use 0 to request that persistent keepalive be disabled.
         #[arg(long, default_value = "15")]
         keepalive: u16,
 
-        /// Output file (default: stdout for single combo)
+        /// Write the generated configuration or archive to this path
+        ///
+        /// For a single server/protocol combination, omission prints the configuration to stdout.
+        /// Multiple combinations produce an archive, defaulting to airvpn.<format>. Existing
+        /// output files are overwritten.
         #[arg(short, long)]
         output: Option<String>,
 
-        /// Archive format when multiple files: zip, 7z, tar, tar.gz, tar.bz2, tar.xz
+        /// Choose the archive format for multiple generated configurations
+        ///
+        /// Accepts zip, 7z, tar, tar.gz, tar.bz2, or tar.xz; defaults to zip. Used only when
+        /// multiple servers or protocols are requested; a single combination produces plain
+        /// configuration text.
         #[arg(short, long, default_value = "zip")]
         format: String,
     },
@@ -632,21 +1009,33 @@ pub enum AirVpnCommand {
 pub enum MullvadCommand {
     /// Sign in with Mullvad account number
     Login {
-        /// Mullvad account number
+        /// Use this Mullvad account number
+        ///
+        /// Uses this account to sign in and save a VPN session. If a different account is already
+        /// saved, confirmation is required unless --force is set.
         account: String,
 
-        /// Overwrite existing saved account ID without confirmation
+        /// Replace an existing saved account ID without asking for confirmation
+        ///
+        /// Applies to account login or creation for this provider. It does not disconnect an
+        /// active tunnel or remove the old account at the VPN provider.
         #[arg(long)]
         force: bool,
     },
 
     /// Create a new Mullvad account and sign in
     CreateAccount {
-        /// Output result as JSON
+        /// Print the result as JSON instead of the human-readable summary
+        ///
+        /// Use this for scripts that need structured output. Only the command result is formatted
+        /// as JSON; diagnostic logs are written separately to stderr.
         #[arg(long)]
         json: bool,
 
-        /// Overwrite existing saved account ID without confirmation
+        /// Replace an existing saved account ID without asking for confirmation
+        ///
+        /// Applies to account login or creation for this provider. It does not disconnect an
+        /// active tunnel or remove the old account at the VPN provider.
         #[arg(long)]
         force: bool,
     },
@@ -665,15 +1054,27 @@ pub enum MullvadCommand {
 
     /// List available VPN servers
     Servers {
-        /// Filter by country code (e.g., US, CH, JP)
+        /// Filter servers by a two-letter country code, such as US or CH
+        ///
+        /// Country codes are case-insensitive. For example, --country CH lists servers in
+        /// Switzerland. Omit to list all countries; this filter does not change the configured
+        /// default country used by connect.
         #[arg(short, long)]
         country: Option<String>,
 
-        /// Filter by keyword tag (repeatable or comma-separated)
+        /// Require matching server keywords
+        ///
+        /// Repeat --tag or separate values with commas; all requested tags must match. Matches
+        /// provider server metadata such as names and locations; matching is case-insensitive.
         #[arg(short = 't', long, value_delimiter = ',')]
         tag: Vec<String>,
 
-        /// Sort order for server listing
+        /// Choose how to rank the server list
+        ///
+        /// name sorts alphabetically; latency probes candidate endpoints and ranks reachable
+        /// servers by measured latency, which can take longer. Where supported, load prefers
+        /// lower reported load and score uses the provider-specific ranking. The accepted values
+        /// and default are shown below; latency-based rankings generate outbound probes.
         #[arg(short = 's', long, default_value = "name", value_parser = ["name", "latency"])]
         sort: String,
     },
@@ -683,11 +1084,18 @@ pub enum MullvadCommand {
 
     /// Disconnect from VPN
     Disconnect {
-        /// Instance name to disconnect (from `tunmux status`). If omitted,
-        /// disconnects the sole active connection or lists choices.
+        /// Select a saved connection instance from tunmux status
+        ///
+        /// Use the instance name printed by tunmux status. If omitted, selection uses the
+        /// provider filter, when supplied, and requires an unambiguous connection; multiple
+        /// candidates are listed for selection.
         instance: Option<String>,
 
-        /// Disconnect all active connections for this provider
+        /// Disconnect every saved connection for this provider
+        ///
+        /// Includes direct tunnels and proxy instances owned by this provider. Cannot be combined
+        /// with an instance name. Without --all, the command disconnects an unambiguous
+        /// connection or displays the available choices.
         #[arg(short = 'a', long, conflicts_with = "instance")]
         all: bool,
     },
@@ -698,21 +1106,33 @@ pub enum MullvadCommand {
 pub enum IvpnCommand {
     /// Sign in with IVPN account ID
     Login {
-        /// IVPN account ID (for example: i-XXXX-XXXX-XXXX)
+        /// Use this IVPN account ID
+        ///
+        /// Uses this account to sign in and save a VPN session. If a different account is already
+        /// saved, confirmation is required unless --force is set.
         account: String,
 
-        /// Overwrite existing saved account ID without confirmation
+        /// Replace an existing saved account ID without asking for confirmation
+        ///
+        /// Applies to account login or creation for this provider. It does not disconnect an
+        /// active tunnel or remove the old account at the VPN provider.
         #[arg(long)]
         force: bool,
     },
 
     /// Create a new IVPN account
     CreateAccount {
-        /// Product: standard or pro
+        /// Choose the IVPN product for the newly created account
+        ///
+        /// Accepts standard or pro; defaults to standard. Applies only to account creation, not
+        /// to changing the product of an existing saved account.
         #[arg(long, default_value = "standard", value_parser = ["standard", "pro"])]
         product: String,
 
-        /// Overwrite existing saved account ID without confirmation
+        /// Replace an existing saved account ID without asking for confirmation
+        ///
+        /// Applies to account login or creation for this provider. It does not disconnect an
+        /// active tunnel or remove the old account at the VPN provider.
         #[arg(long)]
         force: bool,
     },
@@ -731,15 +1151,27 @@ pub enum IvpnCommand {
 
     /// List available VPN servers
     Servers {
-        /// Filter by country code (e.g., US, CH, JP)
+        /// Filter servers by a two-letter country code, such as US or CH
+        ///
+        /// Country codes are case-insensitive. For example, --country CH lists servers in
+        /// Switzerland. Omit to list all countries; this filter does not change the configured
+        /// default country used by connect.
         #[arg(short, long)]
         country: Option<String>,
 
-        /// Filter by keyword tag (repeatable or comma-separated)
+        /// Require matching server keywords
+        ///
+        /// Repeat --tag or separate values with commas; all requested tags must match. Matches
+        /// provider server metadata such as names and locations; matching is case-insensitive.
         #[arg(short = 't', long, value_delimiter = ',')]
         tag: Vec<String>,
 
-        /// Sort order for server listing
+        /// Choose how to rank the server list
+        ///
+        /// name sorts alphabetically; latency probes candidate endpoints and ranks reachable
+        /// servers by measured latency, which can take longer. Where supported, load prefers
+        /// lower reported load and score uses the provider-specific ranking. The accepted values
+        /// and default are shown below; latency-based rankings generate outbound probes.
         #[arg(short = 's', long, default_value = "load", value_parser = ["load", "name", "latency"])]
         sort: String,
     },
@@ -749,11 +1181,18 @@ pub enum IvpnCommand {
 
     /// Disconnect from VPN
     Disconnect {
-        /// Instance name to disconnect (from `tunmux status`). If omitted,
-        /// disconnects the sole active connection or lists choices.
+        /// Select a saved connection instance from tunmux status
+        ///
+        /// Use the instance name printed by tunmux status. If omitted, selection uses the
+        /// provider filter, when supplied, and requires an unambiguous connection; multiple
+        /// candidates are listed for selection.
         instance: Option<String>,
 
-        /// Disconnect all active connections for this provider
+        /// Disconnect every saved connection for this provider
+        ///
+        /// Includes direct tunnels and proxy instances owned by this provider. Cannot be combined
+        /// with an instance name. Without --all, the command disconnects an unambiguous
+        /// connection or displays the available choices.
         #[arg(short = 'a', long, conflicts_with = "instance")]
         all: bool,
     },
@@ -767,22 +1206,37 @@ pub enum WgconfCommand {
 
     /// Disconnect from VPN
     Disconnect {
-        /// Instance name to disconnect (from `tunmux status`). If omitted,
-        /// disconnects the sole active connection or lists choices.
+        /// Select a saved connection instance from tunmux status
+        ///
+        /// Use the instance name printed by tunmux status. If omitted, selection uses the
+        /// provider filter, when supplied, and requires an unambiguous connection; multiple
+        /// candidates are listed for selection.
         instance: Option<String>,
 
-        /// Disconnect all active connections for this provider
+        /// Disconnect every saved connection for this provider
+        ///
+        /// Includes direct tunnels and proxy instances owned by this provider. Cannot be combined
+        /// with an instance name. Without --all, the command disconnects an unambiguous
+        /// connection or displays the available choices.
         #[arg(short = 'a', long, conflicts_with = "instance")]
         all: bool,
     },
 
     /// Save a WireGuard config file as a named profile
     Save {
-        /// WireGuard .conf file path
+        /// Read a WireGuard .conf file from this path
+        ///
+        /// For connect, supply exactly one of --file and --profile. The file is read from disk
+        /// without changing its source contents. Use --save-as with connect, or wgconf save, to
+        /// keep a reusable named copy.
         #[arg(long)]
         file: String,
 
-        /// Profile name
+        /// Name the saved WireGuard profile
+        ///
+        /// Names may contain lowercase letters, digits, dots, underscores, and hyphens, up to 64
+        /// characters. Saving overwrites an existing profile with this name; connect later with
+        /// --profile NAME.
         #[arg(long)]
         name: String,
     },
@@ -792,7 +1246,10 @@ pub enum WgconfCommand {
 
     /// Remove a saved profile
     Remove {
-        /// Profile name
+        /// Remove the saved profile with this name
+        ///
+        /// Use wgconf list to find profile names. Removes the stored profile file; disconnect an
+        /// active tunnel separately.
         name: String,
     },
 }
@@ -802,11 +1259,17 @@ pub enum WgconfCommand {
 pub enum MullvadPaymentCommand {
     /// Fetch Mullvad Monero payment details from the web account flow
     Monero {
-        /// Mullvad account number (defaults to saved session account)
+        /// Use this Mullvad account number
+        ///
+        /// When omitted, uses the account from the saved session. Fetching payment details does
+        /// not replace the saved login or submit a payment.
         #[arg(long)]
         account: Option<String>,
 
-        /// Output result as JSON
+        /// Print the result as JSON instead of the human-readable summary
+        ///
+        /// Use this for scripts that need structured output. Only the command result is formatted
+        /// as JSON; diagnostic logs are written separately to stderr.
         #[arg(long)]
         json: bool,
     },
@@ -817,10 +1280,16 @@ pub enum MullvadPaymentCommand {
 pub enum IvpnPaymentCommand {
     /// Fetch Monero payment details for an IVPN account
     Monero {
-        /// IVPN account ID (for example: i-XXXX-XXXX-XXXX). If omitted, uses saved account ID.
+        /// Use this IVPN account ID
+        ///
+        /// When omitted, uses the account from the saved session. Fetching payment details does
+        /// not replace the saved login or submit a payment.
         account: Option<String>,
 
-        /// Billing duration: 7d, 1m, 1y
+        /// Choose the IVPN billing period for Monero payment details
+        ///
+        /// 7d requests seven days, 1m one month, and 1y one year. Defaults to 1m. Fetches payment
+        /// details for the selected period; it does not send a payment.
         #[arg(long, default_value = "1m", value_parser = ["7d", "1m", "1y"])]
         duration: String,
     },
@@ -834,55 +1303,95 @@ pub enum PortAction {
 
     /// Add a port forward
     Add {
-        /// Port number to forward (0 = auto-assign)
+        /// Select the AirVPN public forwarded port
+        ///
+        /// For add, 0 requests automatic assignment. For remove, info, check, or set, use an
+        /// existing public port from airvpn ports list. This is the provider-side port, not a
+        /// local listener.
         port: u16,
 
-        /// Protocol: tcp, udp, or both
+        /// Choose tcp, udp, or both for the AirVPN port forward
+        ///
+        /// For a new forward, defaults to both. When editing an existing forward, omission
+        /// preserves its current protocol setting.
         #[arg(short, long, default_value = "both")]
         protocol: String,
 
-        /// Local port to map to (default: same as remote port)
+        /// Set the local destination port for this AirVPN forward
+        ///
+        /// For a new forward, omission uses the remote port. When editing an existing forward,
+        /// omission leaves its local-port setting unchanged. This changes the provider mapping
+        /// and does not open a local listener.
         #[arg(short, long)]
         local: Option<u16>,
 
-        /// DDNS name (e.g., myhost -- becomes myhost.airdns.org)
+        /// Assign an AirVPN dynamic DNS hostname prefix
+        ///
+        /// For example, myhost becomes myhost.airdns.org. Supply the prefix rather than the full
+        /// domain. When editing a forward, omit to preserve its existing DDNS setting.
         #[arg(short, long)]
         ddns: Option<String>,
     },
 
     /// Remove a port forward
     Remove {
-        /// Port number to remove
+        /// Select the AirVPN public forwarded port
+        ///
+        /// For add, 0 requests automatic assignment. For remove, info, check, or set, use an
+        /// existing public port from airvpn ports list. This is the provider-side port, not a
+        /// local listener.
         port: u16,
     },
 
     /// Show active sessions for a forwarded port
     Info {
-        /// Port number to inspect
+        /// Select the AirVPN public forwarded port
+        ///
+        /// For add, 0 requests automatic assignment. For remove, info, check, or set, use an
+        /// existing public port from airvpn ports list. This is the provider-side port, not a
+        /// local listener.
         port: u16,
     },
 
     /// Test if a forwarded port is reachable
     Check {
-        /// Port number to test
+        /// Select the AirVPN public forwarded port
+        ///
+        /// For add, 0 requests automatic assignment. For remove, info, check, or set, use an
+        /// existing public port from airvpn ports list. This is the provider-side port, not a
+        /// local listener.
         port: u16,
     },
 
     /// Edit settings on an existing forwarded port
     #[command(visible_alias = "edit")]
     Set {
-        /// Port number to edit
+        /// Select the AirVPN public forwarded port
+        ///
+        /// For add, 0 requests automatic assignment. For remove, info, check, or set, use an
+        /// existing public port from airvpn ports list. This is the provider-side port, not a
+        /// local listener.
         port: u16,
 
-        /// Protocol: tcp, udp, or both
+        /// Choose tcp, udp, or both for the AirVPN port forward
+        ///
+        /// For a new forward, defaults to both. When editing an existing forward, omission
+        /// preserves its current protocol setting.
         #[arg(short, long)]
         protocol: Option<String>,
 
-        /// Local port to map to
+        /// Set the local destination port for this AirVPN forward
+        ///
+        /// For a new forward, omission uses the remote port. When editing an existing forward,
+        /// omission leaves its local-port setting unchanged. This changes the provider mapping
+        /// and does not open a local listener.
         #[arg(short, long)]
         local: Option<u16>,
 
-        /// DDNS name (e.g., myhost -- becomes myhost.airdns.org)
+        /// Assign an AirVPN dynamic DNS hostname prefix
+        ///
+        /// For example, myhost becomes myhost.airdns.org. Supply the prefix rather than the full
+        /// domain. When editing a forward, omit to preserve its existing DDNS setting.
         #[arg(short, long)]
         ddns: Option<String>,
     },
@@ -896,23 +1405,35 @@ pub enum DeviceAction {
 
     /// Add a new device
     Add {
-        /// Name for the new device
+        /// Name the AirVPN device/WireGuard key
+        ///
+        /// For add, omission keeps the provider name New device. For rename, this is the
+        /// replacement display name; identify the existing device with its current name.
         #[arg(short, long)]
         name: Option<String>,
     },
 
     /// Rename a device
     Rename {
-        /// Current device name
+        /// Identify an AirVPN device by its current name
+        ///
+        /// Use airvpn devices list to find existing names. The command resolves that device
+        /// before renaming or deleting it.
         device: String,
 
-        /// New name
+        /// Name the AirVPN device/WireGuard key
+        ///
+        /// For add, omission keeps the provider name New device. For rename, this is the
+        /// replacement display name; identify the existing device with its current name.
         name: String,
     },
 
     /// Delete a device
     Delete {
-        /// Device name
+        /// Identify an AirVPN device by its current name
+        ///
+        /// Use airvpn devices list to find existing names. The command resolves that device
+        /// before renaming or deleting it.
         device: String,
     },
 }
@@ -925,23 +1446,35 @@ pub enum ApiKeyAction {
 
     /// Generate a new API key
     Add {
-        /// Name for the new key
+        /// Set the AirVPN API key display name
+        ///
+        /// For add, omission keeps the provider-assigned name. For rename, this is the new name
+        /// for the selected key; it does not replace the secret key value.
         #[arg(short, long)]
         name: Option<String>,
     },
 
     /// Rename an API key
     Rename {
-        /// Current key name
+        /// Identify the AirVPN API key by its current name
+        ///
+        /// Use airvpn api-keys list to find existing key names. This selects the key record to
+        /// rename or delete; it is not the secret API key value.
         key: String,
 
-        /// New name
+        /// Set the AirVPN API key display name
+        ///
+        /// For add, omission keeps the provider-assigned name. For rename, this is the new name
+        /// for the selected key; it does not replace the secret key value.
         name: String,
     },
 
     /// Delete an API key
     Delete {
-        /// Key name
+        /// Identify the AirVPN API key by its current name
+        ///
+        /// Use airvpn api-keys list to find existing key names. This selects the key record to
+        /// rename or delete; it is not the secret API key value.
         key: String,
     },
 }

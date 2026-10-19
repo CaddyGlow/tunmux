@@ -1,3 +1,4 @@
+mod elevation;
 mod transport;
 mod util;
 
@@ -9,7 +10,7 @@ use std::time::Duration;
 use tracing::debug;
 
 use crate::config;
-use crate::config::{PrivilegedAutostopMode, PrivilegedTransport};
+use crate::config::{PrivilegedAutostopMode, PrivilegedElevation, PrivilegedTransport};
 use crate::error::{AppError, Result};
 use crate::privileged_api::{
     GotaTunAction, KillSignal, PrivilegedRequest, PrivilegedResponse, WgQuickAction,
@@ -21,6 +22,7 @@ use self::util::{build_lease_token, request_kind, resolve_client_authorized_grou
 pub struct PrivilegedClient {
     socket_path: PathBuf,
     transport: PrivilegedTransport,
+    elevation: PrivilegedElevation,
     autostart_enabled: bool,
     autostart_timeout: Duration,
     authorized_group: String,
@@ -134,6 +136,7 @@ impl PrivilegedClient {
         Self {
             socket_path: config::privileged_socket_path(),
             transport: cfg.general.privileged_transport,
+            elevation: cfg.general.privileged_elevation,
             autostart_enabled: cfg.general.privileged_autostart,
             autostart_timeout: Duration::from_millis(timeout_ms),
             authorized_group: resolve_client_authorized_group(

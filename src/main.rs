@@ -44,15 +44,24 @@ fn main() -> std::process::ExitCode {
         TopCommand::Privileged {
             serve,
             stdio,
+            detach,
             authorized_group,
             idle_timeout_ms,
             autostarted,
         } => {
-            let _logging_guard = init_logging(cli.verbose);
             if !serve {
                 eprintln!("privileged mode requires --serve");
                 return std::process::ExitCode::FAILURE;
             }
+            // Detach before logging starts its worker thread; fork keeps only
+            // the calling thread.
+            if detach {
+                if let Err(e) = daemonize(OutputPolicy::KeepTerminalAndFiles) {
+                    eprintln!("privileged service detach failed: {}", e);
+                    return std::process::ExitCode::FAILURE;
+                }
+            }
+            let _logging_guard = init_logging(cli.verbose);
             let run = if stdio {
                 privileged::serve_stdio(idle_timeout_ms, autostarted)
             } else {
@@ -541,7 +550,7 @@ fn run_local_proxy_daemon(pid_file: &str, log_file: &str, config_b64: &str) -> a
     let foreground = std::env::var_os("TUNMUX_LOCAL_PROXY_FOREGROUND").is_some();
     if !foreground {
         // Daemonize (double-fork).
-        daemonize_local()?;
+        daemonize(OutputPolicy::Discard)?;
     }
 
     let _logging_guard = if foreground {
@@ -632,9 +641,20 @@ fn parse_dns_servers_env_list(raw: &str) -> Vec<String> {
         .collect()
 }
 
-/// Double-fork daemonize for the local-proxy daemon.
-fn daemonize_local() -> anyhow::Result<()> {
+/// What a daemonized process keeps from its launcher's stdout/stderr.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum OutputPolicy {
+    /// Redirect both to /dev/null.
+    Discard,
+    /// Keep terminals and log files; redirect pipes and sockets, which would
+    /// otherwise keep the launcher waiting for EOF.
+    KeepTerminalAndFiles,
+}
+
+/// Double-fork daemonize.
+fn daemonize(output: OutputPolicy) -> anyhow::Result<()> {
     use nix::unistd::{fork, setsid, ForkResult};
+    use std::os::fd::AsFd;
 
     match unsafe { fork() } {
         Ok(ForkResult::Parent { .. }) => std::process::exit(0),
@@ -652,10 +672,28 @@ fn daemonize_local() -> anyhow::Result<()> {
 
     let devnull = std::fs::File::open("/dev/null")?;
     nix::unistd::dup2_stdin(&devnull)?;
-    nix::unistd::dup2_stdout(&devnull)?;
-    nix::unistd::dup2_stderr(&devnull)?;
+    let keep = |fd: std::os::fd::BorrowedFd<'_>| {
+        output == OutputPolicy::KeepTerminalAndFiles && keeps_output(fd)
+    };
+    if !keep(std::io::stdout().as_fd()) {
+        nix::unistd::dup2_stdout(&devnull)?;
+    }
+    if !keep(std::io::stderr().as_fd()) {
+        nix::unistd::dup2_stderr(&devnull)?;
+    }
 
     Ok(())
+}
+
+fn keeps_output(fd: std::os::fd::BorrowedFd<'_>) -> bool {
+    use std::io::IsTerminal;
+    if fd.is_terminal() {
+        return true;
+    }
+    fd.try_clone_to_owned()
+        .map(std::fs::File::from)
+        .and_then(|file| file.metadata())
+        .is_ok_and(|meta| meta.is_file())
 }
 
 fn cmd_status() -> anyhow::Result<()> {

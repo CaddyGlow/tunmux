@@ -53,6 +53,7 @@ pub struct GeneralConfig {
     pub credential_store: CredentialStore,
     pub proxy_access_log: bool,
     pub privileged_transport: PrivilegedTransport,
+    pub privileged_elevation: PrivilegedElevation,
     pub privileged_autostart: bool,
     pub privileged_autostart_timeout_ms: u64,
     pub privileged_authorized_group: String,
@@ -68,6 +69,7 @@ impl Default for GeneralConfig {
             credential_store: default_credential_store(),
             proxy_access_log: false,
             privileged_transport: PrivilegedTransport::Socket,
+            privileged_elevation: PrivilegedElevation::Auto,
             privileged_autostart: true,
             privileged_autostart_timeout_ms: 5000,
             privileged_authorized_group: String::new(),
@@ -136,6 +138,32 @@ pub enum PrivilegedTransport {
     #[default]
     Socket,
     Stdio,
+}
+
+/// How the client gains root to start the privileged daemon.
+///
+/// Config values: `"auto"` (detect an elevation program), `"none"` (start the
+/// daemon directly), `"passwordless"` (detect, but never prompt), or a path to
+/// an elevation program such as `"/usr/bin/sudo"`.
+#[derive(Debug, Clone, Default, Deserialize, PartialEq, Eq)]
+#[serde(from = "String")]
+pub enum PrivilegedElevation {
+    #[default]
+    Auto,
+    None,
+    Passwordless,
+    Program(PathBuf),
+}
+
+impl From<String> for PrivilegedElevation {
+    fn from(value: String) -> Self {
+        match value.trim() {
+            "" | "auto" => Self::Auto,
+            "none" => Self::None,
+            "passwordless" => Self::Passwordless,
+            program => Self::Program(PathBuf::from(program)),
+        }
+    }
 }
 
 #[derive(Debug, Default, Deserialize)]

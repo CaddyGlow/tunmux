@@ -1,4 +1,3 @@
-use std::io::IsTerminal;
 use std::io::{BufRead, BufReader, Write};
 use std::os::fd::AsRawFd;
 use std::os::unix::fs::PermissionsExt;
@@ -15,9 +14,9 @@ use crate::config::PrivilegedTransport;
 use crate::error::{AppError, Result};
 use crate::privileged_api::PrivilegedRequest;
 
+use super::elevation::{run_with_timeout, Elevation};
 use super::util::{
-    configured_privileged_stdio_log_path, map_sudo_spawn_error, request_kind,
-    run_sudo_validate_with_timeout, shell_quote, startup_lock_dir, stderr_requires_password,
+    configured_privileged_stdio_log_path, request_kind, shell_quote, startup_lock_dir,
 };
 use super::PrivilegedClient;
 
@@ -208,205 +207,55 @@ impl PrivilegedClient {
     }
 
     fn spawn_privileged_daemon(&self) -> Result<()> {
-        const SUDO_PROMPT_TIMEOUT: Duration = Duration::from_secs(90);
-        debug!("privileged_daemon_start_non_interactive_launch_attempt");
-        if self.run_sudo_non_interactive_launch()? {
-            debug!("privileged_daemon_start_non_interactive_launch_ok");
-            return Ok(());
-        }
+        const PROMPT_TIMEOUT: Duration = Duration::from_secs(90);
 
-        let probe = self.run_sudo_non_interactive_probe()?;
-        let stderr = String::from_utf8_lossy(&probe.stderr);
-        if !stderr_requires_password(&stderr) {
+        let elevation = Elevation::resolve(&self.elevation)?;
+        let interactive = elevation.can_prompt();
+        let mut command = self.elevated_daemon_command(&elevation, interactive)?;
+        if let Some(log_path) = configured_privileged_stdio_log_path() {
+            let (stdout, stderr) = open_stdio_log(&log_path)?;
+            command.stdout(stdout).stderr(stderr);
             debug!(
-                "privileged daemon start: non-interactive launch failed without password-prompt hint stderr={}",
-                stderr.trim()
+                "privileged daemon start: capturing elevation/daemon stdio to {}",
+                log_path.display()
             );
-            return Err(AppError::Other(format!(
-                "failed to start privileged daemon via sudo: {}; run: {}",
-                stderr.trim(),
-                self.manual_start_command()
-            )));
         }
 
-        if !std::io::stdin().is_terminal() {
-            debug!("privileged_daemon_start_password_required_no_tty");
-            return Err(AppError::Other(format!(
-                "sudo password required but no TTY available; run: {}",
-                self.manual_start_command()
-            )));
-        }
-
-        eprintln!("sudo authentication required for tunmux privileged autostart.");
         debug!(
-            "privileged daemon start: running sudo -v with timeout={}s",
-            SUDO_PROMPT_TIMEOUT.as_secs()
+            elevation = ?elevation.display_name(),
+            interactive = interactive,
+            "privileged_daemon_start"
         );
-        let validate = run_sudo_validate_with_timeout(SUDO_PROMPT_TIMEOUT)
-            .map_err(|e| map_sudo_spawn_error(e, self.manual_start_command()))?;
-        if !validate {
-            debug!("privileged_daemon_start_sudo_validate_failed");
-            return Err(AppError::Other(format!(
-                "sudo authentication failed; run: {}",
-                self.manual_start_command()
-            )));
-        }
-
-        debug!("privileged_daemon_start_retry_non_interactive_after_validate");
-        if self.run_sudo_non_interactive_launch()? {
-            debug!("privileged_daemon_start_retry_launch_ok");
+        // The daemon detaches itself, so this returns once it is running.
+        let status = run_with_timeout(command, PROMPT_TIMEOUT)
+            .map_err(|e| elevation.map_spawn_error(e, self.manual_start_command()))?;
+        if status.success() {
             return Ok(());
         }
-        let retry_probe = self.run_sudo_non_interactive_probe()?;
-        let retry_stderr = String::from_utf8_lossy(&retry_probe.stderr)
-            .trim()
-            .to_string();
-        debug!(
-            "privileged daemon start: retry launch failed stderr={}",
-            retry_stderr
-        );
         Err(AppError::Other(format!(
-            "failed to start privileged daemon after sudo auth: {}; run: {}",
-            retry_stderr,
+            "failed to start privileged daemon{}: {}{}; run: {}",
+            via_elevation(&elevation),
+            status,
+            prompt_hint(&elevation, interactive),
             self.manual_start_command()
         )))
     }
 
-    fn run_sudo_non_interactive_launch(&self) -> Result<bool> {
-        let exe = std::env::current_exe()
-            .map_err(|e| AppError::Other(format!("cannot resolve current executable: {}", e)))?;
-        let mut command = Command::new("sudo");
-        command
-            .arg("-n")
-            .arg("-b")
-            .arg(exe)
-            .arg("privileged")
-            .arg("--serve")
-            .arg("--autostarted")
-            .arg("--authorized-group")
-            .arg(self.authorized_group.as_str());
-        crate::logging::apply_to_command(&mut command);
-        if let Some(idle_timeout_ms) = self.daemon_idle_timeout_ms {
-            command
-                .arg("--idle-timeout-ms")
-                .arg(idle_timeout_ms.to_string());
-        }
-        if let Some(log_path) = configured_privileged_stdio_log_path() {
-            if let Some(parent) = log_path.parent() {
-                let _ = fs::create_dir_all(parent);
-            }
-            let log_file = fs::OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(&log_path)
-                .map_err(|e| {
-                    AppError::Other(format!(
-                        "failed to open privileged stdio log {}: {}",
-                        log_path.display(),
-                        e
-                    ))
-                })?;
-            let log_file_err = log_file
-                .try_clone()
-                .map_err(|e| AppError::Other(format!("failed to clone log fd: {}", e)))?;
-            command.stdout(Stdio::from(log_file));
-            command.stderr(Stdio::from(log_file_err));
-            debug!(
-                "privileged daemon start: capturing sudo/daemon stdio to {}",
-                log_path.display()
-            );
-        }
-        debug!(cmd = "sudo -n -b tunmux privileged --serve", "exec");
-        let status = command
-            .status()
-            .map_err(|e| map_sudo_spawn_error(e, self.manual_start_command()))?;
-        Ok(status.success())
-    }
-
-    fn run_sudo_non_interactive_probe(&self) -> Result<std::process::Output> {
-        debug!(cmd = "sudo -n -v", "exec");
-        Command::new("sudo")
-            .arg("-n")
-            .arg("-v")
-            .output()
-            .map_err(|e| map_sudo_spawn_error(e, self.manual_start_command()))
-    }
-
     pub(crate) fn spawn_privileged_stdio_session(&self) -> Result<StdioSession> {
-        const SUDO_PROMPT_TIMEOUT: Duration = Duration::from_secs(90);
-
-        let probe = self.run_sudo_non_interactive_probe()?;
-        if !probe.status.success() {
-            let stderr = String::from_utf8_lossy(&probe.stderr);
-            if !stderr_requires_password(&stderr) {
-                return Err(AppError::Other(format!(
-                    "failed to start privileged stdio helper via sudo: {}; run: {}",
-                    stderr.trim(),
-                    self.manual_start_command()
-                )));
-            }
-            if !std::io::stdin().is_terminal() {
-                return Err(AppError::Other(format!(
-                    "sudo password required but no TTY available; run: {}",
-                    self.manual_start_command()
-                )));
-            }
-
-            eprintln!("sudo authentication required for tunmux privileged stdio mode.");
-            let validate = run_sudo_validate_with_timeout(SUDO_PROMPT_TIMEOUT)
-                .map_err(|e| map_sudo_spawn_error(e, self.manual_start_command()))?;
-            if !validate {
-                return Err(AppError::Other(format!(
-                    "sudo authentication failed; run: {}",
-                    self.manual_start_command()
-                )));
-            }
+        let elevation = Elevation::resolve(&self.elevation)?;
+        if !elevation.supports_pipes() {
+            return Err(AppError::Other(format!(
+                "privileged stdio transport cannot run through {}; set general.privileged_transport = \"socket\" or another general.privileged_elevation",
+                elevation.display_name().unwrap_or_default()
+            )));
         }
 
-        self.spawn_privileged_stdio_session_non_interactive()
-    }
-
-    fn spawn_privileged_stdio_session_non_interactive(&self) -> Result<StdioSession> {
-        let exe = std::env::current_exe()
-            .map_err(|e| AppError::Other(format!("cannot resolve current executable: {}", e)))?;
-
-        debug!("privileged_stdio_helper_spawn_begin");
-        let mut command = Command::new("sudo");
-        command
-            .arg("-n")
-            .arg(exe)
-            .arg("privileged")
-            .arg("--serve")
-            .arg("--stdio")
-            .arg("--autostarted")
-            .arg("--authorized-group")
-            .arg(self.authorized_group.as_str())
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped());
-
-        crate::logging::apply_to_command(&mut command);
-        if let Some(idle_timeout_ms) = self.daemon_idle_timeout_ms {
-            command
-                .arg("--idle-timeout-ms")
-                .arg(idle_timeout_ms.to_string());
-        }
-
+        let interactive = elevation.can_prompt();
+        let mut command = self.elevated_daemon_command(&elevation, interactive)?;
+        command.stdin(Stdio::piped()).stdout(Stdio::piped());
         if let Some(log_path) = configured_privileged_stdio_log_path() {
-            if let Some(parent) = log_path.parent() {
-                let _ = fs::create_dir_all(parent);
-            }
-            let log_file = fs::OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(&log_path)
-                .map_err(|e| {
-                    AppError::Other(format!(
-                        "failed to open privileged stdio log {}: {}",
-                        log_path.display(),
-                        e
-                    ))
-                })?;
-            command.stderr(Stdio::from(log_file));
+            let (_, stderr) = open_stdio_log(&log_path)?;
+            command.stderr(stderr);
             debug!(
                 "privileged stdio helper: capturing stderr to {}",
                 log_path.display()
@@ -415,9 +264,14 @@ impl PrivilegedClient {
             command.stderr(Stdio::inherit());
         }
 
+        debug!(
+            elevation = ?elevation.display_name(),
+            interactive = interactive,
+            "privileged_stdio_helper_spawn_begin"
+        );
         let mut child = command
             .spawn()
-            .map_err(|e| map_sudo_spawn_error(e, self.manual_start_command()))?;
+            .map_err(|e| elevation.map_spawn_error(e, self.manual_start_command()))?;
         debug!( pid = ?child.id(), "privileged_stdio_helper_spawned");
         let stdin = child
             .stdin
@@ -433,6 +287,40 @@ impl PrivilegedClient {
             stdin,
             stdout: BufReader::new(stdout),
         })
+    }
+
+    fn elevated_daemon_command(&self, elevation: &Elevation, interactive: bool) -> Result<Command> {
+        let exe = std::env::current_exe()
+            .map_err(|e| AppError::Other(format!("cannot resolve current executable: {}", e)))?;
+        elevation
+            .command(&exe, &self.daemon_args(), interactive)
+            .ok_or_else(|| {
+                AppError::Other(format!(
+                    "{} cannot run without a password prompt{}; run: {}",
+                    elevation.display_name().unwrap_or_default(),
+                    prompt_hint(elevation, interactive),
+                    self.manual_start_command()
+                ))
+            })
+    }
+
+    fn daemon_args(&self) -> Vec<String> {
+        let mode = match self.transport {
+            PrivilegedTransport::Stdio => "--stdio",
+            PrivilegedTransport::Socket => "--detach",
+        };
+        let mut args: Vec<String> = ["privileged", "--serve", mode, "--autostarted"]
+            .into_iter()
+            .map(str::to_string)
+            .collect();
+        args.push("--authorized-group".to_string());
+        args.push(self.authorized_group.clone());
+        args.extend(crate::logging::forwarded_args());
+        if let Some(idle_timeout_ms) = self.daemon_idle_timeout_ms {
+            args.push("--idle-timeout-ms".to_string());
+            args.push(idle_timeout_ms.to_string());
+        }
+        args
     }
 
     fn wait_until_ready(&self) -> Result<()> {
@@ -502,8 +390,12 @@ impl PrivilegedClient {
         } else {
             ""
         };
+        let prefix = Elevation::resolve(&self.elevation)
+            .map(|elevation| elevation.manual_prefix())
+            .unwrap_or_else(|_| "sudo ".to_string());
         format!(
-            "sudo {} privileged --serve{} --authorized-group {}{}",
+            "{}{} privileged --serve{} --authorized-group {}{}",
+            prefix,
             shell_quote(&exe.to_string_lossy()),
             stdio,
             shell_quote(&self.authorized_group),
@@ -585,5 +477,41 @@ impl PrivilegedClient {
         tracing::trace!(
             request = ?request_kind(request), "privileged_ctl_stdio_response");
         super::map_privileged_error(response)
+    }
+}
+
+fn open_stdio_log(log_path: &std::path::Path) -> Result<(fs::File, fs::File)> {
+    if let Some(parent) = log_path.parent() {
+        let _ = fs::create_dir_all(parent);
+    }
+    let log_file = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(log_path)
+        .map_err(|e| {
+            AppError::Other(format!(
+                "failed to open privileged stdio log {}: {}",
+                log_path.display(),
+                e
+            ))
+        })?;
+    let log_file_err = log_file
+        .try_clone()
+        .map_err(|e| AppError::Other(format!("failed to clone log fd: {}", e)))?;
+    Ok((log_file, log_file_err))
+}
+
+fn via_elevation(elevation: &Elevation) -> String {
+    elevation
+        .display_name()
+        .map(|name| format!(" via {}", name))
+        .unwrap_or_default()
+}
+
+fn prompt_hint(elevation: &Elevation, interactive: bool) -> &'static str {
+    if interactive || matches!(elevation, Elevation::Direct) {
+        ""
+    } else {
+        " (password prompts unavailable: no TTY or passwordless elevation)"
     }
 }

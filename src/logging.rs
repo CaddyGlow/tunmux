@@ -46,7 +46,13 @@ pub fn current_config() -> LoggingConfig {
 
 /// Carry the resolved filter as an argument so sudo environment filtering cannot lose it.
 pub fn apply_to_command(command: &mut std::process::Command) {
-    command.arg("--log-filter").arg(current_config().filter);
+    command.args(forwarded_args());
+}
+
+/// CLI arguments that carry the current logging configuration to a child process.
+#[must_use]
+pub fn forwarded_args() -> [String; 2] {
+    ["--log-filter".to_string(), current_config().filter]
 }
 
 /// Keep this in the process's main scope so queued file events flush on return.

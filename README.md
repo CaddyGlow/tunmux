@@ -25,7 +25,8 @@ It supports Proton VPN, AirVPN, Mullvad, IVPN, and local WireGuard config profil
 - Rust (stable, edition 2021)
 - Linux for full feature set (kernel backend + `--proxy` namespace isolation)
 - macOS for direct mode and `--local-proxy` mode (`--proxy` is Linux-only)
-- `sudo` access for privileged operations (`tunmux privileged --serve`) used by direct mode and `--proxy`
+- Root access for privileged operations (`tunmux privileged --serve`) used by direct mode and `--proxy`,
+  through `doas`, `sudo`, `run0` or `pkexec` on Linux, or `sudo`/the admin dialog on macOS
 
 `userspace` mode uses the embedded `gotatun` library through a built-in helper; no separate `gotatun` CLI install is required.
 `--local-proxy` uses that userspace engine to run a SOCKS5/HTTP proxy without root.
@@ -401,6 +402,7 @@ credential_store = "keyring"      # keyring or file
 proxy_access_log = false
 hooks = { ifup = ["builtin:connectivity", "builtin:external-ip"], ifdown = [] }
 privileged_transport = "socket"   # socket or stdio
+privileged_elevation = "auto"     # auto, none, passwordless, or a path such as /usr/bin/sudo
 privileged_autostart = true
 privileged_autostart_timeout_ms = 5000
 privileged_authorized_group = "tunmux"
@@ -467,19 +469,37 @@ Supported transports:
 - `stdio`: one-shot helper process over stdin/stdout
 
 Autostart can launch the privileged service when needed (if enabled in config).
+`privileged_elevation` in `[general]` selects how it gains root:
 
-Example sudoers entries (adjust binary path for your install):
+- `auto` (default): run directly when already root, otherwise use the first available of
+  `doas`, `sudo`, `run0`, `pkexec` on Linux, or `sudo`, then the macOS administrator
+  dialog (`osascript`) on macOS
+- `none`: start the service directly without elevation (already root, or the binary has
+  the needed capabilities)
+- `passwordless`: like `auto`, but never prompt; fails if the program needs a password
+  (for NOPASSWD sudoers or `nopass` doas rules)
+- a path such as `/usr/bin/sudo`: use that program
+
+The stdio transport cannot run through the macOS administrator dialog.
+
+Example sudoers entries (adjust binary path for your install). The trailing `*` covers the
+`--log-filter` and `--idle-timeout-ms` arguments that autostart appends:
 
 ```bash
 <user-or-group> ALL=(root) NOPASSWD: /usr/bin/tunmux privileged --serve --authorized-group tunmux
-<user-or-group> ALL=(root) NOPASSWD: /usr/bin/tunmux privileged --serve --autostarted --authorized-group tunmux
-<user-or-group> ALL=(root) NOPASSWD: /usr/bin/tunmux privileged --serve --autostarted --authorized-group tunmux --idle-timeout-ms *
+<user-or-group> ALL=(root) NOPASSWD: /usr/bin/tunmux privileged --serve --detach --autostarted --authorized-group tunmux *
 ```
 
 For stdio mode:
 
 ```bash
-<user-or-group> ALL=(root) NOPASSWD: /usr/bin/tunmux privileged --serve --stdio --autostarted --authorized-group tunmux
+<user-or-group> ALL=(root) NOPASSWD: /usr/bin/tunmux privileged --serve --stdio --autostarted --authorized-group tunmux *
+```
+
+Example doas rule (doas matches the command, not its arguments):
+
+```text
+permit nopass :tunmux as root cmd /usr/bin/tunmux
 ```
 
 ## Data Layout
