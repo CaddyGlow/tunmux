@@ -168,12 +168,18 @@ fn socket_occupied(path: &std::path::Path) -> bool {
     use std::os::fd::AsRawFd;
     let result = (|| {
         let address = UnixAddr::new(path)?;
-        let socket = socket(
-            AddressFamily::Unix,
-            SockType::Stream,
-            SockFlag::SOCK_NONBLOCK | SockFlag::SOCK_CLOEXEC,
-            None,
-        )?;
+        #[cfg(target_os = "macos")]
+        let flags = SockFlag::empty();
+        #[cfg(not(target_os = "macos"))]
+        let flags = SockFlag::SOCK_NONBLOCK | SockFlag::SOCK_CLOEXEC;
+        let socket = socket(AddressFamily::Unix, SockType::Stream, flags, None)?;
+        #[cfg(target_os = "macos")]
+        {
+            // macOS requires setting these properties after socket creation.
+            use nix::fcntl::{fcntl, FcntlArg, FdFlag, OFlag};
+            fcntl(&socket, FcntlArg::F_SETFD(FdFlag::FD_CLOEXEC))?;
+            fcntl(&socket, FcntlArg::F_SETFL(OFlag::O_NONBLOCK))?;
+        }
         connect(socket.as_raw_fd(), &address)
     })();
     !matches!(

@@ -1351,12 +1351,18 @@ fn ensure_stopped(owner: &str) -> anyhow::Result<()> {
     use nix::sys::socket::{connect, socket, AddressFamily, SockFlag, SockType, UnixAddr};
     use std::os::fd::AsRawFd;
     let path = Path::new(super::SOCK_DIR).join(format!("{owner}.sock"));
-    let socket = socket(
-        AddressFamily::Unix,
-        SockType::Stream,
-        SockFlag::SOCK_NONBLOCK | SockFlag::SOCK_CLOEXEC,
-        None,
-    )?;
+    #[cfg(target_os = "macos")]
+    let flags = SockFlag::empty();
+    #[cfg(not(target_os = "macos"))]
+    let flags = SockFlag::SOCK_NONBLOCK | SockFlag::SOCK_CLOEXEC;
+    let socket = socket(AddressFamily::Unix, SockType::Stream, flags, None)?;
+    #[cfg(target_os = "macos")]
+    {
+        // macOS requires setting these properties after socket creation.
+        use nix::fcntl::{fcntl, FcntlArg, FdFlag, OFlag};
+        fcntl(&socket, FcntlArg::F_SETFD(FdFlag::FD_CLOEXEC))?;
+        fcntl(&socket, FcntlArg::F_SETFL(OFlag::O_NONBLOCK))?;
+    }
     let address = UnixAddr::new(&path)?;
     match connect(socket.as_raw_fd(), &address) {
         Ok(()) => anyhow::bail!("control socket for {owner} is active; refusing network recovery"),

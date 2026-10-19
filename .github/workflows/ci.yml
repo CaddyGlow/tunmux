@@ -23,6 +23,23 @@ jobs:
       - name: Run repository CI script
         run: bash ./scripts/ci.sh
 
+  macos:
+    name: macOS checks
+    runs-on: macos-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - name: Check macOS targets
+        run: cargo clippy --locked --all-targets --all-features -- -D warnings
+      - name: Test socket occupancy
+        run: cargo test --locked wireguard::health::occupancy_tests
+
   provider-features:
     name: Provider features (${{ matrix.features || 'none' }})
     runs-on: ubuntu-latest
