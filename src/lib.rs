@@ -57,3 +57,16 @@ pub mod proxy;
 
 #[cfg(not(target_os = "android"))]
 pub mod userspace_helper;
+
+#[cfg(not(target_os = "android"))]
+pub mod automation;
+#[cfg(not(target_os = "android"))]
+pub mod network_changes;
+#[cfg(not(target_os = "android"))]
+pub mod service;
+
+#[cfg(not(target_os = "android"))]
+pub mod local_proxy_control;
+
+#[cfg(not(target_os = "android"))]
+mod lan;

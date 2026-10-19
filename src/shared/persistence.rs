@@ -33,6 +33,7 @@ pub(crate) fn write_private_atomic(path: &Path, data: &[u8]) -> io::Result<()> {
     file.sync_all()?;
     drop(file);
     fs::rename(&temporary.0, path)?;
+    fs::File::open(parent)?.sync_all()?;
     Ok(())
 }
 

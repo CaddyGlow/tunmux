@@ -97,7 +97,10 @@ impl PrivilegedClient {
             self.socket_path.display()
         );
         match self.try_connect_socket() {
-            Ok(stream) => {
+            Ok(mut stream) => {
+                if crate::service::installed() {
+                    self.verify_activation(&mut stream)?;
+                }
                 debug!(
                     "privileged ctl connect ok socket={}",
                     self.socket_path.display()
@@ -131,6 +134,25 @@ impl PrivilegedClient {
             )));
         }
 
+        if crate::service::installed() {
+            let deadline = Instant::now() + self.autostart_timeout;
+            while Instant::now() < deadline {
+                if let Ok(mut stream) = self.try_connect_socket() {
+                    self.verify_activation(&mut stream)?;
+                    return Ok(stream);
+                }
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            return Err(AppError::Other(
+                "installed launchd service did not activate; run tunmux service diagnose".into(),
+            ));
+        }
+        if std::env::var_os("TUNMUX_NONINTERACTIVE").is_some() {
+            return Err(AppError::Other(
+                "background connect requires an available privileged service; install it first"
+                    .into(),
+            ));
+        }
         self.autostart_daemon()?;
         self.try_connect_socket().map_err(|e| {
             AppError::Other(format!(
@@ -139,6 +161,13 @@ impl PrivilegedClient {
                 self.manual_start_command()
             ))
         })
+    }
+
+    fn verify_activation(&self, stream: &mut UnixStream) -> Result<()> {
+        match self.send_on_stream(stream, &PrivilegedRequest::Capabilities) {
+            Ok(super::PrivilegedResponse::Text(_)) => Ok(()),
+            _ => Err(AppError::Other("installed launchd service did not answer its activation probe within two seconds; run tunmux service diagnose".into())),
+        }
     }
 
     fn autostart_daemon(&self) -> Result<()> {
@@ -380,7 +409,7 @@ impl PrivilegedClient {
     }
 
     pub(crate) fn try_connect_socket(&self) -> std::io::Result<UnixStream> {
-        UnixStream::connect(&self.socket_path)
+        crate::wireguard::health::connect_probe(&self.socket_path)
     }
 
     pub(crate) fn manual_start_command(&self) -> String {
@@ -413,30 +442,23 @@ impl PrivilegedClient {
         tracing::trace!( request = ?request_kind(request), "privileged_ctl_write");
         let request_bytes = serde_json::to_vec(request)
             .map_err(|e| AppError::Other(format!("serialize request: {}", e)))?;
-        stream
-            .write_all(&request_bytes)
-            .map_err(|e| AppError::Other(format!("write request: {}", e)))?;
-        stream
-            .write_all(b"\n")
-            .map_err(|e| AppError::Other(format!("write request delimiter: {}", e)))?;
-        stream
-            .flush()
-            .map_err(|e| AppError::Other(format!("flush request: {}", e)))?;
-
-        let mut reader = BufReader::new(stream);
-        let mut response_line = String::new();
-        reader
-            .read_line(&mut response_line)
-            .map_err(|e| AppError::Other(format!("read response: {}", e)))?;
-        if response_line.trim().is_empty() {
-            return Err(AppError::Other(
-                "empty response from privileged server".into(),
-            ));
-        }
-        let response: super::PrivilegedResponse = serde_json::from_str(&response_line)
-            .map_err(|e| AppError::Other(format!("decode response: {}", e)))?;
-        tracing::trace!( request = ?request_kind(request), "privileged_ctl_response");
-
+        let mut writer = stream
+            .try_clone()
+            .map_err(|e| AppError::Other(format!("read response: {e}")))?;
+        let mut reader = BufReader::new(
+            stream
+                .try_clone()
+                .map_err(|e| AppError::Other(format!("read response: {e}")))?,
+        );
+        let response_line = bounded_exchange(
+            &mut writer,
+            &mut reader,
+            &request_bytes,
+            request_timeout(request),
+        )
+        .map_err(|e| AppError::Other(format!("read response: {e}")))?;
+        let response = serde_json::from_str(&response_line)
+            .map_err(|e| AppError::Other(format!("decode response: {e}")))?;
         super::map_privileged_error(response)
     }
 
@@ -449,34 +471,169 @@ impl PrivilegedClient {
             request = ?request_kind(request), "privileged_ctl_stdio_write");
         let request_bytes = serde_json::to_vec(request)
             .map_err(|e| AppError::Other(format!("serialize request: {}", e)))?;
-        session
-            .stdin
-            .write_all(&request_bytes)
-            .map_err(|e| AppError::Other(format!("write request stdin: {}", e)))?;
-        session
-            .stdin
-            .write_all(b"\n")
-            .map_err(|e| AppError::Other(format!("write request delimiter stdin: {}", e)))?;
-        session
-            .stdin
-            .flush()
-            .map_err(|e| AppError::Other(format!("flush request stdin: {}", e)))?;
+        let response_line = bounded_exchange(
+            &mut session.stdin,
+            &mut session.stdout,
+            &request_bytes,
+            request_timeout(request),
+        )
+        .map_err(|e| AppError::Other(format!("read response: {e}")))?;
+        let response = serde_json::from_str(&response_line)
+            .map_err(|e| AppError::Other(format!("decode response: {e}")))?;
+        super::map_privileged_error(response)
+    }
+}
 
-        let mut response_line = String::new();
-        session
-            .stdout
-            .read_line(&mut response_line)
-            .map_err(|e| AppError::Other(format!("read response stdout: {}", e)))?;
-        if response_line.trim().is_empty() {
-            return Err(AppError::Other(
-                "empty response from privileged server".into(),
+fn request_timeout(request: &PrivilegedRequest) -> Duration {
+    match request {
+        PrivilegedRequest::Capabilities
+        | PrivilegedRequest::InspectSession { .. }
+        | PrivilegedRequest::WgShow { .. }
+        | PrivilegedRequest::LeaseAcquire { .. }
+        | PrivilegedRequest::LeaseRelease { .. }
+        | PrivilegedRequest::ShutdownIfIdle
+        | PrivilegedRequest::NamespaceExists { .. } => Duration::from_secs(2),
+        PrivilegedRequest::RecoverSession { .. } => Duration::from_secs(65),
+        _ => Duration::from_secs(150),
+    }
+}
+
+/// A duplicate keeps the shared file description alive until its original flags are restored.
+struct NonblockingGuard {
+    descriptor: std::os::fd::OwnedFd,
+    flags: libc::c_int,
+}
+
+impl NonblockingGuard {
+    fn new(descriptor: std::os::fd::RawFd) -> std::io::Result<Self> {
+        use std::os::fd::FromRawFd;
+        let duplicate = unsafe { libc::fcntl(descriptor, libc::F_DUPFD_CLOEXEC, 0) };
+        if duplicate < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        let descriptor = unsafe { std::os::fd::OwnedFd::from_raw_fd(duplicate) };
+        let flags = unsafe { libc::fcntl(descriptor.as_raw_fd(), libc::F_GETFL) };
+        if flags < 0
+            || unsafe {
+                libc::fcntl(
+                    descriptor.as_raw_fd(),
+                    libc::F_SETFL,
+                    flags | libc::O_NONBLOCK,
+                )
+            } < 0
+        {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(Self { descriptor, flags })
+    }
+}
+
+impl Drop for NonblockingGuard {
+    fn drop(&mut self) {
+        unsafe {
+            libc::fcntl(self.descriptor.as_raw_fd(), libc::F_SETFL, self.flags);
+        }
+    }
+}
+
+fn bounded_exchange<W: Write + AsRawFd, R: std::io::Read + AsRawFd>(
+    writer: &mut W,
+    reader: &mut BufReader<R>,
+    request: &[u8],
+    timeout: Duration,
+) -> std::io::Result<String> {
+    let deadline = Instant::now() + timeout;
+    let _write_flags = NonblockingGuard::new(writer.as_raw_fd())?;
+    let _read_flags = NonblockingGuard::new(reader.get_ref().as_raw_fd())?;
+    let retry = || -> std::io::Result<()> {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "privileged response deadline expired",
             ));
         }
-        let response: super::PrivilegedResponse = serde_json::from_str(&response_line)
-            .map_err(|e| AppError::Other(format!("decode response: {}", e)))?;
-        tracing::trace!(
-            request = ?request_kind(request), "privileged_ctl_stdio_response");
-        super::map_privileged_error(response)
+        thread::sleep(remaining.min(Duration::from_millis(5)));
+        Ok(())
+    };
+    let mut request = request.to_vec();
+    if request.last() != Some(&b'\n') {
+        request.push(b'\n');
+    }
+    let mut pending = request.as_slice();
+    while !pending.is_empty() {
+        if Instant::now() >= deadline {
+            retry()?;
+        }
+        match writer.write(pending) {
+            Ok(0) => return Err(std::io::ErrorKind::WriteZero.into()),
+            Ok(count) => pending = &pending[count..],
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::Interrupted
+                ) =>
+            {
+                retry()?
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    loop {
+        if Instant::now() >= deadline {
+            retry()?;
+        }
+        match writer.flush() {
+            Ok(()) => break,
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::Interrupted
+                ) =>
+            {
+                retry()?
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    let mut response = Vec::new();
+    loop {
+        if Instant::now() >= deadline {
+            retry()?;
+        }
+        let available = match reader.fill_buf() {
+            Ok([]) => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    "privileged response ended before newline",
+                ))
+            }
+            Ok(bytes) => bytes,
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::Interrupted
+                ) =>
+            {
+                retry()?;
+                continue;
+            }
+            Err(error) => return Err(error),
+        };
+        let newline = available.iter().position(|byte| *byte == b'\n');
+        let count = newline.map_or(available.len(), |index| index + 1);
+        if response.len() + count > 256 * 1024 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "privileged response exceeds 256 KiB",
+            ));
+        }
+        response.extend_from_slice(&available[..count]);
+        reader.consume(count);
+        if newline.is_some() {
+            return String::from_utf8(response)
+                .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error));
+        }
     }
 }
 
@@ -513,5 +670,106 @@ fn prompt_hint(elevation: &Elevation, interactive: bool) -> &'static str {
         ""
     } else {
         " (password prompts unavailable: no TTY or passwordless elevation)"
+    }
+}
+
+#[cfg(test)]
+mod inspection_deadline_tests {
+    use super::*;
+
+    fn exchange(
+        response: &[u8],
+        delay: Duration,
+        trickle: bool,
+        timeout: Duration,
+    ) -> std::io::Result<String> {
+        let (client, mut server) = UnixStream::pair().unwrap();
+        let mut writer = client.try_clone().unwrap();
+        let response = response.to_vec();
+        let worker = thread::spawn(move || {
+            use std::io::Read;
+            let mut request = [0];
+            server.read_exact(&mut request).unwrap();
+            if trickle {
+                for byte in response {
+                    thread::sleep(delay);
+                    if server.write_all(&[byte]).is_err() {
+                        break;
+                    }
+                }
+            } else {
+                thread::sleep(delay);
+                let _ = server.write_all(&response);
+            }
+        });
+        let before = unsafe { libc::fcntl(client.as_raw_fd(), libc::F_GETFL) };
+        let mut reader = BufReader::new(client.try_clone().unwrap());
+        let result = bounded_exchange(&mut writer, &mut reader, b"\n", timeout);
+        assert_eq!(
+            unsafe { libc::fcntl(client.as_raw_fd(), libc::F_GETFL) },
+            before
+        );
+        drop(reader);
+        drop(client);
+        drop(writer);
+        worker.join().unwrap();
+        result
+    }
+
+    #[test]
+    fn stalled_inspection_has_deadline() {
+        assert_eq!(
+            exchange(
+                b"ok\n",
+                Duration::from_millis(80),
+                false,
+                Duration::from_millis(20)
+            )
+            .unwrap_err()
+            .kind(),
+            std::io::ErrorKind::TimedOut
+        );
+    }
+
+    #[test]
+    fn trickled_inspection_does_not_reset_deadline() {
+        assert_eq!(
+            exchange(
+                b"okay\n",
+                Duration::from_millis(25),
+                true,
+                Duration::from_millis(60)
+            )
+            .unwrap_err()
+            .kind(),
+            std::io::ErrorKind::TimedOut
+        );
+    }
+
+    #[test]
+    fn inspection_rejects_eof_before_newline() {
+        assert_eq!(
+            exchange(b"ok", Duration::ZERO, false, Duration::from_secs(1))
+                .unwrap_err()
+                .kind(),
+            std::io::ErrorKind::UnexpectedEof
+        );
+    }
+
+    #[test]
+    fn inspection_caps_response_and_restores_flags() {
+        assert!(exchange(
+            &vec![b'x'; 256 * 1024 + 1],
+            Duration::ZERO,
+            false,
+            Duration::from_secs(1)
+        )
+        .unwrap_err()
+        .to_string()
+        .contains("256 KiB"));
+        assert_eq!(
+            exchange(b"ok\n", Duration::ZERO, false, Duration::from_secs(1)).unwrap(),
+            "ok\n"
+        );
     }
 }

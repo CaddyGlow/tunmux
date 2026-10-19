@@ -1,7 +1,7 @@
 #[cfg(unix)]
 mod network;
 #[cfg(unix)]
-use network::recover_network;
+pub(crate) mod session;
 #[cfg(unix)]
 mod worker;
 #[cfg(unix)]
@@ -44,6 +44,8 @@ use gotatun::tun::tun_async_device::TunDevice;
 use gotatun::x25519::{PublicKey, StaticSecret};
 #[cfg(unix)]
 use tokio::signal::unix::{signal, SignalKind};
+#[cfg(unix)]
+use tracing::Instrument;
 
 #[cfg(unix)]
 const READY_OK: &[u8] = &[1];
@@ -58,6 +60,7 @@ const CONFIG_B64_ENV: &str = "TUNMUX_GOTATUN_CONFIG_B64";
 
 #[cfg(unix)]
 struct RunningDevice {
+    session_id: String,
     #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     interface_name: String,
     #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
@@ -71,6 +74,8 @@ struct RunningDevice {
 #[cfg(unix)]
 #[derive(Debug, Clone)]
 struct ParsedUserspaceConfig {
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    allow_lan: bool,
     private_key: [u8; 32],
     mtu: Option<crate::wireguard::config::Mtu>,
     addresses: Vec<String>,
@@ -130,7 +135,9 @@ fn daemonize_and_run(interface: &str) -> anyhow::Result<()> {
         daemonize::Outcome::Parent(Ok(_)) => {
             drop(child_tx);
             let mut status = [0u8; 1];
-            parent_rx.set_read_timeout(Some(Duration::from_secs(60)))?;
+            // Recovery, device setup, and failed-start restoration have separate
+            // budgets. Keep the launcher alive until that bounded work finishes.
+            parent_rx.set_read_timeout(Some(Duration::from_secs(150)))?;
             parent_rx
                 .recv(&mut status)
                 .context("failed to receive startup status from helper child")?;
@@ -154,22 +161,36 @@ fn daemonize_and_run(interface: &str) -> anyhow::Result<()> {
                 anyhow::bail!("failed to initialize userspace helper child: {}", e);
             }
 
-            let _logging_guard = crate::logging::init_terminal(false)?;
+            let _logging_guard = crate::logging::init_terminal(false).inspect_err(|_| {
+                let _ = signal_parent(false);
+            })?;
             let rt = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
                 .build()
-                .context("failed to create tokio runtime for userspace helper")?;
+                .context("failed to create tokio runtime for userspace helper")
+                .inspect_err(|_| {
+                    let _ = signal_parent(false);
+                })?;
             let mut session_ownership = None;
             let mut acknowledgment = None;
             let outcome = rt.block_on(async {
                 let mut sigint = signal(SignalKind::interrupt()).context("failed to set SIGINT handler")?;
                 let mut sigterm = signal(SignalKind::terminate()).context("failed to set SIGTERM handler")?;
-                let session_lock = match recover_network(interface) {
+                let session_lock = match NetworkWorker::recover(interface.to_owned(), async {
+                    tokio::select! { _ = sigint.recv() => {}, _ = sigterm.recv() => {} }
+                }).await {
                     Ok(lock) => lock,
                     Err(error) => { let _ = signal_parent(false); return Err(error); }
                 };
                 session_ownership = Some(session_lock.clone());
-                let running = match start_device(interface, session_lock, &mut sigint, &mut sigterm).await {
+                let session_id = match session::start(interface) {
+                    Ok(id) => id,
+                    Err(error) => {
+                        let _ = signal_parent(false);
+                        return Err(error);
+                    }
+                };
+                let running = match start_device(interface, session_id, session_lock, &mut sigint, &mut sigterm).await {
                     Ok(value) => value,
                     Err(error) => {
                         let _ = signal_parent(false);
@@ -209,16 +230,19 @@ fn daemonize_and_run(interface: &str) -> anyhow::Result<()> {
                 let stop = stop_device(running.device).await;
                 let errors: Vec<String> = [outcome, cleanup, stop].into_iter()
                     .filter_map(|result| result.err().map(|error| format!("{error:#}"))).collect();
-                let result = if errors.is_empty() { Ok(()) } else {
+                let mut result = if errors.is_empty() { Ok(()) } else {
                     tracing::error!(interface, errors = ?errors, "userspace_helper_teardown_failed");
                     Err(anyhow::anyhow!(errors.join("; ")))
                 };
                 if result.is_ok() {
-                    let _ = std::fs::remove_file(&running.control_socket_path);
+                    result = session::finish(interface);
+                    if result.is_ok() {
+                        let _ = std::fs::remove_file(&running.control_socket_path);
+                    }
                 }
                 let _ = std::fs::remove_file(stop_path);
                 result
-            });
+            }.instrument(tracing::info_span!("userspace_helper", interface, backend = "userspace")));
             // gotatun Drop can spawn async shutdown work; bound runtime shutdown too.
             rt.shutdown_timeout(Duration::from_secs(1));
             drop(session_ownership);
@@ -233,6 +257,9 @@ fn daemonize_and_run(interface: &str) -> anyhow::Result<()> {
                     let _ = stream.set_write_timeout(Some(Duration::from_secs(1)));
                     let _ = stream.write_all(message.as_bytes());
                 }
+            }
+            if outcome.is_err() {
+                let _ = signal_parent(false);
             }
             outcome?;
         }
@@ -278,6 +305,7 @@ fn helper_daemon(log: File) -> anyhow::Result<Daemonize<()>> {
 )]
 async fn start_device(
     interface: &str,
+    session_id: String,
     session_lock: network::SessionLock,
     sigint: &mut tokio::signal::unix::Signal,
     sigterm: &mut tokio::signal::unix::Signal,
@@ -311,13 +339,17 @@ async fn start_device(
     let uapi = UapiServer::default_unix_socket(interface, None, None)
         .map_err(|e| anyhow::anyhow!("failed to create UAPI socket for {}: {}", interface, e))?;
 
-    let device = DeviceBuilder::new()
-        .with_uapi(uapi)
-        .with_default_udp()
-        .with_ip(tun)
-        .build()
-        .await
-        .map_err(|e| anyhow::anyhow!("failed to start gotatun device {}: {}", interface_name, e))?;
+    let device = tokio::time::timeout(
+        Duration::from_secs(5),
+        DeviceBuilder::new()
+            .with_uapi(uapi)
+            .with_default_udp()
+            .with_ip(tun)
+            .build(),
+    )
+    .await
+    .context("device startup deadline exceeded")?
+    .map_err(|e| anyhow::anyhow!("failed to start gotatun device {}: {}", interface_name, e))?;
 
     if let Some(config) = parsed_config.as_ref() {
         if let Err(e) = tokio::time::timeout(
@@ -355,6 +387,7 @@ async fn start_device(
 
     let control_socket_path = PathBuf::from(SOCK_DIR).join(format!("{}.sock", interface));
     Ok(RunningDevice {
+        session_id,
         interface_name,
         control_interface_name: interface.to_string(),
         control_socket_path,
@@ -391,6 +424,33 @@ async fn finish_device_stop(
 }
 
 #[cfg(unix)]
+async fn stop_request_matches(
+    stream: &mut tokio::net::UnixStream,
+    session_id: &str,
+    timeout: Duration,
+) -> bool {
+    use tokio::io::AsyncReadExt;
+    let mut request = Vec::new();
+    let result = tokio::time::timeout(timeout, async {
+        while request.len() < 64 {
+            let byte = stream.read_u8().await?;
+            request.push(byte);
+            if byte == b'\n' {
+                break;
+            }
+        }
+        Ok::<_, io::Error>(())
+    })
+    .await;
+    match result {
+        // Older clients request stop by connecting without a payload.
+        Err(_) => request.is_empty(),
+        Ok(Ok(())) => request == format!("stop {session_id}\n").as_bytes(),
+        Ok(Err(_)) => false,
+    }
+}
+
+#[cfg(unix)]
 #[tracing::instrument(skip_all, fields(interface = %running.interface_name, backend = "userspace", operation = "wait_for_shutdown"))]
 async fn wait_for_shutdown(
     running: &RunningDevice,
@@ -400,11 +460,11 @@ async fn wait_for_shutdown(
 ) -> anyhow::Result<Option<tokio::net::UnixStream>> {
     let mut ticker = tokio::time::interval(Duration::from_secs(5));
     loop {
-        tokio::select! {
+        let accepted = tokio::select! {
             biased;
             _ = sigint.recv() => return Ok(None),
             _ = sigterm.recv() => return Ok(None),
-            result = listener.accept() => return result.map(|(stream, _)| Some(stream)).context("helper stop listener failed"),
+            result = listener.accept() => Some(result.context("helper stop listener failed")?.0),
             _ = ticker.tick() => {
                 if !running.control_socket_path.exists() { return Ok(None); }
                 #[cfg(target_os = "linux")]
@@ -414,8 +474,8 @@ async fn wait_for_shutdown(
                     biased;
                     _ = sigint.recv() => return Ok(None),
                     _ = sigterm.recv() => return Ok(None),
-                    result = listener.accept() => return result.map(|(stream, _)| Some(stream)).context("helper stop listener failed"),
-                    result = diagnostic => match result {
+                    result = listener.accept() => Some(result.context("helper stop listener failed")?.0),
+                    result = diagnostic => { match result {
                         Ok(peers) => {
                             let (rx_bytes, tx_bytes) = peers.iter().fold((0u64, 0u64), |(rx, tx), peer| {
                                 (rx.saturating_add(peer.stats.rx_bytes as u64), tx.saturating_add(peer.stats.tx_bytes as u64))
@@ -423,8 +483,32 @@ async fn wait_for_shutdown(
                             tracing::debug!(interface = running.control_interface_name, rx_bytes, tx_bytes, "userspace_helper_statistics");
                         }
                         Err(_) => tracing::debug!(interface = running.control_interface_name, "userspace_helper_statistics_timeout"),
-                    }
+                    }; None }
                 }
+            }
+        };
+        if let Some(mut stream) = accepted {
+            // Once accepted, diagnostics cannot cancel a partially read stop
+            // request. Signals still interrupt its bounded identity handshake.
+            let matches = tokio::select! {
+                biased;
+                _ = sigint.recv() => return Ok(None),
+                _ = sigterm.recv() => return Ok(None),
+                matches = stop_request_matches(&mut stream, &running.session_id, Duration::from_secs(1)) => matches,
+            };
+            if matches {
+                return Ok(Some(stream));
+            }
+            use tokio::io::AsyncWriteExt;
+            let reject = tokio::time::timeout(
+                Duration::from_secs(1),
+                stream.write_all(b"error: session identity mismatch or invalid stop request\n"),
+            );
+            tokio::select! {
+                biased;
+                _ = sigint.recv() => return Ok(None),
+                _ = sigterm.recv() => return Ok(None),
+                _ = reject => {},
             }
         }
     }
@@ -442,7 +526,9 @@ fn parse_config_from_env() -> anyhow::Result<Option<ParsedUserspaceConfig>> {
         .decode(encoded)
         .context("failed to decode userspace WireGuard config")?;
     let text = String::from_utf8(bytes).context("userspace WireGuard config is not UTF-8")?;
-    parse_wg_quick_config(&text).map(Some)
+    let mut parsed = parse_wg_quick_config(&text)?;
+    parsed.allow_lan = std::env::var("TUNMUX_ALLOW_LAN").is_ok_and(|s| s == "1");
+    Ok(Some(parsed))
 }
 
 #[cfg(unix)]
@@ -457,6 +543,7 @@ fn parse_wg_quick_config(config: &str) -> anyhow::Result<ParsedUserspaceConfig> 
         .as_deref()
         .ok_or_else(|| anyhow::anyhow!("missing Peer.Endpoint"))?;
     Ok(ParsedUserspaceConfig {
+        allow_lan: false,
         private_key: decode_key32("PrivateKey", &parsed.private_key)?,
         mtu: parsed.mtu,
         addresses: parsed.addresses,
@@ -591,6 +678,31 @@ pub fn recover_stopped(interface: &str) -> anyhow::Result<()> {
 #[cfg(all(test, unix))]
 mod lifecycle_tests {
     use super::*;
+
+    #[tokio::test]
+    async fn test_stop_request_requires_matching_session_identity() {
+        use tokio::io::AsyncWriteExt;
+        let (mut client, mut server) = tokio::net::UnixStream::pair().unwrap();
+        client.write_all(b"stop previous-session\n").await.unwrap();
+        assert!(
+            !stop_request_matches(&mut server, "current-session", Duration::from_millis(20)).await
+        );
+        let (mut client, mut server) = tokio::net::UnixStream::pair().unwrap();
+        client.write_all(b"stop current-session\n").await.unwrap();
+        assert!(
+            stop_request_matches(&mut server, "current-session", Duration::from_millis(20)).await
+        );
+    }
+
+    #[tokio::test]
+    async fn test_partial_stop_request_cannot_fall_back_to_legacy_stop() {
+        use tokio::io::AsyncWriteExt;
+        let (mut client, mut server) = tokio::net::UnixStream::pair().unwrap();
+        client.write_all(b"stop ").await.unwrap();
+        assert!(!stop_request_matches(&mut server, "current", Duration::from_millis(20)).await);
+        let (_client, mut server) = tokio::net::UnixStream::pair().unwrap();
+        assert!(stop_request_matches(&mut server, "current", Duration::from_millis(20)).await);
+    }
 
     #[test]
     fn test_daemon_stdio_child() {

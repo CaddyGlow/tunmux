@@ -294,10 +294,64 @@ impl PrivilegedClient {
         interface: &str,
         config_content: &str,
     ) -> Result<()> {
+        self.gotatun_run_for_session(action, interface, config_content, None)
+    }
+
+    pub fn gotatun_run_for_session(
+        &self,
+        action: GotaTunAction,
+        interface: &str,
+        config_content: &str,
+        session_id: Option<&str>,
+    ) -> Result<()> {
         self.send_unit(PrivilegedRequest::GotaTunRun {
+            session_id: session_id.map(str::to_owned),
             action,
             interface: interface.to_string(),
             config_content: config_content.to_string(),
+        })
+    }
+
+    pub fn gotatun_start_session(&self, interface: &str, config_content: &str) -> Result<String> {
+        if crate::automation::active_spec().is_some_and(|s| s.allow_lan())
+            && !matches!(self.send(PrivilegedRequest::Capabilities), Ok(PrivilegedResponse::Text(capabilities)) if capabilities.split_whitespace().any(|c| c == "lan-policy-v1"))
+        {
+            return Err(AppError::Other(
+                "privileged service lacks LAN policy support; reload it before connecting".into(),
+            ));
+        }
+        match self.send(PrivilegedRequest::StartSession {
+            allow_lan: crate::automation::active_spec().is_some_and(|s| s.allow_lan()),
+            interface: interface.into(),
+            config_content: config_content.into(),
+        })? {
+            PrivilegedResponse::Session(result) if result.health == crate::privileged_api::SessionHealthKind::Active => {
+                result.session_id.ok_or_else(|| AppError::Other("started helper omitted session identity".into()))
+            }
+            _ => Err(AppError::Other("helper startup identity unavailable; restart the privileged service before retrying".into())),
+        }
+    }
+
+    pub fn inspect_session(
+        &self,
+        interface: &str,
+        session_id: Option<&str>,
+    ) -> Result<crate::privileged_api::SessionInspection> {
+        match self.send(PrivilegedRequest::InspectSession {
+            interface: interface.into(),
+            session_id: session_id.map(str::to_owned),
+        })? {
+            PrivilegedResponse::Session(result) => Ok(result),
+            _ => Err(AppError::Other(
+                "invalid privileged session response".into(),
+            )),
+        }
+    }
+
+    pub fn recover_session(&self, interface: &str, session_id: &str) -> Result<()> {
+        self.send_unit(PrivilegedRequest::RecoverSession {
+            interface: interface.into(),
+            session_id: session_id.into(),
         })
     }
 

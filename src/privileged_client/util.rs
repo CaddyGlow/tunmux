@@ -19,6 +19,7 @@ pub(crate) fn shell_quote(value: &str) -> String {
 
 pub(crate) fn request_kind(request: &PrivilegedRequest) -> &'static str {
     match request {
+        PrivilegedRequest::Capabilities => "Capabilities",
         PrivilegedRequest::NamespaceCreate { .. } => "NamespaceCreate",
         PrivilegedRequest::NamespaceDelete { .. } => "NamespaceDelete",
         PrivilegedRequest::NamespaceExists { .. } => "NamespaceExists",
@@ -45,6 +46,9 @@ pub(crate) fn request_kind(request: &PrivilegedRequest) -> &'static str {
         PrivilegedRequest::LeaseAcquire { .. } => "LeaseAcquire",
         PrivilegedRequest::LeaseRelease { .. } => "LeaseRelease",
         PrivilegedRequest::ShutdownIfIdle => "ShutdownIfIdle",
+        PrivilegedRequest::InspectSession { .. } => "InspectSession",
+        PrivilegedRequest::StartSession { .. } => "StartSession",
+        PrivilegedRequest::RecoverSession { .. } => "RecoverSession",
         PrivilegedRequest::WgShow { .. } => "WgShow",
     }
 }

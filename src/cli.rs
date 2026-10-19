@@ -3,6 +3,14 @@ use clap::{Args, Parser, Subcommand, ValueEnum};
 /// Common connect options shared across VPN providers.
 #[derive(Args, Clone, Debug)]
 pub struct ConnectOptions {
+    /// Succeed without reconnecting when this exact source is already active
+    #[arg(long)]
+    pub if_missing: bool,
+
+    /// Bypass directly attached LAN networks (macOS helper direct mode only)
+    #[arg(long)]
+    pub allow_lan: bool,
+
     /// Select the WireGuard implementation for this connection
     ///
     /// Accepts kernel, userspace, or wg-quick. Overrides general.backend in config.toml; the
@@ -96,6 +104,16 @@ pub struct Cli {
 
 #[derive(Subcommand)]
 pub enum TopCommand {
+    /// Install and manage the macOS privileged service
+    Service {
+        #[command(subcommand)]
+        command: ServiceCommand,
+    },
+    /// Manage opt-in desired connections
+    Autoconnect {
+        #[command(subcommand)]
+        command: AutoconnectCommand,
+    },
     /// Proton VPN commands
     #[cfg(feature = "proton")]
     Proton {
@@ -575,6 +593,20 @@ pub struct IvpnConnectArgs {
 #[cfg(feature = "wgconf")]
 #[derive(Args, Clone)]
 pub struct WgconfConnectArgs {
+    /// Stable SOCKS5 port for proxy mode
+    #[arg(long)]
+    pub socks_port: Option<u16>,
+    /// Stable HTTP port for proxy mode
+    #[arg(long)]
+    pub http_port: Option<u16>,
+    /// Succeed when this exact source is already active
+    #[arg(long)]
+    pub if_missing: bool,
+
+    /// Bypass directly attached LAN networks (macOS helper direct mode only)
+    #[arg(long)]
+    pub allow_lan: bool,
+
     /// Read a WireGuard .conf file from this path
     ///
     /// For connect, supply exactly one of --file and --profile. The file is read from disk
@@ -1987,4 +2019,56 @@ mod tests {
             providers.iter().any(|(_, enabled)| *enabled)
         );
     }
+}
+
+#[derive(Subcommand)]
+pub enum ServiceCommand {
+    /// Install the root service; requires root
+    Install {
+        #[arg(long, default_value = "/usr/local/libexec/tunmux")]
+        binary_path: std::path::PathBuf,
+        #[arg(long, default_value = "admin")]
+        authorized_group: String,
+        /// Login user whose sessions are managed during reload/uninstall
+        #[arg(long)]
+        user: Option<u32>,
+        /// User tunmux configuration directory (defaults to that user's ~/.config/tunmux)
+        #[arg(long)]
+        config_dir: Option<std::path::PathBuf>,
+    },
+    /// Disconnect managed sessions and reload the service
+    Reload,
+    /// Report installation, launchd, socket, and recovery state
+    Diagnose,
+    /// Disconnect and remove installed service artifacts; requires root
+    Uninstall,
+}
+
+#[derive(Subcommand)]
+pub enum AutoconnectCommand {
+    /// Persist a desired connection and install the login agent
+    Enable {
+        name: String,
+        /// Persist desired state without installing the login agent
+        #[arg(long)]
+        no_login_agent: bool,
+        /// A connect command, for example: -- connect wgconf --profile work
+        #[arg(last = true, required = true)]
+        args: Vec<String>,
+    },
+    /// Suspend entries until explicitly resumed
+    Disable {
+        name: Option<String>,
+        #[arg(long, conflicts_with = "name", required_unless_present = "name")]
+        all: bool,
+    },
+    /// Resume entries and reset retry exhaustion
+    Resume {
+        name: Option<String>,
+        #[arg(long, conflicts_with = "name", required_unless_present = "name")]
+        all: bool,
+    },
+    Status,
+    /// Run the reconnect controller in the foreground
+    Run,
 }

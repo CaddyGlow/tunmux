@@ -174,6 +174,52 @@ mod tests {
     }
 
     #[test]
+    fn test_helper_config_round_trip_preserves_target_filter() {
+        let config =
+            LoggingConfig::resolve(false, Some("warn,tunmux=trace,gotatun=error")).unwrap();
+        let encoded = serde_json::to_vec(&config).unwrap();
+        let decoded: LoggingConfig = serde_json::from_slice(&encoded).unwrap();
+        assert_eq!(decoded.filter, config.filter);
+    }
+
+    #[test]
+    fn test_target_filter_suppresses_dependency_debug_events() {
+        #[derive(Clone)]
+        struct Output(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+        impl std::io::Write for Output {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let output = Output(Default::default());
+        let (writer, worker) = tracing_appender::non_blocking(output.clone());
+        let guard = LoggingGuard {
+            _worker: Some(worker),
+        };
+        let config = LoggingConfig::resolve(true, None).unwrap();
+        let subscriber = tracing_subscriber::fmt()
+            .with_env_filter(EnvFilter::try_new(config.filter).unwrap())
+            .with_ansi(false)
+            .with_writer(writer)
+            .finish();
+        tracing::subscriber::with_default(subscriber, || {
+            tracing::debug!(target: "tunmux::helper", "helper_debug_marker");
+            tracing::debug!(target: "dependency", "dependency_debug_marker");
+            tracing::warn!(target: "dependency", "dependency_warning_marker");
+        });
+        drop(guard);
+        let bytes = output.0.lock().unwrap();
+        let text = String::from_utf8_lossy(&bytes);
+        assert!(text.contains("helper_debug_marker"));
+        assert!(text.contains("dependency_warning_marker"));
+        assert!(!text.contains("dependency_debug_marker"));
+    }
+
+    #[test]
     fn test_invalid_filter_is_reported() {
         assert!(LoggingConfig::resolve(false, Some("tunmux=not_a_level")).is_err());
     }

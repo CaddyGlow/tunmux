@@ -2,7 +2,7 @@ use super::ParsedUserspaceConfig;
 use anyhow::Context;
 use nix::fcntl::{fcntl, FcntlArg, Flock, FlockArg, OFlag};
 use nix::libc;
-use std::io::{Read, Write};
+use std::io::Read;
 use std::net::IpAddr;
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
@@ -20,7 +20,7 @@ struct LinuxRoute {
 }
 
 #[cfg(target_os = "macos")]
-#[derive(Clone, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 struct MacosRoute {
     is_ipv6: bool,
     destination: String,
@@ -136,6 +136,7 @@ fn configure_network_linux(
         run_command("ip", &["addr", "add", address, "dev", interface])?;
     }
     if let Some(mtu) = config.mtu {
+        budget.check()?;
         run_command(
             "ip",
             &[
@@ -148,6 +149,7 @@ fn configure_network_linux(
             ],
         )?;
     }
+    budget.check()?;
     run_command("ip", &["link", "set", "up", "dev", interface])?;
     budget.check()?;
     let endpoint = match config.endpoint.ip() {
@@ -177,6 +179,7 @@ fn configure_network_linux(
             continue;
         }
         state.push(Action::LinuxRoute(route.clone()))?;
+        budget.check()?;
         if !add_linux_route(&route)? {
             state.actions.pop();
             state.persist()?;
@@ -195,6 +198,7 @@ fn configure_network_linux(
             original,
             intended: intended.clone(),
         })?;
+        budget.check()?;
         std::fs::write("/etc/resolv.conf", intended).context("cannot set resolver")?;
     }
     Ok(())
@@ -386,6 +390,7 @@ fn configure_network_macos(
         match ip {
             IpAddr::V4(addr) => {
                 let ip_string = addr.to_string();
+                budget.check()?;
                 run_command(
                     "ifconfig",
                     &[interface, "inet", address, ip_string.as_str(), "alias"],
@@ -394,6 +399,7 @@ fn configure_network_macos(
             IpAddr::V6(addr) => {
                 let ip_string = addr.to_string();
                 let prefix_string = prefix.to_string();
+                budget.check()?;
                 run_command(
                     "ifconfig",
                     &[
@@ -409,9 +415,12 @@ fn configure_network_macos(
         }
     }
     if let Some(mtu) = config.mtu {
+        budget.check()?;
         run_command("ifconfig", &[interface, "mtu", &mtu.get().to_string()])?;
     }
+    budget.check()?;
     run_command("ifconfig", &[interface, "up"])?;
+    budget.check()?;
     if let Err(error) = run_command("ifconfig", &[interface, "-rxcsum", "-txcsum"]) {
         warn!(
             interface,
@@ -423,15 +432,18 @@ fn configure_network_macos(
     budget.check()?;
     let endpoint_is_ipv6 = matches!(config.endpoint.ip(), IpAddr::V6(_));
     if !endpoint_is_ipv6 || has_ipv6_address {
-        if let Some(default_gateway) = get_macos_default_gateway(endpoint_is_ipv6)? {
+        if let Some((default_gateway, default_interface)) =
+            get_macos_default_route(endpoint_is_ipv6)?
+        {
             let endpoint_route = MacosRoute {
                 is_ipv6: endpoint_is_ipv6,
                 destination: config.endpoint.ip().to_string(),
-                interface: None,
+                interface: Some(default_interface),
                 gateway: Some(default_gateway),
             };
             if !macos_route_present(&endpoint_route)? {
                 state.push(Action::MacosRoute(endpoint_route.clone()))?;
+                budget.check()?;
                 if !add_macos_route(&endpoint_route)? {
                     state.actions.pop();
                     state.persist()?;
@@ -440,12 +452,33 @@ fn configure_network_macos(
         }
     }
 
-    for route in macos_allowed_routes(config, interface, has_ipv4_address, has_ipv6_address) {
+    let original = macos_allowed_routes(config, interface, has_ipv4_address, has_ipv6_address);
+    let planned = if config.allow_lan {
+        let policy = LanPolicy {
+            interface: interface.into(),
+            original,
+            dns: config.dns_servers.clone(),
+        };
+        let planned = lan_routes(&policy)?;
+        state.lan = Some(policy);
+        state.persist()?;
+        planned
+    } else {
+        original
+    };
+    for route in planned {
         budget.check()?;
-        if macos_route_present(&route)? {
-            continue;
+        match macos_route_status(&route)? {
+            Some(true) => continue,
+            Some(false) if !config.allow_lan => continue,
+            Some(false) => anyhow::bail!(
+                "LAN policy route ownership conflict for {}",
+                route.destination
+            ),
+            None => {}
         }
         state.push(Action::MacosRoute(route.clone()))?;
+        budget.check()?;
         if !add_macos_route(&route)? {
             state.actions.pop();
             state.persist()?;
@@ -453,6 +486,7 @@ fn configure_network_macos(
     }
 
     if !config.dns_servers.is_empty() {
+        budget.check()?;
         for service in list_macos_network_services()? {
             budget.check()?;
             let original = get_macos_dns_servers(&service)?;
@@ -462,7 +496,9 @@ fn configure_network_macos(
                 intended: Some(config.dns_servers.clone()),
                 search: false,
             })?;
+            budget.check()?;
             set_macos_dns_servers(&service, &config.dns_servers)?;
+            budget.check()?;
             let original = get_macos_search_domains(&service)?;
             state.push(Action::MacosDns {
                 service: service.clone(),
@@ -470,6 +506,7 @@ fn configure_network_macos(
                 intended: None,
                 search: true,
             })?;
+            budget.check()?;
             set_macos_search_domains_empty(&service)?;
         }
     }
@@ -577,7 +614,14 @@ fn add_macos_route(route: &MacosRoute) -> anyhow::Result<bool> {
         args.push(gateway.clone());
     }
     if let Some(interface) = &route.interface {
-        args.push("-interface".into());
+        args.push(
+            if route.gateway.is_some() {
+                "-ifp"
+            } else {
+                "-interface"
+            }
+            .into(),
+        );
         args.push(interface.clone());
     }
     let refs: Vec<&str> = args.iter().map(String::as_str).collect();
@@ -593,7 +637,14 @@ fn del_macos_route(route: &MacosRoute) -> anyhow::Result<()> {
         args.push(gateway.clone());
     }
     if let Some(interface) = &route.interface {
-        args.push("-interface".into());
+        args.push(
+            if route.gateway.is_some() {
+                "-ifp"
+            } else {
+                "-interface"
+            }
+            .into(),
+        );
         args.push(interface.clone());
     }
     let refs: Vec<&str> = args.iter().map(String::as_str).collect();
@@ -664,7 +715,7 @@ fn macos_allowed_routes(
 }
 
 #[cfg(target_os = "macos")]
-fn get_macos_default_gateway(is_ipv6: bool) -> anyhow::Result<Option<String>> {
+fn get_macos_default_route(is_ipv6: bool) -> anyhow::Result<Option<(String, String)>> {
     let mut args = vec!["-n", "get"];
     if is_ipv6 {
         args.push("-inet6");
@@ -680,15 +731,16 @@ fn get_macos_default_gateway(is_ipv6: bool) -> anyhow::Result<Option<String>> {
         anyhow::bail!("route -n get default failed");
     }
     let text = String::from_utf8_lossy(&output.stdout);
-    for line in text.lines() {
-        if let Some(value) = line.trim().strip_prefix("gateway:") {
-            return Ok(Some(value.trim().to_string()));
+    let field = |key: &str| {
+        text.lines()
+            .find_map(|line| line.trim().strip_prefix(key).map(|s| s.trim().to_owned()))
+    };
+    match (field("gateway:"), field("interface:")) {
+        (Some(gateway), Some(interface)) if !interface.starts_with("utun") => {
+            Ok(Some((gateway, interface)))
         }
-    }
-    if is_ipv6 {
-        Ok(None)
-    } else {
-        anyhow::bail!("default gateway not found")
+        _ if is_ipv6 => Ok(None),
+        _ => anyhow::bail!("no settled physical default route"),
     }
 }
 
@@ -710,7 +762,7 @@ fn parse_cidr(value: &str) -> anyhow::Result<(IpAddr, u8)> {
 enum Action {
     #[cfg(target_os = "linux")]
     LinuxRoute(LinuxRoute),
-    #[cfg(target_os = "linux")]
+    #[cfg(any(test, target_os = "linux"))]
     Resolver {
         path: PathBuf,
         original: String,
@@ -729,11 +781,16 @@ enum Action {
 
 #[derive(serde::Serialize, serde::Deserialize)]
 pub(super) struct Journal {
+    #[cfg(target_os = "macos")]
+    #[serde(default)]
+    lan: Option<LanPolicy>,
     version: u32,
     owner: String,
     actions: Vec<Action>,
     #[serde(skip)]
     path: PathBuf,
+    #[serde(skip)]
+    pending_gateways: std::collections::HashMap<usize, String>,
 }
 
 pub(super) enum CleanupState {
@@ -753,7 +810,7 @@ fn journal_path(owner: &str) -> anyhow::Result<PathBuf> {
 }
 
 pub(super) type SessionLock = std::sync::Arc<Flock<std::fs::File>>;
-fn lock(owner: &str) -> anyhow::Result<SessionLock> {
+pub(super) fn lock(owner: &str) -> anyhow::Result<SessionLock> {
     std::fs::create_dir_all(super::SOCK_DIR)?;
     let path = journal_path(owner)?.with_extension("lock");
     let file = std::fs::OpenOptions::new()
@@ -773,38 +830,58 @@ fn lock(owner: &str) -> anyhow::Result<SessionLock> {
 
 impl Journal {
     fn persist(&self) -> anyhow::Result<()> {
-        let tmp = self
-            .path
-            .with_extension(format!("{}.tmp", std::process::id()));
-        let mut file = std::fs::OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .mode(0o600)
-            .custom_flags(libc::O_NOFOLLOW)
-            .open(&tmp)?;
-        file.write_all(&serde_json::to_vec(self)?)?;
-        file.sync_all()?;
-        std::fs::rename(tmp, &self.path)?;
-        if let Some(parent) = self.path.parent() {
-            std::fs::File::open(parent)?.sync_all()?;
-        }
+        crate::shared::persistence::write_private_atomic(&self.path, &serde_json::to_vec(self)?)?;
         Ok(())
     }
     fn push(&mut self, action: Action) -> anyhow::Result<()> {
         self.actions.push(action);
-        self.persist()
+        if let Err(error) = self.persist() {
+            self.actions.pop();
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    fn replace_action(&mut self, index: usize, action: Action) -> anyhow::Result<()> {
+        let previous = std::mem::replace(&mut self.actions[index], action);
+        if let Err(error) = self.persist() {
+            // Never let a subsequent reconciliation tick apply an intent that
+            // did not complete its checkpoint. Retrying must persist it again.
+            self.actions[index] = previous;
+            return Err(error);
+        }
+        Ok(())
     }
 }
 
-pub(super) fn recover_network(owner: &str) -> anyhow::Result<SessionLock> {
+pub(super) fn recover_network_cancellable(
+    owner: &str,
+    cancelled: &std::sync::atomic::AtomicBool,
+) -> anyhow::Result<SessionLock> {
+    let budget = SetupBudget {
+        deadline: Instant::now() + Duration::from_secs(20),
+        cancelled,
+    };
+    budget.check()?;
     let lock = lock(owner)?;
     ensure_stopped(owner)?;
-    recover_locked(owner)?;
+    recover_locked_with(owner, &budget)?;
     Ok(lock)
 }
 
-fn recover_locked(owner: &str) -> anyhow::Result<()> {
+pub(super) fn recover_locked(owner: &str) -> anyhow::Result<()> {
+    let cancelled = std::sync::atomic::AtomicBool::new(false);
+    recover_locked_with(
+        owner,
+        &SetupBudget {
+            deadline: Instant::now() + Duration::from_secs(20),
+            cancelled: &cancelled,
+        },
+    )
+}
+
+fn recover_locked_with(owner: &str, budget: &SetupBudget<'_>) -> anyhow::Result<()> {
+    budget.check()?;
     let path = journal_path(owner)?;
     let data = match std::fs::read(&path) {
         Ok(data) => data,
@@ -818,7 +895,9 @@ fn recover_locked(owner: &str) -> anyhow::Result<()> {
         "unsupported or mismatched network journal"
     );
     journal.path = path;
-    rollback(&mut journal)
+    rollback_with(&mut journal, budget, |action| {
+        restore_checked(action, Some(budget))
+    })
 }
 
 struct SetupBudget<'a> {
@@ -829,11 +908,11 @@ impl SetupBudget<'_> {
     fn check(&self) -> anyhow::Result<()> {
         anyhow::ensure!(
             !self.cancelled.load(std::sync::atomic::Ordering::Acquire),
-            "network setup cancelled"
+            "network operation cancelled"
         );
         anyhow::ensure!(
             Instant::now() < self.deadline,
-            "network setup deadline exceeded"
+            "network operation deadline exceeded"
         );
         Ok(())
     }
@@ -851,10 +930,13 @@ pub(super) fn configure_network(
     };
     budget.check()?;
     let mut journal = Journal {
+        #[cfg(target_os = "macos")]
+        lan: None,
         version: 1,
         owner: owner.to_string(),
         actions: Vec::new(),
         path: journal_path(owner)?,
+        pending_gateways: Default::default(),
     };
     journal.persist()?;
     #[cfg(target_os = "linux")]
@@ -880,23 +962,42 @@ pub(super) fn cleanup_network(state: &CleanupState) -> anyhow::Result<()> {
         return Ok(());
     };
     let mut journal = Journal {
+        #[cfg(target_os = "macos")]
+        lan: journal.lan.clone(),
         version: journal.version,
         owner: journal.owner.clone(),
         actions: journal.actions.clone(),
         path: journal.path.clone(),
+        pending_gateways: Default::default(),
     };
     rollback(&mut journal)
 }
 
 fn rollback(journal: &mut Journal) -> anyhow::Result<()> {
-    let deadline = Instant::now() + Duration::from_secs(20);
+    let cancelled = std::sync::atomic::AtomicBool::new(false);
+    let budget = SetupBudget {
+        deadline: Instant::now() + Duration::from_secs(20),
+        cancelled: &cancelled,
+    };
+    rollback_with(journal, &budget, |action| {
+        restore_checked(action, Some(&budget))
+    })
+}
+
+// Keep effects injectable at the transactional boundary: checkpointing and retries
+// follow the same production path even when a restoration command fails.
+fn rollback_with(
+    journal: &mut Journal,
+    budget: &SetupBudget<'_>,
+    mut restore_effect: impl FnMut(&Action) -> anyhow::Result<()>,
+) -> anyhow::Result<()> {
     let mut errors = Vec::new();
     for index in (0..journal.actions.len()).rev() {
-        if Instant::now() >= deadline {
-            errors.push("network restoration deadline exceeded".to_string());
+        if let Err(error) = budget.check() {
+            errors.push(error.to_string());
             break;
         }
-        match restore(&journal.actions[index]) {
+        match restore_effect(&journal.actions[index]) {
             Ok(()) => {
                 journal.actions.remove(index);
                 if let Err(error) = journal.persist() {
@@ -918,7 +1019,14 @@ fn rollback(journal: &mut Journal) -> anyhow::Result<()> {
     }
 }
 
+#[cfg(test)]
 fn restore(action: &Action) -> anyhow::Result<()> {
+    restore_checked(action, None)
+}
+
+fn restore_checked(action: &Action, budget: Option<&SetupBudget<'_>>) -> anyhow::Result<()> {
+    let check = || budget.map_or(Ok(()), SetupBudget::check);
+    check()?;
     match action {
         #[cfg(target_os = "linux")]
         Action::LinuxRoute(route) => {
@@ -931,6 +1039,7 @@ fn restore(action: &Action) -> anyhow::Result<()> {
                 "route ownership conflict for {}",
                 route.destination
             );
+            check()?;
             ignore_missing_route(del_linux_route(route))
         }
         #[cfg(target_os = "macos")]
@@ -940,9 +1049,10 @@ fn restore(action: &Action) -> anyhow::Result<()> {
                 Some(false) => anyhow::bail!("route ownership conflict for {}", route.destination),
                 Some(true) => {}
             }
+            check()?;
             ignore_missing_route(del_macos_route(route))
         }
-        #[cfg(target_os = "linux")]
+        #[cfg(any(test, target_os = "linux"))]
         Action::Resolver {
             path,
             original,
@@ -956,6 +1066,7 @@ fn restore(action: &Action) -> anyhow::Result<()> {
                 &current == intended,
                 "resolver ownership conflict; preserving current DNS"
             );
+            check()?;
             std::fs::write(path, original)?;
             Ok(())
         }
@@ -978,6 +1089,7 @@ fn restore(action: &Action) -> anyhow::Result<()> {
                 &current == intended,
                 "DNS ownership conflict on {service}; preserving current settings"
             );
+            check()?;
             match (search, original) {
                 (true, Some(values)) => set_macos_search_domains(service, values),
                 (true, None) => set_macos_search_domains_empty(service),
@@ -1067,9 +1179,17 @@ fn macos_route_status(route: &MacosRoute) -> anyhow::Result<Option<bool>> {
 
 #[cfg(any(test, target_os = "macos"))]
 fn normalized_macos_destination(value: &str) -> Option<(IpAddr, u8)> {
-    let (address, prefix) = value
-        .split_once('/')
-        .unwrap_or((value, if value.contains(':') { "128" } else { "32" }));
+    let inferred;
+    let (address, prefix) = if let Some(parts) = value.split_once('/') {
+        parts
+    } else {
+        inferred = if value.contains(':') {
+            "128".to_string()
+        } else {
+            (value.split('.').count() * 8).to_string()
+        };
+        (value, inferred.as_str())
+    };
     let address = if !address.contains(':') && address != "default" {
         let mut parts = address.split('.').map(str::to_string).collect::<Vec<_>>();
         while parts.len() < 4 {
@@ -1082,41 +1202,73 @@ fn normalized_macos_destination(value: &str) -> Option<(IpAddr, u8)> {
     Some((address.parse().ok()?, prefix.parse().ok()?))
 }
 
-pub(super) fn reconcile_network(state: &mut CleanupState) -> anyhow::Result<()> {
+// A changed gateway must survive two polling observations before replacing
+// an endpoint route. Pending observations are transient, never recovery intent.
+fn gateway_settled(journal: &mut Journal, index: usize, observation: String) -> bool {
+    let settled = journal.pending_gateways.get(&index) == Some(&observation);
+    journal.pending_gateways.insert(index, observation);
+    settled
+}
+
+pub(super) fn reconcile_network_cancellable(
+    state: &mut CleanupState,
+    cancelled: &std::sync::atomic::AtomicBool,
+) -> anyhow::Result<()> {
+    let budget = SetupBudget {
+        deadline: Instant::now() + Duration::from_secs(10),
+        cancelled,
+    };
+    budget.check()?;
     let CleanupState::Active { journal } = state else {
         return Ok(());
     };
-    let deadline = Instant::now() + Duration::from_secs(10);
+    #[cfg(target_os = "macos")]
+    reconcile_lan(journal, &budget)?;
     for index in 0..journal.actions.len() {
-        anyhow::ensure!(
-            Instant::now() < deadline,
-            "network reconciliation deadline exceeded"
-        );
+        budget.check()?;
         match journal.actions[index].clone() {
             #[cfg(target_os = "linux")]
             Action::LinuxRoute(mut route) => {
                 if route.via.is_some() {
-                    let default = if route.is_ipv6 {
-                        get_linux_default_route_v6().context("no settled IPv6 default gateway")?
+                    let observed = if route.is_ipv6 {
+                        get_linux_default_route_v6().context("no settled IPv6 default gateway")
                     } else {
-                        get_linux_default_route_v4()?
+                        get_linux_default_route_v4()
+                    };
+                    let default = match observed {
+                        Ok(default) => default,
+                        Err(error) => {
+                            journal.pending_gateways.remove(&index);
+                            return Err(error);
+                        }
                     };
                     if route.via.as_deref() != Some(default.gateway.as_str())
                         || route.dev.as_deref() != Some(default.dev.as_str())
                     {
-                        restore(&journal.actions[index])?;
+                        if !gateway_settled(
+                            journal,
+                            index,
+                            format!("{}@{}", default.gateway, default.dev),
+                        ) {
+                            continue;
+                        }
+                        budget.check()?;
+                        restore_checked(&journal.actions[index], Some(&budget))?;
+                        budget.check()?;
                         route.via = Some(default.gateway);
                         route.dev = Some(default.dev);
                         anyhow::ensure!(
                             linux_route_observation(&route)?.is_empty(),
                             "endpoint route ownership conflict after gateway change"
                         );
-                        journal.actions[index] = Action::LinuxRoute(route.clone());
-                        journal.persist()?;
+                        journal.replace_action(index, Action::LinuxRoute(route.clone()))?;
                     }
+                    journal.pending_gateways.remove(&index);
                 }
+                budget.check()?;
                 let current = linux_route_observation(&route)?;
                 if current.is_empty() {
+                    budget.check()?;
                     add_linux_route(&route)?;
                 } else {
                     anyhow::ensure!(
@@ -1128,28 +1280,47 @@ pub(super) fn reconcile_network(state: &mut CleanupState) -> anyhow::Result<()> 
             #[cfg(target_os = "macos")]
             Action::MacosRoute(mut route) => {
                 if route.gateway.is_some() {
-                    let gateway = get_macos_default_gateway(route.is_ipv6)?
-                        .context("no settled default gateway")?;
-                    if route.gateway.as_deref() != Some(gateway.as_str()) {
-                        restore(&journal.actions[index])?;
+                    let (gateway, interface) = match get_macos_default_route(route.is_ipv6) {
+                        Ok(Some(default)) => default,
+                        Ok(None) => {
+                            journal.pending_gateways.remove(&index);
+                            continue;
+                        }
+                        Err(error) => {
+                            journal.pending_gateways.remove(&index);
+                            return Err(error);
+                        }
+                    };
+                    if route.gateway.as_deref() != Some(gateway.as_str())
+                        || route.interface.as_deref() != Some(interface.as_str())
+                    {
+                        if !gateway_settled(journal, index, format!("{gateway}@{interface}")) {
+                            continue;
+                        }
+                        budget.check()?;
+                        restore_checked(&journal.actions[index], Some(&budget))?;
+                        budget.check()?;
                         route.gateway = Some(gateway);
+                        route.interface = Some(interface);
                         anyhow::ensure!(
                             !macos_route_present(&route)?,
                             "endpoint route ownership conflict after gateway change"
                         );
-                        journal.actions[index] = Action::MacosRoute(route.clone());
-                        journal.persist()?;
+                        journal.replace_action(index, Action::MacosRoute(route.clone()))?;
                     }
+                    journal.pending_gateways.remove(&index);
                 }
+                budget.check()?;
                 match macos_route_status(&route)? {
                     None => {
+                        budget.check()?;
                         add_macos_route(&route)?;
                     }
                     Some(true) => {}
                     Some(false) => anyhow::bail!("route ownership conflict during reconciliation"),
                 }
             }
-            #[cfg(target_os = "linux")]
+            #[cfg(any(test, target_os = "linux"))]
             Action::Resolver { path, intended, .. } => {
                 anyhow::ensure!(
                     std::fs::read_to_string(path)? == intended,
@@ -1186,12 +1357,11 @@ pub(super) fn reconcile_network(state: &mut CleanupState) -> anyhow::Result<()> 
             _ => None,
         });
         if let Some(dns) = dns {
+            budget.check()?;
             for service in list_macos_network_services()? {
-                anyhow::ensure!(
-                    Instant::now() < deadline,
-                    "network reconciliation deadline exceeded"
-                );
+                budget.check()?;
                 for search in [false, true] {
+                    budget.check()?;
                     if journal.actions.iter().any(|action| matches!(action, Action::MacosDns { service: existing, search: existing_search, .. } if existing == &service && *existing_search == search)) { continue; }
                     let original = if search {
                         get_macos_search_domains(&service)?
@@ -1206,8 +1376,10 @@ pub(super) fn reconcile_network(state: &mut CleanupState) -> anyhow::Result<()> 
                         search,
                     })?;
                     if search {
+                        budget.check()?;
                         set_macos_search_domains_empty(&service)?;
                     } else {
+                        budget.check()?;
                         set_macos_dns_servers(&service, &dns)?;
                     }
                 }
@@ -1217,11 +1389,130 @@ pub(super) fn reconcile_network(state: &mut CleanupState) -> anyhow::Result<()> 
     Ok(())
 }
 
-#[cfg(all(test, target_os = "linux"))]
+pub(super) fn ensure_stopped(owner: &str) -> anyhow::Result<()> {
+    use nix::sys::socket::{connect, socket, AddressFamily, SockFlag, SockType, UnixAddr};
+    use std::os::fd::AsRawFd;
+    let path = Path::new(super::SOCK_DIR).join(format!("{owner}.sock"));
+    #[cfg(target_os = "macos")]
+    let flags = SockFlag::empty();
+    #[cfg(not(target_os = "macos"))]
+    let flags = SockFlag::SOCK_NONBLOCK | SockFlag::SOCK_CLOEXEC;
+    let socket = socket(AddressFamily::Unix, SockType::Stream, flags, None)?;
+    #[cfg(target_os = "macos")]
+    {
+        // macOS requires setting these properties after socket creation.
+        use nix::fcntl::{fcntl, FcntlArg, FdFlag, OFlag};
+        fcntl(&socket, FcntlArg::F_SETFD(FdFlag::FD_CLOEXEC))?;
+        fcntl(&socket, FcntlArg::F_SETFL(OFlag::O_NONBLOCK))?;
+    }
+    let address = UnixAddr::new(&path)?;
+    match connect(socket.as_raw_fd(), &address) {
+        Ok(()) => anyhow::bail!("control socket for {owner} is active; refusing network recovery"),
+        Err(nix::errno::Errno::ENOENT | nix::errno::Errno::ECONNREFUSED) => Ok(()),
+        Err(error) => {
+            Err(error).context("control socket ownership is unknown; refusing network recovery")
+        }
+    }
+}
+
+pub(super) fn recover_stopped_session(owner: &str) -> anyhow::Result<()> {
+    let _lock = lock(owner)?;
+    ensure_stopped(owner)?;
+    recover_locked(owner)?;
+    remove_stopped_endpoints(Path::new(super::SOCK_DIR), owner)
+}
+
+/// Call only after verifying the stopped owner while holding its session lock.
+pub(super) fn remove_stopped_endpoints(directory: &Path, owner: &str) -> anyhow::Result<()> {
+    for extension in ["sock", "stop"] {
+        let path = directory.join(format!("{owner}.{extension}"));
+        match std::fs::remove_file(path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
     static NEXT: AtomicUsize = AtomicUsize::new(0);
+
+    #[test]
+    fn stopped_recovery_removes_crash_endpoints_and_preserves_receipts() {
+        use std::os::unix::net::UnixListener;
+        let directory =
+            PathBuf::from("/tmp").join(format!("tmx-recovery-{:016x}", rand::random::<u64>()));
+        std::fs::create_dir(&directory).unwrap();
+        for endpoint in ["wg-test.sock", "wg-test.stop"] {
+            let listener = UnixListener::bind(directory.join(endpoint)).unwrap();
+            drop(listener); // A killed helper leaves these filesystem nodes behind.
+        }
+        for receipt in ["wg-test.session", "wg-test.recovery.lock", "other.sock"] {
+            std::fs::write(directory.join(receipt), "preserved").unwrap();
+        }
+        remove_stopped_endpoints(&directory, "wg-test").unwrap();
+        remove_stopped_endpoints(&directory, "wg-test").unwrap();
+        assert!(!directory.join("wg-test.sock").exists());
+        assert!(!directory.join("wg-test.stop").exists());
+        for receipt in ["wg-test.session", "wg-test.recovery.lock", "other.sock"] {
+            assert_eq!(
+                std::fs::read_to_string(directory.join(receipt)).unwrap(),
+                "preserved"
+            );
+        }
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    fn planned_destinations(allowed_ips: &[&str], ipv6: bool) -> Vec<String> {
+        let config = ParsedUserspaceConfig {
+            allow_lan: false,
+            private_key: [0; 32],
+            mtu: None,
+            addresses: vec!["10.0.0.2/32".into()],
+            dns_servers: vec![],
+            peer_public_key: [0; 32],
+            peer_preshared_key: None,
+            allowed_ips: allowed_ips.iter().map(|value| (*value).into()).collect(),
+            endpoint: "192.0.2.1:51820".parse().unwrap(),
+        };
+        #[cfg(target_os = "macos")]
+        let routes = macos_allowed_routes(&config, "vpn-test", true, ipv6);
+        #[cfg(target_os = "linux")]
+        let routes = linux_allowed_routes("vpn-test", &config, ipv6);
+        routes.into_iter().map(|route| route.destination).collect()
+    }
+
+    #[test]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    fn test_lan_overlap_preserves_explicit_allowed_ips_without_bypasses() {
+        let allowed = [
+            "192.168.0.0/16",
+            "192.168.1.0/24",
+            "fd00::/8",
+            "fd00:1::/64",
+        ];
+        assert_eq!(planned_destinations(&allowed, true), allowed);
+        assert_eq!(planned_destinations(&allowed, false), &allowed[..2]);
+    }
+
+    #[test]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    fn test_dual_stack_defaults_keep_existing_split_route_policy() {
+        let allowed = ["0.0.0.0/0", "::/0"];
+        assert_eq!(
+            planned_destinations(&allowed, true),
+            ["0.0.0.0/1", "128.0.0.0/1", "::/1", "8000::/1"]
+        );
+        assert_eq!(
+            planned_destinations(&allowed, false),
+            ["0.0.0.0/1", "128.0.0.0/1"]
+        );
+    }
     struct Fixture(PathBuf);
     impl Fixture {
         fn new() -> Self {
@@ -1235,10 +1526,13 @@ mod tests {
         }
         fn journal(&self) -> Journal {
             Journal {
+                #[cfg(target_os = "macos")]
+                lan: None,
                 version: 1,
                 owner: "test".into(),
                 path: self.0.join("recovery.json"),
                 actions: vec![],
+                pending_gateways: Default::default(),
             }
         }
         fn dns(&self, journal: &mut Journal, name: &str, current: &str) -> PathBuf {
@@ -1259,6 +1553,156 @@ mod tests {
             let _ = std::fs::remove_dir_all(&self.0);
         }
     }
+    #[test]
+    fn test_failed_action_replacement_keeps_previous_intent_until_retry_is_durable() {
+        let fixture = Fixture::new();
+        let mut journal = fixture.journal();
+        let path = fixture.dns(&mut journal, "dns", "owned");
+        let durable_path = journal.path.clone();
+        let before = serde_json::to_vec(&journal.actions).unwrap();
+        let replacement = Action::Resolver {
+            path,
+            original: "original".into(),
+            intended: "new-owned".into(),
+        };
+        // A missing parent deterministically fails the checkpoint before rename.
+        journal.path = fixture.0.join("missing-parent/recovery.json");
+        assert!(journal.replace_action(0, replacement.clone()).is_err());
+        assert_eq!(serde_json::to_vec(&journal.actions).unwrap(), before);
+        let reloaded: Journal =
+            serde_json::from_slice(&std::fs::read(&durable_path).unwrap()).unwrap();
+        assert_eq!(serde_json::to_vec(&reloaded.actions).unwrap(), before);
+        journal.path = durable_path;
+        journal.replace_action(0, replacement).unwrap();
+        let reloaded: Journal =
+            serde_json::from_slice(&std::fs::read(&journal.path).unwrap()).unwrap();
+        assert_eq!(
+            serde_json::to_vec(&journal.actions).unwrap(),
+            serde_json::to_vec(&reloaded.actions).unwrap()
+        );
+        assert_ne!(serde_json::to_vec(&journal.actions).unwrap(), before);
+    }
+
+    #[test]
+    fn test_failed_push_does_not_leave_uncheckpointed_intent_in_memory() {
+        let fixture = Fixture::new();
+        let mut journal = fixture.journal();
+        journal.persist().unwrap();
+        let durable_path = journal.path.clone();
+        journal.path = fixture.0.join("missing-parent/recovery.json");
+        assert!(journal
+            .push(Action::Resolver {
+                path: fixture.0.join("dns"),
+                original: "original".into(),
+                intended: "owned".into(),
+            })
+            .is_err());
+        assert!(journal.actions.is_empty());
+        let reloaded: Journal =
+            serde_json::from_slice(&std::fs::read(durable_path).unwrap()).unwrap();
+        assert!(reloaded.actions.is_empty());
+    }
+
+    #[test]
+    fn test_gateway_changes_require_two_matching_observations() {
+        let fixture = Fixture::new();
+        let mut journal = fixture.journal();
+        assert!(!gateway_settled(&mut journal, 0, "gateway-a".into()));
+        assert!(!gateway_settled(&mut journal, 0, "gateway-b".into()));
+        assert!(gateway_settled(&mut journal, 0, "gateway-b".into()));
+        // Losing the primary network invalidates the previous observation.
+        journal.pending_gateways.remove(&0);
+        assert!(!gateway_settled(&mut journal, 0, "gateway-b".into()));
+        journal.persist().unwrap();
+        let loaded: Journal =
+            serde_json::from_slice(&std::fs::read(&journal.path).unwrap()).unwrap();
+        assert!(loaded.pending_gateways.is_empty());
+    }
+
+    #[test]
+    fn test_expired_recovery_leaves_journal_retryable() {
+        let fixture = Fixture::new();
+        let mut journal = fixture.journal();
+        fixture.dns(&mut journal, "dns", "owned");
+        let cancelled = std::sync::atomic::AtomicBool::new(false);
+        let budget = SetupBudget {
+            deadline: Instant::now(),
+            cancelled: &cancelled,
+        };
+        let mut calls = 0;
+        assert!(rollback_with(&mut journal, &budget, |_| {
+            calls += 1;
+            Ok(())
+        })
+        .is_err());
+        assert_eq!(calls, 0);
+        assert_eq!(journal.actions.len(), 1);
+        assert!(journal.path.exists());
+    }
+
+    #[test]
+    fn test_cancelled_reconciliation_does_not_touch_journal_or_dns() {
+        let fixture = Fixture::new();
+        let mut journal = fixture.journal();
+        let path = fixture.dns(&mut journal, "dns", "owned");
+        let before = std::fs::read(&journal.path).unwrap();
+        let journal_path = journal.path.clone();
+        let mut state = CleanupState::Active { journal };
+        let cancelled = std::sync::atomic::AtomicBool::new(true);
+        assert!(reconcile_network_cancellable(&mut state, &cancelled).is_err());
+        assert_eq!(std::fs::read(journal_path).unwrap(), before);
+        assert_eq!(std::fs::read_to_string(path).unwrap(), "owned");
+    }
+
+    #[test]
+    fn test_cancelled_recovery_preserves_pending_actions() {
+        let fixture = Fixture::new();
+        let mut journal = fixture.journal();
+        let path = fixture.dns(&mut journal, "dns", "owned");
+        let cancelled = std::sync::atomic::AtomicBool::new(true);
+        let budget = SetupBudget {
+            deadline: Instant::now() + Duration::from_secs(20),
+            cancelled: &cancelled,
+        };
+        assert!(rollback_with(&mut journal, &budget, restore).is_err());
+        assert_eq!(std::fs::read_to_string(path).unwrap(), "owned");
+        assert_eq!(journal.actions.len(), 1);
+        assert!(journal.path.exists());
+        // Cleanup must use an independent budget after cancellation.
+        rollback(&mut journal).unwrap();
+    }
+
+    #[test]
+    fn test_injected_restoration_failure_retains_only_pending_action_and_retries() {
+        let fixture = Fixture::new();
+        let mut journal = fixture.journal();
+        let first = fixture.dns(&mut journal, "first", "owned");
+        let second = fixture.dns(&mut journal, "second", "owned");
+        let cancelled = std::sync::atomic::AtomicBool::new(false);
+        let budget = SetupBudget {
+            deadline: Instant::now() + Duration::from_secs(20),
+            cancelled: &cancelled,
+        };
+        let mut calls = 0;
+        assert!(rollback_with(&mut journal, &budget, |action| {
+            calls += 1;
+            if calls == 1 {
+                anyhow::bail!("injected effect failure")
+            }
+            restore(action)
+        })
+        .is_err());
+        assert_eq!(calls, 2);
+        assert_eq!(std::fs::read_to_string(first).unwrap(), "original");
+        assert_eq!(std::fs::read_to_string(&second).unwrap(), "owned");
+        let mut reloaded: Journal =
+            serde_json::from_slice(&std::fs::read(&journal.path).unwrap()).unwrap();
+        assert_eq!(reloaded.actions.len(), 1);
+        reloaded.path = journal.path;
+        rollback(&mut reloaded).unwrap();
+        assert_eq!(std::fs::read_to_string(second).unwrap(), "original");
+    }
+
     #[test]
     fn test_rollback_restores_owned_dns_and_is_repeatable() {
         let fixture = Fixture::new();
@@ -1302,6 +1746,7 @@ mod tests {
         assert!(output.status.success());
         assert_eq!(output.stdout.len(), 65536);
     }
+    #[cfg(target_os = "linux")]
     #[test]
     fn test_route_ownership_rejects_other_gateway_or_interface() {
         let route = LinuxRoute {
@@ -1332,6 +1777,7 @@ mod tests {
         );
         assert_eq!(normalized_macos_destination("default"), None);
     }
+    #[cfg(target_os = "linux")]
     #[test]
     fn test_no_primary_network_observation_is_not_a_default_route() {
         assert!(parse_linux_default_route("192.0.2.0/24 dev eth0").is_err());
@@ -1347,43 +1793,178 @@ mod tests {
     }
 }
 
-fn ensure_stopped(owner: &str) -> anyhow::Result<()> {
-    use nix::sys::socket::{connect, socket, AddressFamily, SockFlag, SockType, UnixAddr};
-    use std::os::fd::AsRawFd;
-    let path = Path::new(super::SOCK_DIR).join(format!("{owner}.sock"));
-    #[cfg(target_os = "macos")]
-    let flags = SockFlag::empty();
-    #[cfg(not(target_os = "macos"))]
-    let flags = SockFlag::SOCK_NONBLOCK | SockFlag::SOCK_CLOEXEC;
-    let socket = socket(AddressFamily::Unix, SockType::Stream, flags, None)?;
-    #[cfg(target_os = "macos")]
-    {
-        // macOS requires setting these properties after socket creation.
-        use nix::fcntl::{fcntl, FcntlArg, FdFlag, OFlag};
-        fcntl(&socket, FcntlArg::F_SETFD(FdFlag::FD_CLOEXEC))?;
-        fcntl(&socket, FcntlArg::F_SETFL(OFlag::O_NONBLOCK))?;
-    }
-    let address = UnixAddr::new(&path)?;
-    match connect(socket.as_raw_fd(), &address) {
-        Ok(()) => anyhow::bail!("control socket for {owner} is active; refusing network recovery"),
-        Err(nix::errno::Errno::ENOENT | nix::errno::Errno::ECONNREFUSED) => Ok(()),
-        Err(error) => {
-            Err(error).context("control socket ownership is unknown; refusing network recovery")
-        }
-    }
+pub(super) fn has_pending_gateway(state: &CleanupState) -> bool {
+    matches!(state, CleanupState::Active { journal } if !journal.pending_gateways.is_empty())
 }
 
-pub(super) fn recover_stopped_session(owner: &str) -> anyhow::Result<()> {
-    let _lock = lock(owner)?;
-    ensure_stopped(owner)?;
-    recover_locked(owner)?;
-    for extension in ["sock", "stop"] {
-        let path = Path::new(super::SOCK_DIR).join(format!("{owner}.{extension}"));
-        match std::fs::remove_file(path) {
-            Ok(()) => {}
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => return Err(error.into()),
+#[cfg(target_os = "macos")]
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
+struct LanPolicy {
+    interface: String,
+    original: Vec<MacosRoute>,
+    dns: Vec<String>,
+}
+
+#[cfg(target_os = "macos")]
+fn physical_lans() -> anyhow::Result<Vec<String>> {
+    // Enumerate hardware ports so virtual bridges and other VPN interfaces cannot become bypasses.
+    let ports = run_command_capture_output("networksetup", &["-listallhardwareports"])?;
+    anyhow::ensure!(
+        ports.status.success(),
+        "cannot enumerate physical network interfaces"
+    );
+    let devices: Vec<_> = String::from_utf8(ports.stdout)?
+        .lines()
+        .filter_map(|line| line.strip_prefix("Device: ").map(str::to_owned))
+        .collect();
+    let mut prefixes = Vec::new();
+    for device in devices {
+        if !device.starts_with("en") {
+            continue;
         }
+        let output = run_command_capture_output("ifconfig", &[&device])?;
+        anyhow::ensure!(
+            output.status.success(),
+            "cannot inspect physical interface {device}"
+        );
+        let text = String::from_utf8(output.stdout)?;
+        if !text.lines().any(|line| line.trim() == "status: active") {
+            continue;
+        }
+        for line in text.lines() {
+            let f: Vec<_> = line.split_whitespace().collect();
+            if f.first() == Some(&"inet") && f.len() >= 4 && f[2] == "netmask" {
+                let ip: std::net::Ipv4Addr = f[1].parse()?;
+                if ip.is_loopback()
+                    || ip.is_link_local()
+                    || ip.is_multicast()
+                    || ip.is_unspecified()
+                {
+                    continue;
+                }
+                let mask = u32::from_str_radix(f[3].trim_start_matches("0x"), 16)?;
+                let prefix = mask.leading_ones();
+                anyhow::ensure!(
+                    mask == if prefix == 0 {
+                        0
+                    } else {
+                        u32::MAX << (32 - prefix)
+                    },
+                    "noncontiguous interface mask"
+                );
+                if prefix > 0 && prefix < 32 {
+                    prefixes.push(format!("{ip}/{prefix}"));
+                }
+            } else if f.first() == Some(&"inet6") && f.len() >= 4 && f[2] == "prefixlen" {
+                let ip: std::net::Ipv6Addr = f[1].split('%').next().unwrap_or("").parse()?;
+                let prefix: u8 = f[3].parse()?;
+                if prefix > 0
+                    && prefix < 128
+                    && !ip.is_loopback()
+                    && !ip.is_unspecified()
+                    && !ip.is_multicast()
+                    && !ip.is_unicast_link_local()
+                {
+                    prefixes.push(format!("{ip}/{prefix}"));
+                }
+            }
+        }
+    }
+    Ok(prefixes)
+}
+#[cfg(target_os = "macos")]
+fn lan_routes(policy: &LanPolicy) -> anyhow::Result<Vec<MacosRoute>> {
+    let mut bases = Vec::new();
+    for route in &policy.original {
+        let (ip, prefix) =
+            normalized_macos_destination(&route.destination).context("invalid VPN route")?;
+        bases.push(format!("{ip}/{prefix}"));
+    }
+    let mut routes = crate::lan::vpn_routes(&bases, &physical_lans()?)?;
+    // DNS hosts stay tunneled even when their address overlaps the LAN.
+    for dns in &policy.dns {
+        let ip: IpAddr = dns.parse()?;
+        let host = format!("{ip}/{}", if ip.is_ipv6() { 128 } else { 32 });
+        let target = crate::lan::Prefix::parse(&host)?;
+        if bases
+            .iter()
+            .any(|base| crate::lan::Prefix::parse(base).is_ok_and(|base| base.contains(target)))
+        {
+            routes.push(host);
+        }
+    }
+    routes.sort();
+    routes.dedup();
+    Ok(routes
+        .into_iter()
+        .map(|destination| MacosRoute {
+            is_ipv6: destination.contains(':'),
+            destination,
+            interface: Some(policy.interface.clone()),
+            gateway: None,
+        })
+        .collect())
+}
+#[cfg(target_os = "macos")]
+fn reconcile_lan(journal: &mut Journal, budget: &SetupBudget<'_>) -> anyhow::Result<()> {
+    let Some(policy) = journal.lan.clone() else {
+        return Ok(());
+    };
+    budget.check()?;
+    // Missing primary networks must not turn a transient observation into new routing intent.
+    match get_macos_default_route(false) {
+        Ok(Some(_)) => {}
+        Ok(None) => {
+            journal.pending_gateways.clear();
+            return Ok(());
+        }
+        Err(error) => {
+            journal.pending_gateways.clear();
+            return Err(error);
+        }
+    }
+    let desired = lan_routes(&policy)?;
+    // Restore old intent before retiring it; a failed checkpoint leaves recoverable evidence.
+    for index in (0..journal.actions.len()).rev() {
+        if let Action::MacosRoute(route) = &journal.actions[index] {
+            if route.gateway.is_none()
+                && route.interface.as_ref() == Some(&policy.interface)
+                && !desired.contains(route)
+            {
+                budget.check()?;
+                restore_checked(&journal.actions[index], Some(budget))?;
+                let previous = journal.actions.remove(index);
+                if let Err(error) = journal.persist() {
+                    journal.actions.insert(index, previous);
+                    return Err(error);
+                }
+                journal.pending_gateways.clear();
+            }
+        }
+    }
+    for route in desired {
+        budget.check()?;
+        if journal
+            .actions
+            .iter()
+            .any(|action| matches!(action,Action::MacosRoute(existing) if existing == &route))
+        {
+            continue;
+        }
+        match macos_route_status(&route)? {
+            Some(true) => continue, // Existing interface routes remain borrowed, never owned cleanup intent.
+            Some(false) => anyhow::bail!(
+                "LAN route planning conflicts with existing route {}",
+                route.destination
+            ),
+            None => {}
+        }
+        journal.push(Action::MacosRoute(route.clone()))?;
+        budget.check()?;
+        anyhow::ensure!(
+            add_macos_route(&route)?,
+            "LAN route appeared during reconciliation"
+        );
     }
     Ok(())
 }

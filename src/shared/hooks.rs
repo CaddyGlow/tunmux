@@ -928,6 +928,10 @@ mod tests {
     #[test]
     fn debug_env_contains_core_fields() {
         let state = ConnectionState {
+            #[cfg(not(target_os = "android"))]
+            source_spec: None,
+            allow_lan: false,
+            session_id: None,
             instance_name: "test-instance".to_string(),
             provider: "proton".to_string(),
             interface_name: "proton0".to_string(),
@@ -977,6 +981,10 @@ mod tests {
     #[test]
     fn hook_runtime_prefers_http_proxy_for_requests() {
         let state = ConnectionState {
+            #[cfg(not(target_os = "android"))]
+            source_spec: None,
+            allow_lan: false,
+            session_id: None,
             instance_name: "test-instance".to_string(),
             provider: "proton".to_string(),
             interface_name: "proton0".to_string(),

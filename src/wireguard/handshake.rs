@@ -30,7 +30,7 @@ pub fn wait_for_handshake(interface: &str, dns_servers: &[String]) -> Result<()>
     #[cfg(not(target_os = "linux"))]
     {
         let _ = (interface, dns_servers);
-        return Ok(());
+        Ok(())
     }
 
     #[cfg(target_os = "linux")]

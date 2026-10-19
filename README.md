@@ -623,9 +623,11 @@ Runtime state (macOS):
 
 The embedded userspace helper collects passive peer statistics without launching
 `wg` or generating outbound probe traffic. A dedicated network worker serializes
-setup, reconciliation, and restoration. Every ten seconds it checks owned routes,
-endpoint gateways, and DNS; reconciliation preserves configured AllowedIPs and
-adds no implicit LAN bypass routes. Unsettled gateways or ownership conflicts are
+setup, reconciliation, and restoration. macOS network notifications trigger
+reconciliation after a 500 ms debounce (at most two seconds during a burst), with
+ten-second polling as a fallback. Changed gateways require a confirming observation
+and include physical interface identity. Reconciliation preserves configured
+AllowedIPs by default. Unsettled gateways or ownership conflicts are
 reported without overwriting another owner's settings.
 
 Disconnect waits for the helper's cleanup acknowledgment. Commands have a
@@ -649,9 +651,69 @@ permissions, probe timeouts, legacy records without peer identity, and unverifia
 proxy sessions report unknown. Connection records are written atomically; corrupt
 records are preserved in quarantine. Status does not retire stale sessions.
 
-Native macOS routing, DNS, roaming, and signal behavior still require validation on
-a macOS host. Optional launchd activation, login autoconnect, installation tooling,
-and structured live log forwarding from the reliability plan are not implemented.
+Native routing, DNS, roaming, signal, and launchd behavior must be validated on the
+host; see [the macOS validation runbook](docs/validation/macos-reliability.md).
+Live structured log forwarding remains deferred.
+
+### macOS service and automatic connections
+
+```sh
+sudo tunmux service install                 # root-owned copy in /usr/local/libexec/tunmux
+tunmux service diagnose
+sudo tunmux service reload
+sudo tunmux service uninstall
+
+tunmux autoconnect enable work -- connect wgconf --profile work --backend userspace
+tunmux autoconnect enable exit -- connect airvpn --country NL --local-proxy
+tunmux autoconnect status
+tunmux autoconnect disable work
+tunmux autoconnect resume work
+```
+
+Installation uses a socket-activated privileged LaunchDaemon. `autoconnect enable`
+installs a separate user LaunchAgent; ordinary connects never install services.
+For foreground operation, use `autoconnect enable <name> --no-login-agent -- connect ...`
+and run `tunmux autoconnect run` yourself.
+Use `service install --binary-path /absolute/root-owned/path --authorized-group admin`
+to customize installation. `--user <uid>` identifies the login user when installing
+through an administrator dialog; `--config-dir` supports a custom absolute tunmux
+directory. All ancestors of the installed binary must be root-owned and protected
+against group/other writes.
+
+`connect --if-missing` accepts an already active connection only when its normalized
+source and options match. Different active sources, unknown health, corrupt state,
+and legacy records without identity remain errors. Both top-level and legacy
+provider-prefixed connect commands accept the option.
+
+Desired state is private, versioned, and stored in `~/.config/tunmux/desired.json`,
+separately from observed connections and root recovery journals. One desired direct
+tunnel and multiple local proxies are supported on macOS. Provider credentials and
+WGConf private keys remain in their existing stores; desired entries retain source
+references and a SHA-256 profile fingerprint. Changed profiles require enabling the
+entry again. Proxy ports are persisted when first selected.
+
+Manual disconnect suspends matching desired entries before cleanup. Suspension
+survives login/reboot and requires explicit `autoconnect resume` or `enable`.
+Temporary connection failures retry after 1, 2, 4, 8, 16, and 30 seconds, with bounded
+jitter. Exhaustion waits for a network change or explicit resume; uncertain health
+and permanent failures require intervention. Background attempts never prompt for
+privilege elevation. Logs are in `~/.config/tunmux/autoconnect.log`.
+
+Local proxies use session identities and a private control socket with cleanup
+acknowledgment. Legacy proxies without identity must be disconnected with the
+version that started them before upgrading. Root recovery and source matching do
+not grant automatic destructive recovery of unverified Linux namespace proxies.
+
+`--allow-lan` explicitly bypasses directly attached physical LAN subnets for macOS
+helper-backed direct tunnels. It preserves the more-specific physical LAN routes and omits conflicting VPN
+routes within those prefixes, retains VPN DNS host routes, and journals changes. It does not alter
+WireGuard AllowedIPs. Other backends and proxy modes reject the flag. Reload the
+privileged service when upgrading to gain negotiated LAN-policy support.
+
+Reload suspends automatic work, tears down sessions, and resumes previously enabled
+entries after service activation succeeds. Uninstall completes cleanup before
+removing the installed binary, daemon, and login agent. Profiles, credentials, and
+unresolved recovery journals are preserved; incomplete cleanup aborts removal.
 
 ## License
 

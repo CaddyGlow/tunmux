@@ -34,6 +34,14 @@ fn main() -> std::process::ExitCode {
     }
 
     let cli = Cli::parse();
+    let operation_args: Vec<String> = std::env::args().skip(1).collect();
+    let _operation = match tunmux::automation::prepare(&operation_args) {
+        Ok(guard) => guard,
+        Err(error) => {
+            eprintln!("{error:#}");
+            return std::process::ExitCode::FAILURE;
+        }
+    };
     if let Err(error) = logging::configure(cli.verbose, cli.log_filter.as_deref()) {
         eprintln!("logging initialization failed: {error:#}");
         return std::process::ExitCode::FAILURE;
@@ -142,7 +150,7 @@ fn main() -> std::process::ExitCode {
             let rt = tokio::runtime::Runtime::new().expect("failed to create tokio runtime");
             if let Err(e) = rt.block_on(run(other, config)) {
                 error!( error = ?e.to_string(), "command_failed");
-                return std::process::ExitCode::FAILURE;
+                return tunmux::automation::failure_exit_code(&e);
             }
         }
     }
@@ -158,6 +166,8 @@ fn init_logging(verbose: bool) -> logging::LoggingGuard {
 
 async fn run(command: TopCommand, config: config::AppConfig) -> anyhow::Result<()> {
     match command {
+        TopCommand::Service { command } => tunmux::service::dispatch(command),
+        TopCommand::Autoconnect { command } => tunmux::automation::dispatch(command),
         #[cfg(feature = "proton")]
         TopCommand::Proton { command } => proton::handlers::dispatch(command, &config).await,
         #[cfg(feature = "airvpn")]
@@ -612,10 +622,23 @@ fn run_local_proxy_daemon(pid_file: &str, log_file: &str, config_b64: &str) -> a
         .enable_all()
         .build()?;
 
-    rt.block_on(wireguard::proxy_tunnel::run_local_proxy(
-        cfg,
-        Some(startup_status_file.as_str()),
-    ))
+    let mut control = tunmux::local_proxy_control::Control::start(std::path::Path::new(pid_file))?;
+    let (result, acknowledgment) = rt.block_on(async {
+        let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
+        tokio::select! {
+            result = wireguard::proxy_tunnel::run_local_proxy(cfg, Some(startup_status_file.as_str())) => Ok::<_, anyhow::Error>((result, None)),
+            stream = control.stop.recv() => Ok((Ok(()), stream)),
+            _ = terminate.recv() => Ok((Ok(()), None)),
+            _ = tokio::signal::ctrl_c() => Ok((Ok(()), None)),
+        }
+    })?;
+    rt.shutdown_timeout(std::time::Duration::from_secs(5));
+    std::fs::remove_file(pid_file)?;
+    let _ = std::fs::remove_file(startup_status_file);
+    if let Some(stream) = acknowledgment {
+        control.acknowledge(stream)?;
+    }
+    result
 }
 
 fn local_proxy_dns_override_from_env() -> Option<(&'static str, Vec<String>)> {
@@ -697,10 +720,18 @@ fn keeps_output(fd: std::os::fd::BorrowedFd<'_>) -> bool {
 }
 
 fn cmd_status() -> anyhow::Result<()> {
-    let connections = ConnectionState::load_all()?;
+    let (connections, corrupt) = ConnectionState::load_all_with_corrupt()?;
+    for path in &corrupt {
+        println!(
+            "Unknown connection state: {} (corrupt saved record; recovery required)",
+            path.display()
+        );
+    }
 
     if connections.is_empty() {
-        println!("No active connections.");
+        if corrupt.is_empty() {
+            println!("No active connections.");
+        }
         return Ok(());
     }
 

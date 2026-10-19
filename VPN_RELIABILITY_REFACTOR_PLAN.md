@@ -1,10 +1,90 @@
 # VPN reliability and macOS integration plan
 
+## Implementation status — phases 1–5
+
+The findings below describe the original review snapshot. The current implementation
+includes the following reliability changes. Phase 5 has also been implemented in
+the current working tree: socket-activated launchd installation, desired-state
+autoconnect, identity-aware local proxies, and bounded retries. Phase 6 (live log
+forwarding) remains deferred. See `docs/validation/macos-reliability.md` for the
+native validation runner and acceptance criteria.
+
+- Recovery commands run on a dedicated thread rather than the helper's current-thread
+  Tokio runtime. Recovery, setup, and reconciliation check cancellation/deadlines
+  before effects; cancellation of setup still runs independent rollback.
+- Device startup/configuration/stop and runtime shutdown are bounded. Normal disconnect
+  waits for restoration, device stop, runtime shutdown, and ownership release before
+  success acknowledgment. The acknowledgment has one 70-second deadline and bounded
+  framing; the launcher allows 150 seconds for startup and failed-start restoration.
+- `StartSession`, `InspectSession`, and `RecoverSession` privileged requests carry
+  typed session observations. Startup returns the session identity before another
+  privileged request can run. Existing `GotaTunRun` requests retain their unit response
+  and accept an optional identity for disconnect.
+  Update/restart persistent privileged services alongside the CLI to support the new
+  requests. Status probes and authorized inspection exchanges have two-second
+  deadlines and bounded response framing; authorized inspection reuses command
+  transports instead of opening a competing connection to the single-client service.
+- Root-owned session receipts and the existing exclusive network lock establish helper
+  ownership. Receipts survive cleanup so a crash before display-state removal remains
+  recoverable. The running helper rejects mismatched stop identities. Older clients
+  that connect without a stop payload remain supported. Legacy saved records stay
+  unknown and cannot authorize a disconnect of a potentially reused interface:
+  disconnect with the version that started the session before upgrading, or verify
+  and recover the original helper independently, then reconnect to record identity.
+- Direct and proxy connection preparation, state persistence, and shared disconnect
+  are serialized per instance. Confirmed inactive, identified helper sessions recover
+  before stale metadata is retired. Unknown health or incomplete recovery blocks
+  replacement. Native kernel/proxy sessions without equivalent recovery ownership
+  proof do not gain automatic destructive recovery. The macOS kernel selection uses
+  the helper and records its session identity too.
+- Handshake failures after helper startup and macOS helper state-save failures attempt
+  identity-aware cleanup and preserve both the original and restoration errors.
+- Status does not rename corrupt state. Connection preparation quarantines corrupt
+  records and keeps blocking on unresolved quarantine receipts across retries. A
+  valid repaired JSON record supersedes its receipts without deleting evidence.
+  After independently resolving recovery, an operator can remove the corresponding
+  quarantine receipt to allow a fresh connection; status alone never authorizes this.
+- Connection metadata and recovery journals share private atomic writes with parent
+  directory synchronization. Failed journal pushes/replacements restore in-memory
+  intent, preventing later reconciliation from applying uncheckpointed changes.
+- Reconciliation retains ten-second polling as a fallback and debounces native macOS
+  network notifications. Two matching changed gateway/interface observations are
+  required before replacing endpoint routes. Missing/unsettled primary networks
+  defer changes. Route and DNS conflicts preserve external changes. AllowedIPs is
+  preserved by default; `--allow-lan` explicitly retains physical LAN route precedence
+  and omits conflicting VPN routes, while keeping VPN DNS host routes.
+- Existing EnvFilter configuration, owned logging guards, helper filter propagation,
+  and MTU precedence remain in place. Worker threads inherit operation spans. Tests
+  cover target filtering, filter serialization, and log flushing.
+
+Implementation areas: `src/userspace_helper{.rs,/network.rs,/worker.rs,/session.rs}`;
+`src/privileged{_api.rs,_client/,/}`; `src/wireguard/{connection,health,userspace,kernel,handshake}.rs`;
+`src/shared/{connection_ops,hooks,persistence}.rs`; `src/main.rs`; `src/logging.rs`.
+The existing SHA-256 dependency is now shared across provider feature configurations.
+
+Automated macOS validation covers cancellation, rollback failures/retries, journal
+checkpoint failures, ownership conflicts, corrupt-state retries, session identity,
+legacy request framing, disconnect deadlines, logging, and MTU parsing/precedence.
+Completed on macOS (`aarch64-apple-darwin`): formatting, all-feature/all-target Clippy
+with warnings denied, the full suite (208 library tests, two binary tests, and four
+CLI integration tests), and
+Clippy/CLI tests for all eight CI provider feature configurations. No-default-feature
+checks also cover the shared transport changes. Native validation on levua passed
+direct disconnect, SIGTERM, SIGKILL journal recovery, DNS conflict preservation,
+LAN opt-in lifecycle, interface MTU, socket authorization, live service reload and
+uninstall/reinstall, sleep/resume, and Wi-Fi off/on outage recovery. The latter
+recovered within a 19.64-second validation wait and passed IPv4/IPv6 connectivity
+checks. Local-proxy reconnect and durable manual suppression also passed live tests.
+Switching between distinct physical interfaces/gateways, login/logout agent
+behavior, physical LAN reachability, the remaining multiple-entry/concurrency
+campaign, and native Linux/Android validation remain unverified. See
+`docs/validation/2026-10-19-levua.md` for evidence and limitations.
+
 ## Objective
 
 Implement the useful reliability improvements proposed in PRs [#1](https://github.com/CaddyGlow/tunmux/pull/1) and [#3](https://github.com/CaddyGlow/tunmux/pull/3) through incremental changes to the current codebase. Preserve provider integrations, Linux functionality, Android support, and existing proxy modes.
 
-This plan follows a read-only source review using three agents for lifecycle/state, macOS networking, and tracing. Findings have not been confirmed through native macOS execution. Source locations below refer to the code at review time and may move.
+This plan originated in a read-only source review using three agents for lifecycle/state, macOS networking, and tracing. The findings below describe that original snapshot; the implementation status and validation report above record subsequent native checks. Source locations below refer to the code at review time and may move.
 
 ## Scope decisions
 

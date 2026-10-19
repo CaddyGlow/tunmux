@@ -111,6 +111,10 @@ pub fn spawn_daemon(
 
     let mut cmd = std::process::Command::new(&exe);
     crate::logging::apply_to_command(&mut cmd);
+    cmd.env(
+        "TUNMUX_LOCAL_PROXY_SESSION",
+        format!("{:032x}", rand::random::<u128>()),
+    );
     cmd.args([
         "local-proxy-daemon",
         "--socks-port",
@@ -274,9 +278,7 @@ pub fn disconnect(
     state: &crate::wireguard::connection::ConnectionState,
     instance_name: &str,
 ) -> anyhow::Result<()> {
-    if let Some(pid) = state.proxy_pid {
-        stop_daemon(pid)?;
-    }
+    crate::local_proxy_control::stop(state)?;
     let pid_path = proxy::local_pid_file(instance_name);
     let log_path = proxy::local_log_file(instance_name);
     let _ = std::fs::remove_file(&pid_path);

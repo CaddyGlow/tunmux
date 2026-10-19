@@ -286,6 +286,7 @@ pub fn disconnect_one_provider_connection(
     config: &AppConfig,
     remove_namespace_dir_if_exists: bool,
 ) -> anyhow::Result<()> {
+    let _preparation = lock_connection_preparation(&state.instance_name)?;
     if state.backend == WgBackend::LocalProxy {
         local_proxy::disconnect(state, &state.instance_name)?;
         hooks::run_ifdown(config, provider, state);
@@ -325,7 +326,8 @@ pub fn disconnect_one_provider_connection(
                 ConnectionState::remove(&state.instance_name)?;
             }
             WgBackend::Userspace => {
-                wireguard::userspace::down(&state.interface_name, provider)?;
+                let id = state.session_id.as_deref().ok_or_else(|| anyhow::anyhow!("legacy connection has no verified session identity; disconnect with the version that started it, then reconnect"))?;
+                wireguard::userspace::down_for_session(&state.interface_name, id)?;
                 ConnectionState::remove(&state.instance_name)?;
             }
             WgBackend::LocalProxy => unreachable!(),
@@ -341,6 +343,9 @@ pub fn derive_instance_name(
     target_kind: &str,
     target_name: &str,
 ) -> anyhow::Result<String> {
+    if let Some(instance) = crate::automation::managed_instance() {
+        return Ok(instance.to_owned());
+    }
     let instance = proxy::instance_name(instance_seed);
     if instance.is_empty() {
         anyhow::bail!(
@@ -352,13 +357,58 @@ pub fn derive_instance_name(
     Ok(instance)
 }
 
+/// Hold through startup and state persistence to serialize competing connects.
+fn lock_connection_preparation(instance: &str) -> anyhow::Result<nix::fcntl::Flock<std::fs::File>> {
+    use std::os::unix::fs::OpenOptionsExt;
+    crate::config::ensure_connections_dir()?;
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .mode(0o600)
+        .custom_flags(nix::libc::O_NOFOLLOW)
+        .open(crate::config::connections_dir().join(format!("{instance}.prepare.lock")))?;
+    nix::fcntl::Flock::lock(file, nix::fcntl::FlockArg::LockExclusiveNonblock).map_err(
+        |(_, error)| anyhow::anyhow!("another connection operation owns {instance}: {error}"),
+    )
+}
+
 pub fn ensure_instance_available(
     instance: &str,
     target_kind: &str,
     target_name: &str,
 ) -> anyhow::Result<()> {
+    let _preparation = lock_connection_preparation(instance)?;
+    ensure_instance_available_locked(instance, target_kind, target_name)
+}
+
+fn ensure_instance_available_locked(
+    instance: &str,
+    target_kind: &str,
+    target_name: &str,
+) -> anyhow::Result<()> {
+    if let Some(preserved) = ConnectionState::quarantine_corrupt(instance)? {
+        anyhow::bail!("corrupt connection state preserved at {}; session ownership remains unknown; explicit recovery required", preserved.display());
+    }
     if let Some(state) = ConnectionState::load(instance)? {
-        let health = wireguard::health::inspect(&state);
+        let health = wireguard::health::inspect_for_connect(&state);
+        if health.kind == wireguard::health::HealthKind::Inactive
+            && state.backend == WgBackend::LocalProxy
+        {
+            ConnectionState::remove(instance)?;
+            return Ok(());
+        }
+        if health.kind == wireguard::health::HealthKind::Inactive && health.recovery_available {
+            let id = state
+                .session_id
+                .as_deref()
+                .ok_or_else(|| anyhow::anyhow!("missing session identity"))?;
+            crate::privileged_client::PrivilegedClient::new()
+                .recover_session(&state.interface_name, id)?;
+            ConnectionState::remove(instance)?;
+            return Ok(());
+        }
         anyhow::bail!(
             "instance {:?} is {}: {} ({} {}). Disconnect/recover first or choose a different {}.",
             instance,
@@ -420,10 +470,10 @@ pub fn connect_direct_wg(
         );
     }
 
-    ensure_instance_available(DIRECT_INSTANCE, "direct VPN", display_name)?;
-    if (backend != WgBackend::Userspace && wireguard::wg_quick::is_interface_active(interface_name))
-        || wireguard::userspace::is_interface_active(interface_name)
-    {
+    let _preparation = lock_connection_preparation(DIRECT_INSTANCE)?;
+    ensure_instance_available_locked(DIRECT_INSTANCE, "direct VPN", display_name)?;
+    wireguard::userspace::prepare_endpoint(interface_name)?;
+    if backend != WgBackend::Userspace && wireguard::wg_quick::is_interface_active(interface_name) {
         anyhow::bail!(
             "Already connected. Run `tunmux disconnect --provider {}` first.",
             provider.dir_name()
@@ -465,10 +515,10 @@ pub fn connect_direct_config(
 ) -> anyhow::Result<()> {
     use wireguard::connection::DIRECT_INSTANCE;
 
-    ensure_instance_available(DIRECT_INSTANCE, "direct VPN", display_name)?;
-    if (backend != WgBackend::Userspace && wireguard::wg_quick::is_interface_active(interface_name))
-        || wireguard::userspace::is_interface_active(interface_name)
-    {
+    let _preparation = lock_connection_preparation(DIRECT_INSTANCE)?;
+    ensure_instance_available_locked(DIRECT_INSTANCE, "direct VPN", display_name)?;
+    wireguard::userspace::prepare_endpoint(interface_name)?;
+    if backend != WgBackend::Userspace && wireguard::wg_quick::is_interface_active(interface_name) {
         anyhow::bail!(
             "Already connected. Run `tunmux disconnect --provider {}` first.",
             provider.dir_name()
@@ -476,20 +526,32 @@ pub fn connect_direct_config(
     }
     let parsed = wireguard::config::parse_config(text)?;
     println!("Connecting to {}...", display_name);
-    let effective_iface = match backend {
-        WgBackend::WgQuick => wireguard::wg_quick::up(text, interface_name, provider, false)?,
-        WgBackend::Userspace => wireguard::userspace::up(text, interface_name, provider)?,
+    let (effective_iface, session_id) = match backend {
+        WgBackend::WgQuick => (
+            wireguard::wg_quick::up(text, interface_name, provider, false)?,
+            None,
+        ),
+        WgBackend::Userspace => (
+            interface_name.to_owned(),
+            Some(wireguard::userspace::up_raw_with_session(
+                text,
+                interface_name,
+            )?),
+        ),
         _ => anyhow::bail!("full config startup requires wg-quick or userspace backend"),
     };
     let rollback = StartupGuard::new(|| {
-        let result = if backend == WgBackend::Userspace {
-            wireguard::userspace::down(&effective_iface, provider)
+        let result = if let Some(id) = session_id.as_deref() {
+            wireguard::userspace::down_for_session(&effective_iface, id)
         } else {
             wireguard::wg_quick::down(&effective_iface, provider)
         };
         log_cleanup_error(result.map_err(Into::into));
     });
     let state = ConnectionState {
+        source_spec: None,
+        allow_lan: false,
+        session_id: session_id.clone(),
         instance_name: DIRECT_INSTANCE.to_string(),
         provider: provider.dir_name().to_string(),
         interface_name: effective_iface.clone(),
@@ -544,6 +606,8 @@ pub struct ConnectContext<'a> {
 }
 
 pub fn connect_proxy_via_netns(ctx: &ConnectContext<'_>) -> anyhow::Result<()> {
+    let _preparation = lock_connection_preparation(ctx.instance)?;
+    ensure_instance_available_locked(ctx.instance, "server", ctx.display_name)?;
     let ConnectContext {
         provider,
         instance,
@@ -573,6 +637,9 @@ pub fn connect_proxy_via_netns(ctx: &ConnectContext<'_>) -> anyhow::Result<()> {
     });
 
     let state = ConnectionState {
+        source_spec: None,
+        allow_lan: false,
+        session_id: None,
         instance_name: instance.to_string(),
         provider: provider.dir_name().to_string(),
         interface_name,
@@ -619,6 +686,8 @@ pub struct LocalProxyContext<'a> {
 }
 
 pub fn connect_local_proxy_instance(ctx: &LocalProxyContext<'_>) -> anyhow::Result<()> {
+    let _preparation = lock_connection_preparation(ctx.instance)?;
+    ensure_instance_available_locked(ctx.instance, "server", ctx.display_name)?;
     let LocalProxyContext {
         provider,
         instance,
@@ -650,6 +719,9 @@ pub fn connect_local_proxy_instance(ctx: &LocalProxyContext<'_>) -> anyhow::Resu
     });
 
     let state = ConnectionState {
+        source_spec: None,
+        allow_lan: false,
+        session_id: None,
         instance_name: instance.to_string(),
         provider: provider.dir_name().to_string(),
         interface_name: String::new(),

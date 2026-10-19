@@ -21,9 +21,27 @@ pub enum KillSignal {
     Kill,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionHealthKind {
+    Active,
+    Inactive,
+    Unknown,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SessionInspection {
+    pub health: SessionHealthKind,
+    pub reason: String,
+    pub recovery_available: bool,
+    pub session_id: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum PrivilegedRequest {
+    /// Query optional protocol capabilities before requesting new effects.
+    Capabilities,
     NamespaceCreate {
         name: String,
     },
@@ -101,6 +119,8 @@ pub enum PrivilegedRequest {
         prefer_userspace: bool,
     },
     GotaTunRun {
+        #[serde(default)]
+        session_id: Option<String>,
         action: GotaTunAction,
         interface: String,
         config_content: String,
@@ -141,9 +161,21 @@ pub enum PrivilegedRequest {
     },
     ShutdownIfIdle,
 
-    /// Run `wg show <interface>` and return the output (works for kernel, wg-quick, and
-    /// userspace backends since the `wg` tool reads the UAPI socket at
-    /// `/var/run/wireguard/<interface>.sock` for userspace interfaces).
+    /// Start a helper and return its identity in the same serialized operation.
+    StartSession {
+        #[serde(default)]
+        allow_lan: bool,
+        interface: String,
+        config_content: String,
+    },
+    InspectSession {
+        interface: String,
+        session_id: Option<String>,
+    },
+    RecoverSession {
+        interface: String,
+        session_id: String,
+    },
     WgShow {
         interface: String,
     },
@@ -152,6 +184,7 @@ pub enum PrivilegedRequest {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "kind", content = "value", rename_all = "snake_case")]
 pub enum PrivilegedResponse {
+    Session(SessionInspection),
     Unit,
     Bool(bool),
     Pid(u32),
@@ -264,11 +297,15 @@ impl PrivilegedRequest {
                 Ok(())
             }
             Self::GotaTunRun {
+                session_id,
                 action,
                 interface,
                 config_content,
             } => {
                 validate_interface_name(interface)?;
+                if let Some(id) = session_id {
+                    validate_lease_token(id)?;
+                }
                 if matches!(action, GotaTunAction::Up) && config_content.trim().is_empty() {
                     return Err("config_content cannot be empty".into());
                 }
@@ -306,7 +343,35 @@ impl PrivilegedRequest {
             Self::LeaseAcquire { token } | Self::LeaseRelease { token } => {
                 validate_lease_token(token)
             }
-            Self::ShutdownIfIdle => Ok(()),
+            Self::ShutdownIfIdle | Self::Capabilities => Ok(()),
+            Self::StartSession {
+                allow_lan: _,
+                interface,
+                config_content,
+            } => {
+                validate_interface_name(interface)?;
+                if config_content.trim().is_empty() {
+                    return Err("config_content cannot be empty".into());
+                }
+                Ok(())
+            }
+            Self::InspectSession {
+                interface,
+                session_id,
+            } => {
+                validate_interface_name(interface)?;
+                if let Some(id) = session_id {
+                    validate_lease_token(id)?;
+                }
+                Ok(())
+            }
+            Self::RecoverSession {
+                interface,
+                session_id,
+            } => {
+                validate_interface_name(interface)?;
+                validate_lease_token(session_id)
+            }
             Self::WgShow { interface } => validate_interface_name(interface),
         }
     }
@@ -585,6 +650,38 @@ mod tests {
     use super::{
         validate_host_endpoint, validate_interface_name, validate_provider, PrivilegedRequest,
     };
+
+    #[test]
+    fn legacy_helper_requests_keep_optional_identity_and_unit_response() {
+        let request: PrivilegedRequest = serde_json::from_str(
+            r#"{"kind":"gota_tun_run","action":"Down","interface":"proton0","config_content":""}"#,
+        )
+        .unwrap();
+        assert!(matches!(
+            request,
+            PrivilegedRequest::GotaTunRun {
+                session_id: None,
+                ..
+            }
+        ));
+        assert!(request.validate().is_ok());
+        assert_eq!(
+            serde_json::to_string(&super::PrivilegedResponse::Unit).unwrap(),
+            r#"{"kind":"unit"}"#
+        );
+    }
+
+    #[test]
+    fn typed_start_requires_config_and_valid_interface() {
+        let request = |interface: &str, config: &str| PrivilegedRequest::StartSession {
+            allow_lan: false,
+            interface: interface.into(),
+            config_content: config.into(),
+        };
+        assert!(request("proton0", "[Interface]").validate().is_ok());
+        assert!(request("proton0", " ").validate().is_err());
+        assert!(request("../proton0", "[Interface]").validate().is_err());
+    }
 
     #[test]
     fn direct_provider_interfaces_are_allowed() {

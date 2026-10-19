@@ -11,9 +11,9 @@ use crate::privileged_api::{
 };
 
 use super::commands::{
-    run, run_gotatun_down, run_gotatun_up, run_output, run_resolved_revert_dns,
-    run_resolved_set_dns, run_wg_quick_down, run_wg_quick_up, run_wg_show, set_preshared_key,
-    wg_set,
+    run, run_gotatun_down_session, run_gotatun_up, run_gotatun_up_policy, run_output,
+    run_resolved_revert_dns, run_resolved_set_dns, run_wg_quick_down, run_wg_quick_up, run_wg_show,
+    set_preshared_key, wg_set,
 };
 use super::daemon::spawn_proxy_daemon;
 use super::managed_pids::{managed_pid_is_current, register_managed_pid, unregister_managed_pid};
@@ -27,6 +27,7 @@ pub(super) fn dispatch(
     control_state: &mut ControlState,
 ) -> PrivilegedResponse {
     match request {
+        PrivilegedRequest::Capabilities => PrivilegedResponse::Text("lan-policy-v1".into()),
         PrivilegedRequest::NamespaceCreate { name } => {
             execute_unit(run(&["ip", "netns", "add", name.as_str()]))
         }
@@ -207,6 +208,7 @@ pub(super) fn dispatch(
         }
 
         PrivilegedRequest::GotaTunRun {
+            session_id,
             action,
             interface,
             config_content,
@@ -220,13 +222,15 @@ pub(super) fn dispatch(
                     },
                 }
             }
-            GotaTunAction::Down => match run_gotatun_down(interface.as_str()) {
-                Ok(()) => PrivilegedResponse::Unit,
-                Err(e) => PrivilegedResponse::Error {
-                    code: categorize_error(&e),
-                    message: e.to_string(),
-                },
-            },
+            GotaTunAction::Down => {
+                match run_gotatun_down_session(interface.as_str(), session_id.as_deref()) {
+                    Ok(()) => PrivilegedResponse::Unit,
+                    Err(e) => PrivilegedResponse::Error {
+                        code: categorize_error(&e),
+                        message: e.to_string(),
+                    },
+                }
+            }
         },
 
         PrivilegedRequest::EnsureDir { path, mode } => match std::fs::create_dir_all(&path) {
@@ -395,6 +399,52 @@ pub(super) fn dispatch(
             PrivilegedResponse::Bool(control_state.leases.is_empty())
         }
 
+        PrivilegedRequest::StartSession {
+            allow_lan,
+            interface,
+            config_content,
+        } => {
+            match run_gotatun_up_policy(&interface, &config_content, allow_lan) {
+                Ok(()) => {
+                    let inspected = crate::userspace_helper::session::inspect(&interface, None);
+                    if inspected.health == crate::privileged_api::SessionHealthKind::Active
+                        && inspected.session_id.is_some()
+                    {
+                        PrivilegedResponse::Session(inspected)
+                    } else {
+                        // Startup belongs to this serialized dispatch. If identity
+                        // capture fails, do not leave its resources running unseen.
+                        let cleanup =
+                            run_gotatun_down_session(&interface, inspected.session_id.as_deref());
+                        PrivilegedResponse::Error {
+                            code: "Startup".into(),
+                            message: match cleanup {
+                                Ok(()) => format!("helper startup identity unavailable: {}", inspected.reason),
+                                Err(error) => format!("helper startup identity unavailable: {}; cleanup incomplete: {error}", inspected.reason),
+                            },
+                        }
+                    }
+                }
+                Err(error) => PrivilegedResponse::Error {
+                    code: categorize_error(&error),
+                    message: error.to_string(),
+                },
+            }
+        }
+        PrivilegedRequest::InspectSession {
+            interface,
+            session_id,
+        } => PrivilegedResponse::Session(crate::userspace_helper::session::inspect(
+            &interface,
+            session_id.as_deref(),
+        )),
+        PrivilegedRequest::RecoverSession {
+            interface,
+            session_id,
+        } => execute_unit(
+            crate::userspace_helper::session::recover(&interface, &session_id)
+                .map_err(|error| AppError::Other(error.to_string())),
+        ),
         PrivilegedRequest::WgShow { interface } => match run_wg_show(interface.as_str()) {
             Ok(output) => PrivilegedResponse::Text(output),
             Err(e) => PrivilegedResponse::Error {

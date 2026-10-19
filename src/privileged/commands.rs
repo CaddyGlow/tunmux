@@ -1,5 +1,4 @@
 use std::os::unix::fs::PermissionsExt;
-use std::os::unix::net::UnixStream;
 use std::process::Command;
 
 use tracing::debug;
@@ -111,19 +110,27 @@ fn run_wg_show_uapi(interface: &str, socket_path: &std::path::Path) -> Result<St
     use std::time::{Duration, Instant};
 
     debug!(socket = %socket_path.display(), "uapi_get");
-    let mut stream = UnixStream::connect(socket_path)
+    let mut stream = crate::wireguard::health::connect_probe(socket_path)
         .map_err(|e| AppError::WireGuard(format!("UAPI connect: {e}")))?;
     stream.set_write_timeout(Some(Duration::from_secs(2)))?;
     stream.write_all(b"get=1\n\n")?;
+    stream.set_nonblocking(true)?;
     let deadline = Instant::now() + Duration::from_secs(2);
     let mut response = Vec::new();
     loop {
         let remaining = deadline
             .checked_duration_since(Instant::now())
             .ok_or_else(|| AppError::WireGuard("UAPI read deadline expired".into()))?;
-        stream.set_read_timeout(Some(remaining))?;
         let mut chunk = [0; 4096];
-        let count = stream.read(&mut chunk)?;
+        let count = match stream.read(&mut chunk) {
+            Ok(count) => count,
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                std::thread::sleep(remaining.min(Duration::from_millis(5)));
+                continue;
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(error) => return Err(error.into()),
+        };
         if count == 0 {
             return Err(AppError::WireGuard(
                 "UAPI closed before response completed".into(),
@@ -331,6 +338,16 @@ pub(super) fn wg_format_bytes(bytes: u64) -> String {
 }
 
 pub(super) fn run_gotatun_up(interface: &str, config_content: &str) -> Result<()> {
+    run_gotatun_up_policy(interface, config_content, false)
+}
+pub(super) fn run_gotatun_up_policy(
+    interface: &str,
+    config_content: &str,
+    allow_lan: bool,
+) -> Result<()> {
+    if allow_lan && !cfg!(target_os = "macos") {
+        return Err(AppError::Other("LAN bypass requires macOS".into()));
+    }
     use base64::Engine;
 
     let exe = self_executable_for_spawn()?;
@@ -345,21 +362,30 @@ pub(super) fn run_gotatun_up(interface: &str, config_content: &str) -> Result<()
         .env("RUST_LOG", crate::logging::current_config().filter)
         .env("TUNMUX_GOTATUN_HELPER", "1")
         .env("TUNMUX_GOTATUN_CONFIG_B64", config_b64)
+        .env("TUNMUX_ALLOW_LAN", if allow_lan { "1" } else { "0" })
         .arg(interface);
     let status = command
         .status()
         .map_err(|e| AppError::Other(format!("gotatun up failed to start: {}", e)))?;
 
     if !status.success() {
-        return Err(AppError::WireGuard(format!("gotatun up exited {}", status)));
+        return Err(AppError::WireGuard(format!(
+            "gotatun up exited {}; see /var/run/wireguard/{interface}.log for helper diagnostics",
+            status
+        )));
     }
     Ok(())
 }
 
-pub(super) fn run_gotatun_down(interface: &str) -> Result<()> {
+pub(super) fn run_gotatun_down_session(interface: &str, session_id: Option<&str>) -> Result<()> {
     let stop_path =
         std::path::PathBuf::from("/var/run/wireguard").join(format!("{interface}.stop"));
-    match request_gotatun_stop(&stop_path, interface, std::time::Duration::from_secs(70)) {
+    match request_gotatun_stop_session(
+        &stop_path,
+        interface,
+        session_id,
+        std::time::Duration::from_secs(70),
+    ) {
         Ok(()) => Ok(()),
         Err(AppError::Io(error))
             if matches!(
@@ -369,7 +395,11 @@ pub(super) fn run_gotatun_down(interface: &str) -> Result<()> {
         {
             // Recovery takes the helper's exclusive session lock. A still-live
             // helper or unknown socket ownership must never be replaced.
-            match crate::userspace_helper::recover_stopped(interface) {
+            let recovery = match session_id {
+                Some(id) => crate::userspace_helper::session::recover(interface, id),
+                None => crate::userspace_helper::recover_stopped(interface),
+            };
+            match recovery {
                 Ok(()) => Ok(()),
                 Err(recovery) => Err(AppError::Other(format!(
                     "{error}; recovery unavailable: {recovery:#}"
@@ -380,22 +410,68 @@ pub(super) fn run_gotatun_down(interface: &str) -> Result<()> {
     }
 }
 
+#[cfg(test)]
 fn request_gotatun_stop(
     stop_path: &std::path::Path,
     interface: &str,
     timeout: std::time::Duration,
 ) -> Result<()> {
-    use std::io::{BufRead, BufReader, Read};
-    let stream = UnixStream::connect(stop_path)?;
-    stream.set_read_timeout(Some(timeout))?;
-    let mut response = String::new();
-    BufReader::new(stream.take(4096))
-        .read_line(&mut response)
-        .map_err(|error| {
-            AppError::Other(format!(
-                "waiting for {interface} cleanup acknowledgment failed: {error}"
-            ))
-        })?;
+    request_gotatun_stop_session(stop_path, interface, None, timeout)
+}
+
+fn request_gotatun_stop_session(
+    stop_path: &std::path::Path,
+    interface: &str,
+    session_id: Option<&str>,
+    timeout: std::time::Duration,
+) -> Result<()> {
+    use std::io::Read;
+    let deadline = std::time::Instant::now() + timeout;
+    let mut stream = crate::wireguard::health::connect_probe(stop_path)?;
+    if let Some(id) = session_id {
+        use std::io::Write;
+        stream.set_write_timeout(Some(timeout))?;
+        stream.write_all(format!("stop {id}\n").as_bytes())?;
+    }
+    stream.set_nonblocking(true)?;
+    let mut response = Vec::new();
+    loop {
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        if remaining.is_zero() {
+            return Err(AppError::Other(format!(
+                "waiting for {interface} cleanup acknowledgment timed out"
+            )));
+        }
+        let mut byte = [0];
+        match stream.read(&mut byte) {
+            Ok(0) => {
+                return Err(AppError::Other(format!(
+                    "{interface} cleanup acknowledgment ended before newline"
+                )))
+            }
+            Ok(_) => {
+                response.push(byte[0]);
+                if byte[0] == b'\n' {
+                    break;
+                }
+                if response.len() >= 4096 {
+                    return Err(AppError::Other(format!(
+                        "{interface} cleanup acknowledgment exceeds 4096 bytes"
+                    )));
+                }
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                std::thread::sleep(remaining.min(std::time::Duration::from_millis(5)));
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(error) => {
+                return Err(AppError::Other(format!(
+                    "waiting for {interface} cleanup acknowledgment failed: {error}"
+                )))
+            }
+        }
+    }
+    let response = String::from_utf8_lossy(&response);
     if response.trim() != "ok" {
         return Err(AppError::Other(format!(
             "{interface} cleanup incomplete: {}",
@@ -462,7 +538,7 @@ mod lifecycle_tests {
     static NEXT_SOCKET: AtomicU64 = AtomicU64::new(0);
 
     fn stop_server(
-        response: &'static [u8],
+        response: &[u8],
         delay: Duration,
     ) -> (std::path::PathBuf, std::thread::JoinHandle<()>) {
         let path = std::env::temp_dir().join(format!(
@@ -471,12 +547,40 @@ mod lifecycle_tests {
             NEXT_SOCKET.fetch_add(1, Ordering::Relaxed)
         ));
         let listener = UnixListener::bind(&path).unwrap();
+        let response = response.to_vec();
         let worker = std::thread::spawn(move || {
             let (mut client, _) = listener.accept().unwrap();
             std::thread::sleep(delay);
-            let _ = client.write_all(response);
+            let _ = client.write_all(&response);
         });
         (path, worker)
+    }
+
+    #[test]
+    fn test_disconnect_sends_expected_session_identity() {
+        use std::io::{BufRead, BufReader};
+        let path = std::env::temp_dir().join(format!(
+            "tunmux-stop-{}-{}.sock",
+            std::process::id(),
+            NEXT_SOCKET.fetch_add(1, Ordering::Relaxed)
+        ));
+        let listener = UnixListener::bind(&path).unwrap();
+        let worker = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = String::new();
+            BufReader::new(&stream).read_line(&mut request).unwrap();
+            assert_eq!(request, "stop expected-session\n");
+            stream.write_all(b"ok\n").unwrap();
+        });
+        let result = request_gotatun_stop_session(
+            &path,
+            "test",
+            Some("expected-session"),
+            Duration::from_secs(1),
+        );
+        worker.join().unwrap();
+        std::fs::remove_file(path).unwrap();
+        assert!(result.is_ok(), "{result:?}");
     }
 
     #[test]
@@ -486,7 +590,10 @@ mod lifecycle_tests {
         let result = request_gotatun_stop(&path, "test", Duration::from_secs(1));
         worker.join().unwrap();
         std::fs::remove_file(path).unwrap();
-        assert!(result.is_ok() && started.elapsed() >= Duration::from_millis(50));
+        assert!(
+            result.is_ok() && started.elapsed() >= Duration::from_millis(50),
+            "{result:?}"
+        );
     }
 
     #[test]
@@ -495,10 +602,8 @@ mod lifecycle_tests {
         let result = request_gotatun_stop(&path, "test", Duration::from_secs(1));
         worker.join().unwrap();
         std::fs::remove_file(path).unwrap();
-        assert!(result
-            .unwrap_err()
-            .to_string()
-            .contains("DNS restoration pending"));
+        let error = result.unwrap_err().to_string();
+        assert!(error.contains("DNS restoration pending"), "{error}");
     }
 
     #[test]
@@ -508,6 +613,53 @@ mod lifecycle_tests {
         worker.join().unwrap();
         std::fs::remove_file(path).unwrap();
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_disconnect_rejects_unterminated_acknowledgment() {
+        let (path, worker) = stop_server(b"ok", Duration::ZERO);
+        let result = request_gotatun_stop(&path, "test", Duration::from_secs(1));
+        worker.join().unwrap();
+        std::fs::remove_file(path).unwrap();
+        let error = result.unwrap_err().to_string();
+        assert!(error.contains("before newline"), "{error}");
+    }
+
+    #[test]
+    fn test_disconnect_trickled_response_has_total_deadline() {
+        let path = std::env::temp_dir().join(format!(
+            "tunmux-stop-{}-{}.sock",
+            std::process::id(),
+            NEXT_SOCKET.fetch_add(1, Ordering::Relaxed)
+        ));
+        let listener = UnixListener::bind(&path).unwrap();
+        let worker = std::thread::spawn(move || {
+            let (mut client, _) = listener.accept().unwrap();
+            for byte in b"ok\n" {
+                std::thread::sleep(Duration::from_millis(70));
+                if client.write_all(&[*byte]).is_err() {
+                    break;
+                }
+            }
+        });
+        let result = request_gotatun_stop(&path, "test", Duration::from_millis(150));
+        worker.join().unwrap();
+        std::fs::remove_file(path).unwrap();
+        assert!(
+            result.is_err(),
+            "trickled bytes must not reset the deadline"
+        );
+    }
+
+    #[test]
+    fn test_disconnect_rejects_overlong_response() {
+        let response = vec![b'x'; 4097];
+        let (path, worker) = stop_server(&response, Duration::ZERO);
+        let result = request_gotatun_stop(&path, "test", Duration::from_secs(1));
+        worker.join().unwrap();
+        std::fs::remove_file(path).unwrap();
+        let error = result.unwrap_err().to_string();
+        assert!(error.contains("4096"), "{error}");
     }
 
     #[test]

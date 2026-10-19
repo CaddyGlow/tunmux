@@ -88,12 +88,26 @@ fn cmd_connect(args: WgconfConnectArgs, config: &AppConfig) -> anyhow::Result<()
         let routed = routed
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("missing parsed routed config"))?;
-        connect_proxy(&source, routed, mtu, config)?;
+        connect_proxy(
+            &source,
+            routed,
+            mtu,
+            args.socks_port,
+            args.http_port,
+            config,
+        )?;
     } else if args.local_proxy {
         let routed = routed
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("missing parsed routed config"))?;
-        connect_local_proxy(&source, routed, args.mtu, config)?;
+        connect_local_proxy(
+            &source,
+            routed,
+            args.mtu,
+            args.socks_port,
+            args.http_port,
+            config,
+        )?;
     } else {
         connect_direct(
             &source,
@@ -193,6 +207,8 @@ fn connect_proxy(
     source: &ConfigSource,
     routed: &RoutedConfig,
     mtu: Option<u16>,
+    socks_port: Option<u16>,
+    http_port: Option<u16>,
     config: &AppConfig,
 ) -> anyhow::Result<()> {
     let instance = connection_ops::derive_instance_name(
@@ -202,8 +218,11 @@ fn connect_proxy(
     )?;
     connection_ops::ensure_instance_available(&instance, "source", &source.display_name)?;
 
-    let proxy_config =
-        connection_ops::resolve_proxy_config(None, None, config.general.proxy_access_log)?;
+    let proxy_config = connection_ops::resolve_proxy_config(
+        socks_port,
+        http_port,
+        config.general.proxy_access_log,
+    )?;
 
     routed.with_params(mtu, |params| {
         let endpoint = format_endpoint(&routed.server_ip, routed.server_port);
@@ -225,6 +244,8 @@ fn connect_local_proxy(
     source: &ConfigSource,
     routed: &RoutedConfig,
     mtu: Option<u16>,
+    socks_port: Option<u16>,
+    http_port: Option<u16>,
     config: &AppConfig,
 ) -> anyhow::Result<()> {
     let instance = connection_ops::derive_instance_name(
@@ -234,8 +255,11 @@ fn connect_local_proxy(
     )?;
     connection_ops::ensure_instance_available(&instance, "source", &source.display_name)?;
 
-    let proxy_config =
-        connection_ops::resolve_proxy_config(None, None, config.general.proxy_access_log)?;
+    let proxy_config = connection_ops::resolve_proxy_config(
+        socks_port,
+        http_port,
+        config.general.proxy_access_log,
+    )?;
 
     routed.with_params(mtu, |params| {
         let endpoint = format_endpoint(&routed.server_ip, routed.server_port);

@@ -67,6 +67,9 @@ pub fn up(
     }
 
     let state = ConnectionState {
+        source_spec: None,
+        allow_lan: false,
+        session_id: None,
         instance_name: DIRECT_INSTANCE.to_string(),
         provider: provider.to_string(),
         interface_name: interface_name.to_string(),
@@ -546,9 +549,12 @@ fn up_macos(
     }
 
     let wg_config = super::config::generate_config(params);
-    super::userspace::up_raw(&wg_config, interface_name)?;
+    let session_id = super::userspace::up_raw_with_session(&wg_config, interface_name)?;
 
     let state = ConnectionState {
+        source_spec: None,
+        allow_lan: false,
+        session_id: Some(session_id.clone()),
         instance_name: DIRECT_INSTANCE.to_string(),
         provider: provider.to_string(),
         interface_name: interface_name.to_string(),
@@ -568,7 +574,9 @@ fn up_macos(
         virtual_ips: vec![],
         keepalive_secs: None,
     };
-    state.save()?;
+    super::userspace::finish_startup(state.save(), || {
+        super::userspace::down_for_session(interface_name, &session_id)
+    })?;
 
     info!(
         interface = state.interface_name,
@@ -580,7 +588,8 @@ fn up_macos(
 }
 
 fn down_macos(state: &ConnectionState) -> Result<()> {
-    super::userspace::down_raw(&state.interface_name)?;
+    let id = state.session_id.as_deref().ok_or_else(|| AppError::Other("legacy connection has no verified session identity; disconnect with the version that started it, then reconnect".into()))?;
+    super::userspace::down_for_session(&state.interface_name, id)?;
     ConnectionState::remove(&state.instance_name)?;
     info!(
         interface = state.interface_name,

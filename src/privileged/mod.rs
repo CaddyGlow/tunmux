@@ -1,3 +1,4 @@
+mod activation;
 mod commands;
 mod daemon;
 mod dispatch;
@@ -6,7 +7,6 @@ mod managed_pids;
 use std::collections::HashSet;
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::fs::PermissionsExt;
-use std::os::unix::io::FromRawFd;
 use std::os::unix::net::UnixStream;
 use std::time::{Duration, Instant};
 
@@ -23,6 +23,9 @@ use crate::privileged_api::{PrivilegedRequest, PrivilegedResponse};
 use dispatch::dispatch;
 use managed_pids::{cleanup_stale_managed_pid_registry_entries, ensure_managed_pid_registry_dir};
 
+#[cfg(target_os = "macos")]
+const AUTH_GROUP_NAME: &str = "admin";
+#[cfg(not(target_os = "macos"))]
 const AUTH_GROUP_NAME: &str = "tunmux";
 
 struct ControlState {
@@ -84,18 +87,14 @@ pub fn serve(
             gid = ?gid, "socket_dir_chowned");
     }
 
-    let listener = match systemd_activated_listener()? {
+    let listener = match activation::activated_listener()? {
         Some(listener) => {
-            info!("privileged_service_systemd_socket_activation");
+            info!("privileged_service_socket_activation");
             listener
         }
         None => {
             let socket_path = config::privileged_socket_path();
-            if socket_path.exists() {
-                let _ = std::fs::remove_file(&socket_path);
-            }
-
-            let listener = std::os::unix::net::UnixListener::bind(&socket_path)?;
+            let listener = activation::Listener::bind(&socket_path)?;
             let perms = std::fs::Permissions::from_mode(0o660);
             std::fs::set_permissions(&socket_path, perms)?;
 
@@ -114,7 +113,7 @@ pub fn serve(
     };
 
     if idle_timeout.is_some() {
-        listener.set_nonblocking(true)?;
+        listener.socket.set_nonblocking(true)?;
         info!(
             idle_timeout_ms = ?idle_timeout.map(|d| d.as_millis()).unwrap_or_default() as u64, "privileged_service_idle_timeout_enabled");
     }
@@ -122,7 +121,7 @@ pub fn serve(
     let mut control_state = ControlState::new(cli_autostarted);
     let mut last_activity = Instant::now();
     loop {
-        match listener.accept() {
+        match listener.socket.accept() {
             Ok((stream, _)) => {
                 let mut stream = stream;
                 loop {
@@ -205,37 +204,6 @@ pub fn serve_stdio(cli_idle_timeout_ms: Option<u64>, cli_autostarted: bool) -> a
     }
 }
 
-fn systemd_activated_listener() -> anyhow::Result<Option<std::os::unix::net::UnixListener>> {
-    let Some(listen_pid) = std::env::var("LISTEN_PID").ok() else {
-        return Ok(None);
-    };
-    let listen_pid: u32 = match listen_pid.parse() {
-        Ok(pid) => pid,
-        Err(_) => return Ok(None),
-    };
-    if listen_pid != std::process::id() {
-        return Ok(None);
-    }
-
-    let listen_fds: usize = match std::env::var("LISTEN_FDS")
-        .ok()
-        .and_then(|value| value.parse().ok())
-    {
-        Some(fds) if fds > 0 => fds,
-        _ => return Ok(None),
-    };
-    let _ = listen_fds;
-
-    // First inherited descriptor starts at fd 3 as defined by socket activation protocol.
-    let listener = unsafe { std::os::unix::net::UnixListener::from_raw_fd(3) };
-
-    // Prevent reused descriptors by descendants from accidentally consuming this fd.
-    std::env::remove_var("LISTEN_FDS");
-    std::env::remove_var("LISTEN_PID");
-
-    Ok(Some(listener))
-}
-
 enum ClientReadResult {
     ConnectionClosed,
     Response(PrivilegedResponse),
@@ -288,10 +256,31 @@ fn handle_client(
             }
         }
 
-        #[cfg(not(target_os = "linux"))]
+        #[cfg(target_os = "macos")]
         {
-            let _ = authorized_group;
-            (0u32, 0u32)
+            use std::os::fd::AsRawFd;
+            let mut uid = 0;
+            let mut gid = 0;
+            if unsafe { nix::libc::getpeereid(stream.as_raw_fd(), &mut uid, &mut gid) } != 0 {
+                return ClientReadResult::Response(PrivilegedResponse::Error {
+                    code: "Auth".into(),
+                    message: format!("getpeereid failed: {}", std::io::Error::last_os_error()),
+                });
+            }
+            if !is_authorized(uid, gid, authorized_group) {
+                return ClientReadResult::Response(PrivilegedResponse::Error {
+                    code: "Auth".into(),
+                    message: format!("peer uid={uid} gid={gid} not authorized"),
+                });
+            }
+            (uid, gid)
+        }
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+        {
+            return ClientReadResult::Response(PrivilegedResponse::Error {
+                code: "Auth".into(),
+                message: "peer authentication unsupported on this platform".into(),
+            });
         }
     };
 
@@ -354,6 +343,7 @@ fn process_request_payload(
 
 fn describe_request(request: &PrivilegedRequest) -> &'static str {
     match request {
+        PrivilegedRequest::Capabilities => "Capabilities",
         PrivilegedRequest::NamespaceCreate { .. } => "NamespaceCreate",
         PrivilegedRequest::NamespaceDelete { .. } => "NamespaceDelete",
         PrivilegedRequest::NamespaceExists { .. } => "NamespaceExists",
@@ -380,6 +370,9 @@ fn describe_request(request: &PrivilegedRequest) -> &'static str {
         PrivilegedRequest::LeaseAcquire { .. } => "LeaseAcquire",
         PrivilegedRequest::LeaseRelease { .. } => "LeaseRelease",
         PrivilegedRequest::ShutdownIfIdle => "ShutdownIfIdle",
+        PrivilegedRequest::InspectSession { .. } => "InspectSession",
+        PrivilegedRequest::StartSession { .. } => "StartSession",
+        PrivilegedRequest::RecoverSession { .. } => "RecoverSession",
         PrivilegedRequest::WgShow { .. } => "WgShow",
     }
 }
@@ -402,7 +395,7 @@ fn resolve_authorized_group(cli_group: Option<String>) -> Option<String> {
     Some(AUTH_GROUP_NAME.to_string())
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn is_authorized(peer_uid: u32, peer_gid: u32, authorized_group: Option<&str>) -> bool {
     if peer_uid == 0 {
         return true;
@@ -426,6 +419,15 @@ fn is_authorized(peer_uid: u32, peer_gid: u32, authorized_group: Option<&str>) -
     if let Some(gid) = allowed_gid {
         if gid == peer_gid {
             return true;
+        }
+        // getpeereid returns the effective GID, which may differ from an admin's
+        // supplementary group. Resolve membership using the peer UID, never caller input.
+        if let Ok(Some(user)) = nix::unistd::User::from_uid(nix::unistd::Uid::from_raw(peer_uid)) {
+            if let Ok(name) = std::ffi::CString::new(user.name) {
+                if user_in_group(&name, user.gid, gid) {
+                    return true;
+                }
+            }
         }
     }
 
@@ -604,4 +606,30 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(dir);
     }
+}
+
+#[cfg(target_os = "macos")]
+fn user_in_group(name: &std::ffi::CStr, primary: nix::unistd::Gid, expected: u32) -> bool {
+    // Darwin getgrouplist uses int groups, unlike the POSIX gid_t interface.
+    let mut groups = vec![0i32; 1024];
+    let mut count = groups.len() as i32;
+    let result = unsafe {
+        nix::libc::getgrouplist(
+            name.as_ptr(),
+            primary.as_raw() as i32,
+            groups.as_mut_ptr(),
+            &mut count,
+        )
+    };
+    result >= 0
+        && count >= 0
+        && (count as usize) <= groups.len()
+        && groups[..count as usize]
+            .iter()
+            .any(|g| *g as u32 == expected)
+}
+#[cfg(target_os = "linux")]
+fn user_in_group(name: &std::ffi::CStr, primary: nix::unistd::Gid, expected: u32) -> bool {
+    nix::unistd::getgrouplist(name, primary)
+        .is_ok_and(|groups| groups.iter().any(|g| g.as_raw() == expected))
 }
