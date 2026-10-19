@@ -433,8 +433,7 @@ pub fn delete_session(provider: Provider, config: &AppConfig) -> Result<()> {
 pub fn save_provider_file(provider: Provider, filename: &str, data: &[u8]) -> Result<()> {
     ensure_config_dir(provider)?;
     let path = config_dir(provider).join(filename);
-    fs::write(&path, data)?;
-    fs::set_permissions(&path, fs::Permissions::from_mode(0o600))?;
+    crate::shared::persistence::write_private_atomic(&path, data)?;
     Ok(())
 }
 

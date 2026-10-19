@@ -62,7 +62,7 @@ pub fn local_proxy_config_from_params(
 }
 
 fn parse_endpoint(host: &str, port: u16) -> anyhow::Result<SocketAddr> {
-    let endpoint = format!("{}:{}", host, port);
+    let endpoint = crate::wireguard::config::format_endpoint(host, port);
     if let Ok(addr) = endpoint.parse::<SocketAddr>() {
         return Ok(addr);
     }

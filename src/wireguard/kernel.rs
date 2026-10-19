@@ -71,7 +71,7 @@ pub fn up(
         provider: provider.to_string(),
         interface_name: interface_name.to_string(),
         backend: WgBackend::Kernel,
-        server_endpoint: format!("{}:{}", params.server_ip, params.server_port),
+        server_endpoint: super::config::format_endpoint(params.server_ip, params.server_port),
         server_display_name: server_display_name.to_string(),
         original_gateway_ip: Some(gw_ip.clone()),
         original_gateway_iface: Some(gw_iface.clone()),
@@ -152,7 +152,7 @@ pub fn up_in_netns(
     );
     client.interface_create_wireguard(interface_name)?;
 
-    let endpoint = format!("{}:{}", params.server_ip, params.server_port);
+    let endpoint = super::config::format_endpoint(params.server_ip, params.server_port);
     let allowed_ips_wg = params.allowed_ips.replace(", ", ",");
     log_kernel_setup_command(
         interface_name,
@@ -389,7 +389,7 @@ fn bring_up(
     );
     client.interface_create_wireguard(interface_name)?;
 
-    let endpoint = format!("{}:{}", params.server_ip, params.server_port);
+    let endpoint = super::config::format_endpoint(params.server_ip, params.server_port);
     let allowed_ips_wg = params.allowed_ips.replace(", ", ",");
     log_kernel_setup_command(
         interface_name,
@@ -553,7 +553,7 @@ fn up_macos(
         provider: provider.to_string(),
         interface_name: interface_name.to_string(),
         backend: WgBackend::Kernel,
-        server_endpoint: format!("{}:{}", params.server_ip, params.server_port),
+        server_endpoint: super::config::format_endpoint(params.server_ip, params.server_port),
         server_display_name: server_display_name.to_string(),
         original_gateway_ip: None,
         original_gateway_iface: None,

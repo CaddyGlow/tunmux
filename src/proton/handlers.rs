@@ -1065,31 +1065,26 @@ async fn cmd_connect(
                 .collect();
             let latencies =
                 latency::probe_endpoints_tcp(&targets, Duration::from_millis(800), 24).await;
-            let mut rows: Vec<(&models::server::LogicalServer, Option<Duration>)> =
-                servers.iter().zip(latencies).collect();
-            rows.sort_by(|a, b| {
-                latency_order(&a.1, &b.1)
-                    .then_with(|| a.0.score.partial_cmp(&b.0.score).unwrap_or(Ordering::Equal))
-                    .then_with(|| a.0.name.cmp(&b.0.name))
-            });
-            rows.first()
-                .map(|(server, _)| *server)
+            servers
+                .iter()
+                .zip(latencies)
+                .min_by(|a, b| {
+                    latency_order(&a.1, &b.1)
+                        .then_with(|| a.0.score.partial_cmp(&b.0.score).unwrap_or(Ordering::Equal))
+                        .then_with(|| a.0.name.cmp(&b.0.name))
+                })
+                .map(|(selected, _)| selected)
                 .ok_or(error::AppError::NoServerFound)?
         } else {
-            match args.sort.as_str() {
-                "score" => {
-                    servers
-                        .sort_by(|a, b| a.score.partial_cmp(&b.score).unwrap_or(Ordering::Equal));
-                }
-                "load" => {
-                    servers.sort_by(|a, b| a.load.cmp(&b.load).then_with(|| a.name.cmp(&b.name)));
-                }
-                "name" => {
-                    servers.sort_by(|a, b| a.name.cmp(&b.name));
-                }
-                _ => unreachable!(),
-            }
-            servers.first().ok_or(error::AppError::NoServerFound)?
+            servers
+                .iter()
+                .min_by(|a, b| match args.sort.as_str() {
+                    "score" => a.score.partial_cmp(&b.score).unwrap_or(Ordering::Equal),
+                    "load" => a.load.cmp(&b.load).then_with(|| a.name.cmp(&b.name)),
+                    "name" => a.name.cmp(&b.name),
+                    _ => unreachable!(),
+                })
+                .ok_or(error::AppError::NoServerFound)?
         }
     };
 

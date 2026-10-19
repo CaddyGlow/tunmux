@@ -494,13 +494,11 @@ async fn cmd_connect(
         let latencies =
             latency::probe_endpoints_tcp(&targets, Duration::from_millis(800), 24).await;
 
-        let mut rows: Vec<(&MullvadRelay, Option<Duration>)> =
-            relays.into_iter().zip(latencies).collect();
-        rows.sort_by(|a, b| {
-            latency_order(&a.1, &b.1).then_with(|| a.0.hostname.cmp(&b.0.hostname))
-        });
-        rows.first()
-            .map(|(relay, _)| *relay)
+        relays
+            .into_iter()
+            .zip(latencies)
+            .min_by(|a, b| latency_order(&a.1, &b.1).then_with(|| a.0.hostname.cmp(&b.0.hostname)))
+            .map(|(selected, _)| selected)
             .ok_or(error::AppError::NoServerFound)?
     };
 
@@ -592,10 +590,9 @@ fn select_relay<'a>(
         relays.retain(|r| country_code_from_location(&r.location) == cc_upper);
     }
 
-    relays.sort_by(|a, b| a.hostname.cmp(&b.hostname));
     relays
-        .first()
-        .copied()
+        .into_iter()
+        .min_by(|a, b| a.hostname.cmp(&b.hostname))
         .ok_or_else(|| error::AppError::NoServerFound.into())
 }
 

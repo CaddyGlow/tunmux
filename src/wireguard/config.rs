@@ -233,6 +233,53 @@ pub fn parse_config(input: &str) -> Result<WgParsedConfig> {
     })
 }
 
+/// Owned connection parameters shared by imported and provider configurations.
+/// Intentionally does not implement Debug because it contains private keys.
+pub struct WgConfig {
+    pub private_key: String,
+    pub addresses: Vec<String>,
+    pub dns_servers: Vec<String>,
+    pub server_public_key: String,
+    pub server_ip: String,
+    pub server_port: u16,
+    pub preshared_key: Option<String>,
+    pub allowed_ips: String,
+}
+
+impl WgConfig {
+    /// Borrow parameters for the duration of a backend operation.
+    pub fn with_params<T>(
+        &self,
+        mtu: Option<u16>,
+        operation: impl FnOnce(&WgConfigParams<'_>) -> T,
+    ) -> T {
+        let addresses: Vec<_> = self.addresses.iter().map(String::as_str).collect();
+        let dns_servers: Vec<_> = self.dns_servers.iter().map(String::as_str).collect();
+        operation(&WgConfigParams {
+            private_key: &self.private_key,
+            addresses: &addresses,
+            dns_servers: &dns_servers,
+            mtu,
+            server_public_key: &self.server_public_key,
+            server_ip: &self.server_ip,
+            server_port: self.server_port,
+            preshared_key: self.preshared_key.as_deref(),
+            allowed_ips: &self.allowed_ips,
+        })
+    }
+}
+
+/// Format a hostname or IP endpoint, including IPv6 brackets exactly once.
+#[must_use]
+pub fn format_endpoint(host: &str, port: u16) -> String {
+    let host = host.trim_start_matches('[').trim_end_matches(']');
+    if host.contains(':') {
+        format!("[{host}]:{port}")
+    } else {
+        format!("{host}:{port}")
+    }
+}
+
 /// Parameters needed to generate a WireGuard config.
 pub struct WgConfigParams<'a> {
     pub private_key: &'a str,
@@ -275,10 +322,9 @@ pub fn generate_config(params: &WgConfigParams<'_>) -> String {
 
     config.push_str(&format!(
         "AllowedIPs = {allowed_ips}\n\
-         Endpoint = {server_ip}:{server_port}\n",
+         Endpoint = {endpoint}\n",
         allowed_ips = params.allowed_ips,
-        server_ip = params.server_ip,
-        server_port = params.server_port,
+        endpoint = format_endpoint(params.server_ip, params.server_port),
     ));
 
     config
@@ -287,6 +333,45 @@ pub fn generate_config(params: &WgConfigParams<'_>) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_endpoint_formatting_supports_hostnames_and_ipv6() {
+        for (host, expected) in [
+            ("vpn.example", "vpn.example:51820"),
+            ("192.0.2.1", "192.0.2.1:51820"),
+            ("2001:db8::1", "[2001:db8::1]:51820"),
+            ("[2001:db8::1]", "[2001:db8::1]:51820"),
+        ] {
+            assert_eq!(format_endpoint(host, 51820), expected);
+        }
+    }
+
+    #[test]
+    fn test_owned_config_generates_parseable_ipv6_configuration() {
+        let config = WgConfig {
+            private_key: "private".into(),
+            addresses: vec!["10.0.0.2/32".into(), "fd00::2/128".into()],
+            dns_servers: vec!["10.0.0.1".into(), "fd00::1".into()],
+            server_public_key: "public".into(),
+            server_ip: "2001:db8::1".into(),
+            server_port: 51820,
+            preshared_key: Some("preshared".into()),
+            allowed_ips: "0.0.0.0/0, ::/0".into(),
+        };
+        let text = config.with_params(Some(1380), generate_config);
+        let parsed = parse_config(&text).unwrap();
+        assert_eq!(parsed.private_key, config.private_key);
+        assert_eq!(parsed.addresses, config.addresses);
+        assert_eq!(parsed.dns_servers, config.dns_servers);
+        assert_eq!(parsed.mtu, Some(Mtu::new(1380).unwrap()));
+        assert_eq!(parsed.peers[0].public_key, config.server_public_key);
+        assert_eq!(parsed.peers[0].preshared_key, config.preshared_key);
+        assert_eq!(parsed.peers[0].allowed_ips, config.allowed_ips);
+        assert_eq!(
+            parsed.peers[0].endpoint.as_deref(),
+            Some("[2001:db8::1]:51820")
+        );
+    }
 
     #[test]
     fn test_mtu_validation_and_override_precedence() {

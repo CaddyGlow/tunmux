@@ -10,6 +10,37 @@ use crate::wireguard;
 use crate::wireguard::backend::WgBackend;
 use crate::wireguard::connection::ConnectionState;
 
+/// Owns rollback until startup has successfully persisted its connection state.
+struct StartupGuard<F: FnOnce()> {
+    rollback: Option<F>,
+}
+
+impl<F: FnOnce()> StartupGuard<F> {
+    fn new(rollback: F) -> Self {
+        Self {
+            rollback: Some(rollback),
+        }
+    }
+
+    fn commit(mut self) {
+        self.rollback.take();
+    }
+}
+
+impl<F: FnOnce()> Drop for StartupGuard<F> {
+    fn drop(&mut self) {
+        if let Some(rollback) = self.rollback.take() {
+            rollback();
+        }
+    }
+}
+
+fn log_cleanup_error(result: anyhow::Result<()>) {
+    if let Err(error) = result {
+        tracing::warn!(%error, "connection_rollback_failed");
+    }
+}
+
 /// Describes a selected server for connection routing.
 pub struct ResolvedServer<'a> {
     pub instance_seed: &'a str,
@@ -61,7 +92,10 @@ pub fn connect_routed(
             instance: &instance,
             display_name: server.display_name,
             connect_endpoint: params.server_ip,
-            state_endpoint: &format!("{}:{}", params.server_ip, params.server_port),
+            state_endpoint: &wireguard::config::format_endpoint(
+                params.server_ip,
+                params.server_port,
+            ),
             dns_servers: params.dns_servers.iter().map(|s| s.to_string()).collect(),
             params,
             proxy_config: &proxy_config,
@@ -77,7 +111,10 @@ pub fn connect_routed(
             instance: &instance,
             display_name: server.display_name,
             connect_endpoint: params.server_ip,
-            state_endpoint: &format!("{}:{}", params.server_ip, params.server_port),
+            state_endpoint: &wireguard::config::format_endpoint(
+                params.server_ip,
+                params.server_port,
+            ),
             dns_servers: params.dns_servers.iter().map(|s| s.to_string()).collect(),
             virtual_ips: params.addresses.iter().map(|s| s.to_string()).collect(),
             peer_public_key: params.server_public_key,
@@ -372,6 +409,17 @@ pub fn connect_direct_wg(
 ) -> anyhow::Result<()> {
     use wireguard::connection::{ConnectionState, DIRECT_INSTANCE};
 
+    if matches!(backend, WgBackend::WgQuick | WgBackend::Userspace) {
+        return connect_direct_config(
+            &wireguard::config::generate_config(params),
+            backend,
+            interface_name,
+            provider,
+            display_name,
+            config,
+        );
+    }
+
     ensure_instance_available(DIRECT_INSTANCE, "direct VPN", display_name)?;
     if (backend != WgBackend::Userspace && wireguard::wg_quick::is_interface_active(interface_name))
         || wireguard::userspace::is_interface_active(interface_name)
@@ -385,17 +433,6 @@ pub fn connect_direct_wg(
     println!("Connecting to {} ({})...", display_name, params.server_ip);
 
     match backend {
-        WgBackend::WgQuick => {
-            let wg_config = wireguard::config::generate_config(params);
-            let effective_iface =
-                wireguard::wg_quick::up(&wg_config, interface_name, provider, false)?;
-            build_direct_state(params, backend, effective_iface, provider, display_name).save()?;
-        }
-        WgBackend::Userspace => {
-            let wg_config = wireguard::config::generate_config(params);
-            let effective_iface = wireguard::userspace::up(&wg_config, interface_name, provider)?;
-            build_direct_state(params, backend, effective_iface, provider, display_name).save()?;
-        }
         WgBackend::Kernel => {
             wireguard::kernel::up(
                 params,
@@ -405,7 +442,7 @@ pub fn connect_direct_wg(
                 disable_ipv6,
             )?;
         }
-        WgBackend::LocalProxy => {
+        _ => {
             anyhow::bail!("use --local-proxy flag to start userspace WireGuard proxy mode");
         }
     }
@@ -417,21 +454,51 @@ pub fn connect_direct_wg(
     Ok(())
 }
 
-fn build_direct_state(
-    params: &wireguard::config::WgConfigParams<'_>,
+/// Connect a full config without discarding wg-quick directives or additional peers.
+pub fn connect_direct_config(
+    text: &str,
     backend: WgBackend,
-    effective_iface: String,
+    interface_name: &str,
     provider: Provider,
     display_name: &str,
-) -> wireguard::connection::ConnectionState {
-    use wireguard::connection::{ConnectionState, DIRECT_INSTANCE};
+    config: &AppConfig,
+) -> anyhow::Result<()> {
+    use wireguard::connection::DIRECT_INSTANCE;
 
-    ConnectionState {
+    ensure_instance_available(DIRECT_INSTANCE, "direct VPN", display_name)?;
+    if (backend != WgBackend::Userspace && wireguard::wg_quick::is_interface_active(interface_name))
+        || wireguard::userspace::is_interface_active(interface_name)
+    {
+        anyhow::bail!(
+            "Already connected. Run `tunmux disconnect --provider {}` first.",
+            provider.dir_name()
+        );
+    }
+    let parsed = wireguard::config::parse_config(text)?;
+    println!("Connecting to {}...", display_name);
+    let effective_iface = match backend {
+        WgBackend::WgQuick => wireguard::wg_quick::up(text, interface_name, provider, false)?,
+        WgBackend::Userspace => wireguard::userspace::up(text, interface_name, provider)?,
+        _ => anyhow::bail!("full config startup requires wg-quick or userspace backend"),
+    };
+    let rollback = StartupGuard::new(|| {
+        let result = if backend == WgBackend::Userspace {
+            wireguard::userspace::down(&effective_iface, provider)
+        } else {
+            wireguard::wg_quick::down(&effective_iface, provider)
+        };
+        log_cleanup_error(result.map_err(Into::into));
+    });
+    let state = ConnectionState {
         instance_name: DIRECT_INSTANCE.to_string(),
         provider: provider.dir_name().to_string(),
-        interface_name: effective_iface,
+        interface_name: effective_iface.clone(),
         backend,
-        server_endpoint: format!("{}:{}", params.server_ip, params.server_port),
+        server_endpoint: parsed
+            .peers
+            .first()
+            .and_then(|peer| peer.endpoint.clone())
+            .unwrap_or_else(|| "unknown".to_string()),
         server_display_name: display_name.to_string(),
         original_gateway_ip: None,
         original_gateway_iface: None,
@@ -440,12 +507,16 @@ fn build_direct_state(
         proxy_pid: None,
         socks_port: None,
         http_port: None,
-        dns_servers: params.dns_servers.iter().map(|s| s.to_string()).collect(),
-        peer_public_key: Some(params.server_public_key.to_string()),
+        dns_servers: parsed.dns_servers,
+        peer_public_key: parsed.peers.first().map(|peer| peer.public_key.clone()),
         local_public_key: None,
         virtual_ips: vec![],
         keepalive_secs: None,
-    }
+    };
+    state.save()?;
+    rollback.commit();
+    hooks::run_ifup(config, provider, &state);
+    Ok(())
 }
 
 /// Disconnect the direct instance for a provider, if it exists.
@@ -490,19 +561,16 @@ pub fn connect_proxy_via_netns(ctx: &ConnectContext<'_>) -> anyhow::Result<()> {
     println!("Connecting to {} ({})...", display_name, connect_endpoint);
 
     netns::create(&namespace_name)?;
-
-    if let Err(e) = wireguard::kernel::up_in_netns(params, &interface_name, &namespace_name) {
-        netns::delete(&namespace_name)?;
-        return Err(e.into());
-    }
-
-    let pid = match proxy::spawn_daemon(instance, &interface_name, &namespace_name, proxy_config) {
-        Ok(pid) => pid,
-        Err(e) => {
-            netns::delete(&namespace_name)?;
-            return Err(e);
-        }
-    };
+    let namespace_guard = StartupGuard::new(|| {
+        log_cleanup_error(netns::delete(&namespace_name).map_err(Into::into));
+    });
+    wireguard::kernel::up_in_netns(params, &interface_name, &namespace_name)?;
+    let pid = proxy::spawn_daemon(instance, &interface_name, &namespace_name, proxy_config)?;
+    let daemon_guard = StartupGuard::new(|| {
+        log_cleanup_error(proxy::stop_daemon(pid));
+        let _ = std::fs::remove_file(proxy::pid_file(instance));
+        let _ = std::fs::remove_file(proxy::log_file(instance));
+    });
 
     let state = ConnectionState {
         instance_name: instance.to_string(),
@@ -514,7 +582,7 @@ pub fn connect_proxy_via_netns(ctx: &ConnectContext<'_>) -> anyhow::Result<()> {
         original_gateway_ip: None,
         original_gateway_iface: None,
         original_resolv_conf: None,
-        namespace_name: Some(namespace_name),
+        namespace_name: Some(namespace_name.clone()),
         proxy_pid: Some(pid),
         socks_port: Some(proxy_config.socks_port),
         http_port: Some(proxy_config.http_port),
@@ -525,6 +593,8 @@ pub fn connect_proxy_via_netns(ctx: &ConnectContext<'_>) -> anyhow::Result<()> {
         keepalive_secs: None,
     };
     state.save()?;
+    daemon_guard.commit();
+    namespace_guard.commit();
     hooks::run_ifup(config, provider, &state);
 
     println!(
@@ -573,6 +643,11 @@ pub fn connect_local_proxy_instance(ctx: &LocalProxyContext<'_>) -> anyhow::Resu
     println!("Connecting to {} ({})...", display_name, connect_endpoint);
 
     let pid = local_proxy::spawn_daemon(instance, &cfg, proxy_config.access_log)?;
+    let daemon_guard = StartupGuard::new(|| {
+        log_cleanup_error(local_proxy::stop_daemon(pid));
+        let _ = std::fs::remove_file(proxy::local_pid_file(instance));
+        let _ = std::fs::remove_file(proxy::local_log_file(instance));
+    });
 
     let state = ConnectionState {
         instance_name: instance.to_string(),
@@ -595,6 +670,7 @@ pub fn connect_local_proxy_instance(ctx: &LocalProxyContext<'_>) -> anyhow::Resu
         keepalive_secs: cfg.keepalive,
     };
     state.save()?;
+    daemon_guard.commit();
     hooks::run_ifup(config, provider, &state);
 
     println!(
@@ -602,4 +678,31 @@ pub fn connect_local_proxy_instance(ctx: &LocalProxyContext<'_>) -> anyhow::Resu
         instance, display_name, proxy_config.socks_port, proxy_config.http_port
     );
     Ok(())
+}
+
+#[cfg(test)]
+mod startup_tests {
+    use super::StartupGuard;
+    use std::cell::RefCell;
+
+    #[test]
+    fn test_failed_startup_rolls_back_in_reverse_order_and_preserves_error() {
+        let cleanup = RefCell::new(Vec::new());
+        let result: anyhow::Result<()> = (|| {
+            let _namespace = StartupGuard::new(|| cleanup.borrow_mut().push("namespace"));
+            let _daemon = StartupGuard::new(|| cleanup.borrow_mut().push("daemon"));
+            Err(anyhow::anyhow!("state save failed"))?;
+            Ok(())
+        })();
+        assert_eq!(result.unwrap_err().to_string(), "state save failed");
+        assert_eq!(*cleanup.borrow(), ["daemon", "namespace"]);
+    }
+
+    #[test]
+    fn test_successful_startup_keeps_resources() {
+        let cleanup = RefCell::new(Vec::new());
+        let guard = StartupGuard::new(|| cleanup.borrow_mut().push("daemon"));
+        guard.commit();
+        assert!(cleanup.borrow().is_empty());
+    }
 }

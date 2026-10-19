@@ -65,6 +65,7 @@ fn unavailable(provider: Provider, backend: &str, operation: &str, reason: &str)
     AppError::CredentialStoreUnavailable(format_message(provider, backend, operation, reason))
 }
 
+#[cfg(target_os = "android")]
 fn misconfigured(provider: Provider, backend: &str, operation: &str, reason: &str) -> AppError {
     AppError::CredentialStoreMisconfigured(format_message(provider, backend, operation, reason))
 }

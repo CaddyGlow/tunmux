@@ -9,7 +9,6 @@ use anyhow::Context;
 use crate::cli::{WgconfCommand, WgconfConnectArgs};
 use crate::config::{self, AppConfig, Provider};
 use crate::shared::connection_ops;
-use crate::shared::hooks;
 use crate::wireguard;
 
 const PROVIDER: Provider = Provider::Wgconf;
@@ -22,17 +21,7 @@ struct ConfigSource {
     config_text: String,
 }
 
-#[derive(Debug)]
-struct RoutedConfig {
-    private_key: String,
-    addresses: Vec<String>,
-    dns_servers: Vec<String>,
-    server_public_key: String,
-    server_ip: String,
-    server_port: u16,
-    preshared_key: Option<String>,
-    allowed_ips: String,
-}
+use crate::wireguard::config::{format_endpoint, WgConfig as RoutedConfig};
 
 pub async fn dispatch(command: WgconfCommand, config: &AppConfig) -> anyhow::Result<()> {
     match command {
@@ -153,82 +142,16 @@ fn connect_direct(
     mtu: Option<u16>,
     config: &AppConfig,
 ) -> anyhow::Result<()> {
-    use wireguard::connection::DIRECT_INSTANCE;
-
-    crate::shared::connection_ops::ensure_instance_available(
-        DIRECT_INSTANCE,
-        "direct VPN",
-        "wgconf",
-    )?;
-    if (backend != wireguard::backend::WgBackend::Userspace
-        && wireguard::wg_quick::is_interface_active(INTERFACE_NAME))
-        || wireguard::userspace::is_interface_active(INTERFACE_NAME)
-    {
-        anyhow::bail!("Already connected. Run `tunmux disconnect --provider wgconf` first.");
-    }
-
-    println!("Connecting to {}...", source.display_name);
-
-    let state_endpoint = routed
-        .map(|cfg| format_endpoint(&cfg.server_ip, cfg.server_port))
-        .unwrap_or_else(|| best_effort_endpoint(&source.config_text));
-    let parsed_config = wireguard::config::parse_config(&source.config_text)?;
-    let state_peer_public_key = parsed_config
-        .peers
-        .first()
-        .map(|peer| peer.public_key.clone());
-    let state_dns_servers = parsed_config.dns_servers;
-
     match backend {
-        wireguard::backend::WgBackend::WgQuick => {
-            let effective_iface =
-                wireguard::wg_quick::up(&source.config_text, INTERFACE_NAME, PROVIDER, false)?;
-            let state = wireguard::connection::ConnectionState {
-                instance_name: DIRECT_INSTANCE.to_string(),
-                provider: PROVIDER.dir_name().to_string(),
-                interface_name: effective_iface,
+        wireguard::backend::WgBackend::WgQuick | wireguard::backend::WgBackend::Userspace => {
+            connection_ops::connect_direct_config(
+                &source.config_text,
                 backend,
-                server_endpoint: state_endpoint,
-                server_display_name: source.display_name.clone(),
-                original_gateway_ip: None,
-                original_gateway_iface: None,
-                original_resolv_conf: None,
-                namespace_name: None,
-                proxy_pid: None,
-                socks_port: None,
-                http_port: None,
-                dns_servers: state_dns_servers.clone(),
-                peer_public_key: state_peer_public_key.clone(),
-                local_public_key: None,
-                virtual_ips: vec![],
-                keepalive_secs: None,
-            };
-            state.save()?;
-        }
-        wireguard::backend::WgBackend::Userspace => {
-            let effective_iface =
-                wireguard::userspace::up(&source.config_text, INTERFACE_NAME, PROVIDER)?;
-            let state = wireguard::connection::ConnectionState {
-                instance_name: DIRECT_INSTANCE.to_string(),
-                provider: PROVIDER.dir_name().to_string(),
-                interface_name: effective_iface,
-                backend,
-                server_endpoint: state_endpoint,
-                server_display_name: source.display_name.clone(),
-                original_gateway_ip: None,
-                original_gateway_iface: None,
-                original_resolv_conf: None,
-                namespace_name: None,
-                proxy_pid: None,
-                socks_port: None,
-                http_port: None,
-                dns_servers: state_dns_servers.clone(),
-                peer_public_key: state_peer_public_key.clone(),
-                local_public_key: None,
-                virtual_ips: vec![],
-                keepalive_secs: None,
-            };
-            state.save()?;
+                INTERFACE_NAME,
+                PROVIDER,
+                &source.display_name,
+                config,
+            )?;
         }
         wireguard::backend::WgBackend::Kernel => {
             let routed = routed.ok_or_else(|| anyhow::anyhow!("missing parsed routed config"))?;
@@ -242,33 +165,21 @@ fn connect_direct(
                     routed.server_ip
                 );
             }
-            let (addresses, dns_servers) = routed_param_refs(routed);
-            let params = wireguard::config::WgConfigParams {
-                private_key: &routed.private_key,
-                addresses: &addresses,
-                dns_servers: &dns_servers,
-                mtu,
-                server_public_key: &routed.server_public_key,
-                server_ip: &routed.server_ip,
-                server_port: routed.server_port,
-                preshared_key: routed.preshared_key.as_deref(),
-                allowed_ips: &routed.allowed_ips,
-            };
-            wireguard::kernel::up(
-                &params,
-                INTERFACE_NAME,
-                PROVIDER.dir_name(),
-                &source.display_name,
-                disable_ipv6,
-            )?;
+            routed.with_params(mtu, |params| {
+                connection_ops::connect_direct_wg(
+                    params,
+                    backend,
+                    INTERFACE_NAME,
+                    PROVIDER,
+                    &source.display_name,
+                    disable_ipv6,
+                    config,
+                )
+            })?;
         }
         wireguard::backend::WgBackend::LocalProxy => {
             anyhow::bail!("use --local-proxy flag to start userspace WireGuard proxy mode");
         }
-    }
-
-    if let Some(state) = wireguard::connection::ConnectionState::load(DIRECT_INSTANCE)? {
-        hooks::run_ifup(config, PROVIDER, &state);
     }
 
     println!(
@@ -294,30 +205,19 @@ fn connect_proxy(
     let proxy_config =
         connection_ops::resolve_proxy_config(None, None, config.general.proxy_access_log)?;
 
-    let (addresses, dns_servers) = routed_param_refs(routed);
-    let params = wireguard::config::WgConfigParams {
-        private_key: &routed.private_key,
-        addresses: &addresses,
-        dns_servers: &dns_servers,
-        mtu,
-        server_public_key: &routed.server_public_key,
-        server_ip: &routed.server_ip,
-        server_port: routed.server_port,
-        preshared_key: routed.preshared_key.as_deref(),
-        allowed_ips: &routed.allowed_ips,
-    };
-
-    let endpoint = format_endpoint(&routed.server_ip, routed.server_port);
-    connection_ops::connect_proxy_via_netns(&connection_ops::ConnectContext {
-        provider: PROVIDER,
-        instance: &instance,
-        display_name: &source.display_name,
-        connect_endpoint: &endpoint,
-        state_endpoint: &endpoint,
-        dns_servers: routed.dns_servers.clone(),
-        params: &params,
-        proxy_config: &proxy_config,
-        config,
+    routed.with_params(mtu, |params| {
+        let endpoint = format_endpoint(&routed.server_ip, routed.server_port);
+        connection_ops::connect_proxy_via_netns(&connection_ops::ConnectContext {
+            provider: PROVIDER,
+            instance: &instance,
+            display_name: &source.display_name,
+            connect_endpoint: &endpoint,
+            state_endpoint: &endpoint,
+            dns_servers: routed.dns_servers.clone(),
+            params,
+            proxy_config: &proxy_config,
+            config,
+        })
     })
 }
 
@@ -337,32 +237,21 @@ fn connect_local_proxy(
     let proxy_config =
         connection_ops::resolve_proxy_config(None, None, config.general.proxy_access_log)?;
 
-    let (addresses, dns_servers) = routed_param_refs(routed);
-    let params = wireguard::config::WgConfigParams {
-        private_key: &routed.private_key,
-        addresses: &addresses,
-        dns_servers: &dns_servers,
-        mtu,
-        server_public_key: &routed.server_public_key,
-        server_ip: &routed.server_ip,
-        server_port: routed.server_port,
-        preshared_key: routed.preshared_key.as_deref(),
-        allowed_ips: &routed.allowed_ips,
-    };
-
-    let endpoint = format_endpoint(&routed.server_ip, routed.server_port);
-    connection_ops::connect_local_proxy_instance(&connection_ops::LocalProxyContext {
-        provider: PROVIDER,
-        instance: &instance,
-        display_name: &source.display_name,
-        connect_endpoint: &endpoint,
-        state_endpoint: &endpoint,
-        dns_servers: routed.dns_servers.clone(),
-        virtual_ips: routed.addresses.clone(),
-        peer_public_key: &routed.server_public_key,
-        params: &params,
-        proxy_config: &proxy_config,
-        config,
+    routed.with_params(mtu, |params| {
+        let endpoint = format_endpoint(&routed.server_ip, routed.server_port);
+        connection_ops::connect_local_proxy_instance(&connection_ops::LocalProxyContext {
+            provider: PROVIDER,
+            instance: &instance,
+            display_name: &source.display_name,
+            connect_endpoint: &endpoint,
+            state_endpoint: &endpoint,
+            dns_servers: routed.dns_servers.clone(),
+            virtual_ips: routed.addresses.clone(),
+            peer_public_key: &routed.server_public_key,
+            params,
+            proxy_config: &proxy_config,
+            config,
+        })
     })
 }
 
@@ -523,39 +412,11 @@ fn parse_endpoint(value: &str) -> anyhow::Result<(IpAddr, u16)> {
     Ok((ip, port))
 }
 
-fn routed_param_refs(routed: &RoutedConfig) -> (Vec<&str>, Vec<&str>) {
-    (
-        routed.addresses.iter().map(String::as_str).collect(),
-        routed.dns_servers.iter().map(String::as_str).collect(),
-    )
-}
-
 fn has_ipv6_interface_address(addresses: &[String]) -> bool {
     addresses.iter().any(|cidr| {
         let ip = cidr.split('/').next().unwrap_or_default().trim();
         ip.parse::<IpAddr>().is_ok_and(|addr| addr.is_ipv6())
     })
-}
-
-fn best_effort_endpoint(config_text: &str) -> String {
-    if let Ok(parsed) = wireguard::config::parse_config(config_text) {
-        for peer in parsed.peers {
-            if let Some(endpoint) = peer.endpoint {
-                if let Ok((ip, port)) = parse_endpoint(&endpoint) {
-                    return format_endpoint(&ip.to_string(), port);
-                }
-            }
-        }
-    }
-    "unknown".to_string()
-}
-
-fn format_endpoint(host: &str, port: u16) -> String {
-    if host.contains(':') {
-        format!("[{}]:{}", host, port)
-    } else {
-        format!("{}:{}", host, port)
-    }
 }
 
 fn validate_profile_name(name: &str) -> anyhow::Result<String> {
@@ -625,14 +486,8 @@ fn save_profile_content(name: &str, content: &str) -> anyhow::Result<()> {
 fn save_profile_content_in(provider: &Path, name: &str, content: &str) -> anyhow::Result<()> {
     ensure_profile_dirs_in(provider)?;
     let path = profile_path_in(provider, name)?;
-    fs::write(&path, content)
+    crate::shared::persistence::write_private_atomic(&path, content.as_bytes())
         .with_context(|| format!("failed to write profile file {}", path.display()))?;
-    fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).with_context(|| {
-        format!(
-            "failed to set profile file permissions for {}",
-            path.display()
-        )
-    })?;
     Ok(())
 }
 
@@ -736,7 +591,9 @@ mod tests {
     #[test]
     fn routed_parse_requires_dns_and_valid_peer_endpoint() {
         let no_dns = "[Interface]\nPrivateKey = a\nAddress = 10.0.0.2/32\n[Peer]\nPublicKey = b\nAllowedIPs = 0.0.0.0/0\nEndpoint = 198.51.100.10:51820\n";
-        let err = parse_routed_config(no_dns).expect_err("dns should be required");
+        let err = parse_routed_config(no_dns)
+            .err()
+            .expect("dns should be required");
         assert!(err.to_string().contains("Interface.DNS"));
 
         let with_dns = "[Interface]\nPrivateKey = a\nAddress = 10.0.0.2/32\nDNS = 1.1.1.1\n[Peer]\nPublicKey = b\nAllowedIPs = 0.0.0.0/0\nEndpoint = [2001:db8::1]:51820\n";

@@ -585,22 +585,19 @@ async fn cmd_connect(args: crate::cli::IvpnConnectArgs, config: &AppConfig) -> a
         let latencies =
             latency::probe_endpoints_tcp(&targets, Duration::from_millis(800), 24).await;
 
-        let mut latency_rows: Vec<((&IvpnWireGuardServer, &IvpnWireGuardHost), Option<Duration>)> =
-            rows.into_iter().zip(latencies).collect();
-        latency_rows.sort_by(|a, b| {
-            latency_order(&a.1, &b.1)
-                .then_with(|| {
-                    a.0 .1
-                        .load
-                        .partial_cmp(&b.0 .1.load)
-                        .unwrap_or(std::cmp::Ordering::Equal)
-                })
-                .then_with(|| a.0 .1.hostname.cmp(&b.0 .1.hostname))
-        });
-
-        latency_rows
-            .first()
-            .map(|(row, _)| *row)
+        rows.into_iter()
+            .zip(latencies)
+            .min_by(|a, b| {
+                latency_order(&a.1, &b.1)
+                    .then_with(|| {
+                        a.0 .1
+                            .load
+                            .partial_cmp(&b.0 .1.load)
+                            .unwrap_or(std::cmp::Ordering::Equal)
+                    })
+                    .then_with(|| a.0 .1.hostname.cmp(&b.0 .1.hostname))
+            })
+            .map(|(selected, _)| selected)
             .ok_or(error::AppError::NoServerFound)?
     };
 
@@ -710,21 +707,16 @@ fn select_host<'a>(
         }
     }
 
-    match sort {
-        "name" => {
-            rows.sort_by(|a, b| a.1.hostname.cmp(&b.1.hostname));
-        }
-        _ => {
-            rows.sort_by(|a, b| {
+    rows.into_iter()
+        .min_by(|a, b| match sort {
+            "name" => a.1.hostname.cmp(&b.1.hostname),
+            _ => {
                 a.1.load
                     .partial_cmp(&b.1.load)
                     .unwrap_or(std::cmp::Ordering::Equal)
                     .then_with(|| a.1.hostname.cmp(&b.1.hostname))
-            });
-        }
-    }
-    rows.first()
-        .copied()
+            }
+        })
         .ok_or_else(|| error::AppError::NoServerFound.into())
 }
 

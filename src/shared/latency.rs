@@ -133,7 +133,7 @@ fn parse_duration_ms_prefix(input: &str) -> Option<Duration> {
 
 async fn probe_tcp_once(host: &str, port: u16, timeout: Duration) -> Option<Duration> {
     let started = tokio::time::Instant::now();
-    let address = format!("{}:{}", host, port);
+    let address = crate::wireguard::config::format_endpoint(host, port);
     match tokio::time::timeout(timeout, TcpStream::connect(address)).await {
         Ok(Ok(_stream)) => Some(started.elapsed()),
         Ok(Err(err)) if is_reachable_connect_error(&err) => Some(started.elapsed()),

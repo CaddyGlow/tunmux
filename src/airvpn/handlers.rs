@@ -354,7 +354,6 @@ async fn cmd_connect(
             .iter()
             .find(|s| s.name.eq_ignore_ascii_case(name))
             .ok_or_else(|| error::AppError::NoServerFound)?
-            .clone()
     } else {
         // Apply filters
         if let Some(ref cc) = effective_country {
@@ -366,57 +365,38 @@ async fn cmd_connect(
             let latencies =
                 probe_airvpn_latencies(&candidates, wg_mode.entry_index as usize, wg_mode.port)
                     .await;
-            let mut rows: Vec<(AirServer, Option<Duration>, i64)> = candidates
-                .into_iter()
+            candidates
+                .iter()
                 .zip(latencies)
                 .map(|(server, latency)| {
-                    let score = airvpn_eddie_speed_score(&server, latency);
+                    let score = airvpn_eddie_speed_score(server, latency);
                     (server, latency, score)
                 })
-                .collect();
-            match args.sort.as_str() {
-                "latency" => rows.sort_by(|a, b| {
-                    latency_order(&a.1, &b.1)
+                .min_by(|a, b| match args.sort.as_str() {
+                    "latency" => latency_order(&a.1, &b.1)
                         .then_with(|| a.2.cmp(&b.2))
-                        .then_with(|| a.0.name.cmp(&b.0.name))
-                }),
-                "score" => rows.sort_by(|a, b| {
-                    a.2.cmp(&b.2)
-                        .then_with(|| latency_order(&a.1, &b.1))
-                        .then_with(|| a.0.name.cmp(&b.0.name))
-                }),
-                _ => unreachable!(),
-            }
-            rows.first()
-                .map(|(server, _, _)| server.clone())
+                        .then_with(|| a.0.name.cmp(&b.0.name)),
+                    "score" => {
+                        a.2.cmp(&b.2)
+                            .then_with(|| latency_order(&a.1, &b.1))
+                            .then_with(|| a.0.name.cmp(&b.0.name))
+                    }
+                    _ => unreachable!(),
+                })
+                .map(|(server, _, _)| server)
                 .ok_or(error::AppError::NoServerFound)?
         } else {
-            match args.sort.as_str() {
-                "name" => {
-                    candidates.sort_by(|a, b| a.name.cmp(&b.name));
-                }
-                "load" => {
-                    candidates.sort_by(|a, b| {
-                        airvpn_load_ratio(a)
-                            .partial_cmp(&airvpn_load_ratio(b))
-                            .unwrap_or(Ordering::Equal)
-                            .then_with(|| a.name.cmp(&b.name))
-                    });
-                }
-                "score" => {
-                    candidates.sort_by(|a, b| {
-                        let score_a = airvpn_eddie_speed_score(a, None);
-                        let score_b = airvpn_eddie_speed_score(b, None);
-                        score_a.cmp(&score_b).then_with(|| a.name.cmp(&b.name))
-                    });
-                }
-                _ => unreachable!(),
-            }
-
             candidates
-                .first()
+                .iter()
+                .min_by(|a, b| match args.sort.as_str() {
+                    "name" => a.name.cmp(&b.name),
+                    "load" => airvpn_load_ratio(a)
+                        .partial_cmp(&airvpn_load_ratio(b))
+                        .unwrap_or(Ordering::Equal)
+                        .then_with(|| a.name.cmp(&b.name)),
+                    _ => unreachable!(),
+                })
                 .ok_or(error::AppError::NoServerFound)?
-                .clone()
         }
     };
 
