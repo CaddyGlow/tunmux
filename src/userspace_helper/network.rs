@@ -1435,6 +1435,182 @@ pub(super) fn remove_stopped_endpoints(directory: &Path, owner: &str) -> anyhow:
     Ok(())
 }
 
+pub(super) fn has_pending_gateway(state: &CleanupState) -> bool {
+    matches!(state, CleanupState::Active { journal } if !journal.pending_gateways.is_empty())
+}
+
+#[cfg(target_os = "macos")]
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
+struct LanPolicy {
+    interface: String,
+    original: Vec<MacosRoute>,
+    dns: Vec<String>,
+}
+
+#[cfg(target_os = "macos")]
+fn physical_lans() -> anyhow::Result<Vec<String>> {
+    // Enumerate hardware ports so virtual bridges and other VPN interfaces cannot become bypasses.
+    let ports = run_command_capture_output("networksetup", &["-listallhardwareports"])?;
+    anyhow::ensure!(
+        ports.status.success(),
+        "cannot enumerate physical network interfaces"
+    );
+    let devices: Vec<_> = String::from_utf8(ports.stdout)?
+        .lines()
+        .filter_map(|line| line.strip_prefix("Device: ").map(str::to_owned))
+        .collect();
+    let mut prefixes = Vec::new();
+    for device in devices {
+        if !device.starts_with("en") {
+            continue;
+        }
+        let output = run_command_capture_output("ifconfig", &[&device])?;
+        anyhow::ensure!(
+            output.status.success(),
+            "cannot inspect physical interface {device}"
+        );
+        let text = String::from_utf8(output.stdout)?;
+        if !text.lines().any(|line| line.trim() == "status: active") {
+            continue;
+        }
+        for line in text.lines() {
+            let f: Vec<_> = line.split_whitespace().collect();
+            if f.first() == Some(&"inet") && f.len() >= 4 && f[2] == "netmask" {
+                let ip: std::net::Ipv4Addr = f[1].parse()?;
+                if ip.is_loopback()
+                    || ip.is_link_local()
+                    || ip.is_multicast()
+                    || ip.is_unspecified()
+                {
+                    continue;
+                }
+                let mask = u32::from_str_radix(f[3].trim_start_matches("0x"), 16)?;
+                let prefix = mask.leading_ones();
+                anyhow::ensure!(
+                    mask == if prefix == 0 {
+                        0
+                    } else {
+                        u32::MAX << (32 - prefix)
+                    },
+                    "noncontiguous interface mask"
+                );
+                if prefix > 0 && prefix < 32 {
+                    prefixes.push(format!("{ip}/{prefix}"));
+                }
+            } else if f.first() == Some(&"inet6") && f.len() >= 4 && f[2] == "prefixlen" {
+                let ip: std::net::Ipv6Addr = f[1].split('%').next().unwrap_or("").parse()?;
+                let prefix: u8 = f[3].parse()?;
+                if prefix > 0
+                    && prefix < 128
+                    && !ip.is_loopback()
+                    && !ip.is_unspecified()
+                    && !ip.is_multicast()
+                    && !ip.is_unicast_link_local()
+                {
+                    prefixes.push(format!("{ip}/{prefix}"));
+                }
+            }
+        }
+    }
+    Ok(prefixes)
+}
+#[cfg(target_os = "macos")]
+fn lan_routes(policy: &LanPolicy) -> anyhow::Result<Vec<MacosRoute>> {
+    let mut bases = Vec::new();
+    for route in &policy.original {
+        let (ip, prefix) =
+            normalized_macos_destination(&route.destination).context("invalid VPN route")?;
+        bases.push(format!("{ip}/{prefix}"));
+    }
+    let mut routes = crate::lan::vpn_routes(&bases, &physical_lans()?)?;
+    // DNS hosts stay tunneled even when their address overlaps the LAN.
+    for dns in &policy.dns {
+        let ip: IpAddr = dns.parse()?;
+        let host = format!("{ip}/{}", if ip.is_ipv6() { 128 } else { 32 });
+        let target = crate::lan::Prefix::parse(&host)?;
+        if bases
+            .iter()
+            .any(|base| crate::lan::Prefix::parse(base).is_ok_and(|base| base.contains(target)))
+        {
+            routes.push(host);
+        }
+    }
+    routes.sort();
+    routes.dedup();
+    Ok(routes
+        .into_iter()
+        .map(|destination| MacosRoute {
+            is_ipv6: destination.contains(':'),
+            destination,
+            interface: Some(policy.interface.clone()),
+            gateway: None,
+        })
+        .collect())
+}
+#[cfg(target_os = "macos")]
+fn reconcile_lan(journal: &mut Journal, budget: &SetupBudget<'_>) -> anyhow::Result<()> {
+    let Some(policy) = journal.lan.clone() else {
+        return Ok(());
+    };
+    budget.check()?;
+    // Missing primary networks must not turn a transient observation into new routing intent.
+    match get_macos_default_route(false) {
+        Ok(Some(_)) => {}
+        Ok(None) => {
+            journal.pending_gateways.clear();
+            return Ok(());
+        }
+        Err(error) => {
+            journal.pending_gateways.clear();
+            return Err(error);
+        }
+    }
+    let desired = lan_routes(&policy)?;
+    // Restore old intent before retiring it; a failed checkpoint leaves recoverable evidence.
+    for index in (0..journal.actions.len()).rev() {
+        if let Action::MacosRoute(route) = &journal.actions[index] {
+            if route.gateway.is_none()
+                && route.interface.as_ref() == Some(&policy.interface)
+                && !desired.contains(route)
+            {
+                budget.check()?;
+                restore_checked(&journal.actions[index], Some(budget))?;
+                let previous = journal.actions.remove(index);
+                if let Err(error) = journal.persist() {
+                    journal.actions.insert(index, previous);
+                    return Err(error);
+                }
+                journal.pending_gateways.clear();
+            }
+        }
+    }
+    for route in desired {
+        budget.check()?;
+        if journal
+            .actions
+            .iter()
+            .any(|action| matches!(action,Action::MacosRoute(existing) if existing == &route))
+        {
+            continue;
+        }
+        match macos_route_status(&route)? {
+            Some(true) => continue, // Existing interface routes remain borrowed, never owned cleanup intent.
+            Some(false) => anyhow::bail!(
+                "LAN route planning conflicts with existing route {}",
+                route.destination
+            ),
+            None => {}
+        }
+        journal.push(Action::MacosRoute(route.clone()))?;
+        budget.check()?;
+        anyhow::ensure!(
+            add_macos_route(&route)?,
+            "LAN route appeared during reconciliation"
+        );
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1791,180 +1967,4 @@ mod tests {
             .contains("timed out"));
         assert!(started.elapsed() < Duration::from_secs(5));
     }
-}
-
-pub(super) fn has_pending_gateway(state: &CleanupState) -> bool {
-    matches!(state, CleanupState::Active { journal } if !journal.pending_gateways.is_empty())
-}
-
-#[cfg(target_os = "macos")]
-#[derive(Clone, serde::Serialize, serde::Deserialize)]
-struct LanPolicy {
-    interface: String,
-    original: Vec<MacosRoute>,
-    dns: Vec<String>,
-}
-
-#[cfg(target_os = "macos")]
-fn physical_lans() -> anyhow::Result<Vec<String>> {
-    // Enumerate hardware ports so virtual bridges and other VPN interfaces cannot become bypasses.
-    let ports = run_command_capture_output("networksetup", &["-listallhardwareports"])?;
-    anyhow::ensure!(
-        ports.status.success(),
-        "cannot enumerate physical network interfaces"
-    );
-    let devices: Vec<_> = String::from_utf8(ports.stdout)?
-        .lines()
-        .filter_map(|line| line.strip_prefix("Device: ").map(str::to_owned))
-        .collect();
-    let mut prefixes = Vec::new();
-    for device in devices {
-        if !device.starts_with("en") {
-            continue;
-        }
-        let output = run_command_capture_output("ifconfig", &[&device])?;
-        anyhow::ensure!(
-            output.status.success(),
-            "cannot inspect physical interface {device}"
-        );
-        let text = String::from_utf8(output.stdout)?;
-        if !text.lines().any(|line| line.trim() == "status: active") {
-            continue;
-        }
-        for line in text.lines() {
-            let f: Vec<_> = line.split_whitespace().collect();
-            if f.first() == Some(&"inet") && f.len() >= 4 && f[2] == "netmask" {
-                let ip: std::net::Ipv4Addr = f[1].parse()?;
-                if ip.is_loopback()
-                    || ip.is_link_local()
-                    || ip.is_multicast()
-                    || ip.is_unspecified()
-                {
-                    continue;
-                }
-                let mask = u32::from_str_radix(f[3].trim_start_matches("0x"), 16)?;
-                let prefix = mask.leading_ones();
-                anyhow::ensure!(
-                    mask == if prefix == 0 {
-                        0
-                    } else {
-                        u32::MAX << (32 - prefix)
-                    },
-                    "noncontiguous interface mask"
-                );
-                if prefix > 0 && prefix < 32 {
-                    prefixes.push(format!("{ip}/{prefix}"));
-                }
-            } else if f.first() == Some(&"inet6") && f.len() >= 4 && f[2] == "prefixlen" {
-                let ip: std::net::Ipv6Addr = f[1].split('%').next().unwrap_or("").parse()?;
-                let prefix: u8 = f[3].parse()?;
-                if prefix > 0
-                    && prefix < 128
-                    && !ip.is_loopback()
-                    && !ip.is_unspecified()
-                    && !ip.is_multicast()
-                    && !ip.is_unicast_link_local()
-                {
-                    prefixes.push(format!("{ip}/{prefix}"));
-                }
-            }
-        }
-    }
-    Ok(prefixes)
-}
-#[cfg(target_os = "macos")]
-fn lan_routes(policy: &LanPolicy) -> anyhow::Result<Vec<MacosRoute>> {
-    let mut bases = Vec::new();
-    for route in &policy.original {
-        let (ip, prefix) =
-            normalized_macos_destination(&route.destination).context("invalid VPN route")?;
-        bases.push(format!("{ip}/{prefix}"));
-    }
-    let mut routes = crate::lan::vpn_routes(&bases, &physical_lans()?)?;
-    // DNS hosts stay tunneled even when their address overlaps the LAN.
-    for dns in &policy.dns {
-        let ip: IpAddr = dns.parse()?;
-        let host = format!("{ip}/{}", if ip.is_ipv6() { 128 } else { 32 });
-        let target = crate::lan::Prefix::parse(&host)?;
-        if bases
-            .iter()
-            .any(|base| crate::lan::Prefix::parse(base).is_ok_and(|base| base.contains(target)))
-        {
-            routes.push(host);
-        }
-    }
-    routes.sort();
-    routes.dedup();
-    Ok(routes
-        .into_iter()
-        .map(|destination| MacosRoute {
-            is_ipv6: destination.contains(':'),
-            destination,
-            interface: Some(policy.interface.clone()),
-            gateway: None,
-        })
-        .collect())
-}
-#[cfg(target_os = "macos")]
-fn reconcile_lan(journal: &mut Journal, budget: &SetupBudget<'_>) -> anyhow::Result<()> {
-    let Some(policy) = journal.lan.clone() else {
-        return Ok(());
-    };
-    budget.check()?;
-    // Missing primary networks must not turn a transient observation into new routing intent.
-    match get_macos_default_route(false) {
-        Ok(Some(_)) => {}
-        Ok(None) => {
-            journal.pending_gateways.clear();
-            return Ok(());
-        }
-        Err(error) => {
-            journal.pending_gateways.clear();
-            return Err(error);
-        }
-    }
-    let desired = lan_routes(&policy)?;
-    // Restore old intent before retiring it; a failed checkpoint leaves recoverable evidence.
-    for index in (0..journal.actions.len()).rev() {
-        if let Action::MacosRoute(route) = &journal.actions[index] {
-            if route.gateway.is_none()
-                && route.interface.as_ref() == Some(&policy.interface)
-                && !desired.contains(route)
-            {
-                budget.check()?;
-                restore_checked(&journal.actions[index], Some(budget))?;
-                let previous = journal.actions.remove(index);
-                if let Err(error) = journal.persist() {
-                    journal.actions.insert(index, previous);
-                    return Err(error);
-                }
-                journal.pending_gateways.clear();
-            }
-        }
-    }
-    for route in desired {
-        budget.check()?;
-        if journal
-            .actions
-            .iter()
-            .any(|action| matches!(action,Action::MacosRoute(existing) if existing == &route))
-        {
-            continue;
-        }
-        match macos_route_status(&route)? {
-            Some(true) => continue, // Existing interface routes remain borrowed, never owned cleanup intent.
-            Some(false) => anyhow::bail!(
-                "LAN route planning conflicts with existing route {}",
-                route.destination
-            ),
-            None => {}
-        }
-        journal.push(Action::MacosRoute(route.clone()))?;
-        budget.check()?;
-        anyhow::ensure!(
-            add_macos_route(&route)?,
-            "LAN route appeared during reconciliation"
-        );
-    }
-    Ok(())
 }
