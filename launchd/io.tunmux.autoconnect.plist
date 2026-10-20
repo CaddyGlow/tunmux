@@ -1,0 +1,31 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>ProgramArguments</key>
+    <array>
+        <string>{{BINARY}}</string>
+        <string>autoconnect</string>
+        <string>run</string>
+    </array>
+    <key>Label</key>
+    <string>io.tunmux.autoconnect</string>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>XDG_CONFIG_HOME</key>
+        <string>{{CONFIG_HOME}}</string>
+        <key>TUNMUX_NONINTERACTIVE</key>
+        <string>1</string>
+    </dict>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+    <key>ThrottleInterval</key>
+    <integer>10</integer>
+    <key>StandardOutPath</key>
+    <string>{{LOG}}</string>
+    <key>StandardErrorPath</key>
+    <string>{{LOG}}</string>
+</dict>
+</plist>

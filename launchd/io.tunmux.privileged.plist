@@ -1,0 +1,49 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>ProgramArguments</key>
+    <array>
+        <string>{{BINARY}}</string>
+        <string>privileged</string>
+        <string>--serve</string>
+        <string>--authorized-group</string>
+        <string>{{GROUP}}</string>
+    </array>
+    <key>Label</key>
+    <string>io.tunmux.privileged</string>
+    <key>UserName</key>
+    <string>root</string>
+    <key>GroupName</key>
+    <string>{{GROUP}}</string>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>TUNMUX_LAUNCHD_SOCKET</key>
+        <string>1</string>
+        <key>PATH</key>
+        <string>/usr/bin:/bin:/usr/sbin:/sbin</string>
+    </dict>
+    <key>Sockets</key>
+    <dict>
+        <key>PrivilegedListener</key>
+        <dict>
+            <key>SockFamily</key>
+            <string>Unix</string>
+            <key>SockType</key>
+            <string>stream</string>
+            <key>SockPathName</key>
+            <string>{{SOCKET}}</string>
+            <key>SockPathOwner</key>
+            <integer>0</integer>
+            <key>SockPathGroup</key>
+            <integer>{{GID}}</integer>
+            <key>SockPathMode</key>
+            <integer>432</integer>
+        </dict>
+    </dict>
+    <key>StandardOutPath</key>
+    <string>/var/log/tunmux/privileged.log</string>
+    <key>StandardErrorPath</key>
+    <string>/var/log/tunmux/privileged.log</string>
+</dict>
+</plist>

@@ -1,722 +1,306 @@
 # tunmux
 
-`tunmux` is a multi-provider VPN CLI written in Rust.
-
-Supported platforms:
-- Linux: direct mode, `--proxy` mode, and `--local-proxy` mode
-- macOS: direct mode and `--local-proxy` mode (`--proxy` is not available)
-
-It supports Proton VPN, AirVPN, Mullvad, IVPN, and local WireGuard config profiles (`wgconf`) with WireGuard connectivity in:
-- direct mode (system-wide routing)
-- Linux namespace proxy mode (`--proxy`, isolated per-connection namespace)
-- local-proxy mode (`--local-proxy`, userspace SOCKS5/HTTP proxy without root)
-
-## What It Does
-
-- Connect/disconnect VPN sessions across multiple providers
-- Run multiple VPN exits side-by-side in proxy mode
-- In proxy mode, keep host traffic unchanged unless an app explicitly uses a proxy
-- Run rootless userspace local-proxy mode with `--local-proxy` (no `sudo` required)
-- Manage provider-specific account and utility commands from one CLI
-- Support multiple WireGuard backends: `wg-quick`, `userspace`, `kernel`
-
-## Platform And Requirements
-
-- Rust (stable, edition 2021)
-- Linux for full feature set (kernel backend + `--proxy` namespace isolation)
-- macOS for direct mode and `--local-proxy` mode (`--proxy` is Linux-only)
-- Root access for privileged operations (`tunmux privileged --serve`) used by direct mode and `--proxy`,
-  through `doas`, `sudo`, `run0` or `pkexec` on Linux, or `sudo`/the admin dialog on macOS
-
-`userspace` mode uses the embedded `gotatun` library through a built-in helper; no separate `gotatun` CLI install is required.
-`--local-proxy` uses that userspace engine to run a SOCKS5/HTTP proxy without root.
-
-Optional:
-- systemd socket activation via `systemd/tunmux-privileged.socket`
-- keyring storage via `cargo build --features keyring`
+A Rust CLI for WireGuard connections through **Proton VPN, AirVPN, Mullvad,
+IVPN**, or your own **WireGuard configuration files** (`wgconf`). Use it for a
+direct VPN connection or run separate VPN exits as local SOCKS5/HTTP proxies.
 
 ## Build
 
-```bash
-cargo build
-cargo build --features keyring
-```
-
-## Offline benchmarks
-
-The Criterion suite measures WireGuard config generation, parsing with 1/10/100
-peers, CLI argument parsing, and deterministic VPN key derivation (when Proton,
-Mullvad, or IVPN is enabled). Fixtures are synthetic and prepared outside the
-timed loops. Timings include output allocation and destruction. No credentials,
-network access, root privileges, or running VPN are needed at benchmark runtime.
-These are CPU microbenchmarks, not tunnel throughput or connection latency tests.
-
-Run inside the development shell (`direnv allow`, or prefix commands with
-`nix develop path:$HOME/projects-caddy/nix-dev-shells/android -c`):
+Use the Rust toolchain pinned in [rust-toolchain.toml](rust-toolchain.toml).
+Initialize the bundled `smoltcp` submodule before building:
 
 ```sh
-# Cargo uses the optimized bench profile automatically.
-cargo bench --locked --bench offline
-# Run only config parsing; smoke-check every fixture without collecting timings.
-cargo bench --locked --bench offline -- wireguard/parse
-cargo bench --locked --bench offline -- --test
-# Save a baseline, then compare after making changes.
-cargo bench --locked --bench offline -- --save-baseline before
-cargo bench --locked --bench offline -- --baseline before
+git submodule update --init --recursive
+cargo build --release --locked
+cargo run -- --help
 ```
 
-Criterion stores measurements under the Cargo target directory's `criterion/`
-folder. Compare runs on the same machine with the same toolchain and feature set,
-and minimize other CPU activity. Key benchmarks are omitted when their provider
-features are disabled; the rest also run with `--no-default-features`.
-
-## Kernel versus userspace WireGuard benchmark
-
-On Linux, compare the kernel client with tunmux's embedded GotaTun client using
-two temporary network namespaces and a local kernel WireGuard server. The test
-measures TCP upload/download throughput, idle and loaded ping RTT, and CPU usage.
-It alternates backend order each round, uses identical MTUs, and saves raw iperf3
-JSON alongside the measurements. No VPN account or internet traffic is needed.
-
-Recorded results: [2026-10-19 kernel versus GotaTun comparison](docs/benchmarks/2026-10-19-wg-backends.md),
-including measurements, setup, limitations, and archived raw data.
-
-Requirements: Python 3, `ip`, `wg`, `iperf3`, `ping`, `mount`, `unshare`, kernel
-WireGuard, and `/dev/net/tun`. Run in the development shell. Unprivileged user
-namespaces allow running as your normal user; systems that disable them require
-root. A private mount namespace isolates helper sockets and namespace handles.
+The submodule URL uses the maintainer's SSH alias. If that alias is unavailable,
+configure the public URL locally before initializing it:
 
 ```sh
-cargo build --release --locked --no-default-features
-python3 scripts/wg_backend_bench.py --bin target/release/tunmux \
-  --seconds 5 --repeats 3 --output /tmp/wg-backends.json
-# Repeat with concurrent TCP streams:
-python3 scripts/wg_backend_bench.py --bin target/release/tunmux \
-  --streams 4 --output /tmp/wg-backends-4streams.json
+git config submodule.third_party/smoltcp.url https://github.com/CaddyGlow/smoltcp.git
+git submodule update --init --recursive
 ```
 
-Use Cargo's actual target directory for `--bin` if you override it. Both peers
-share the host CPU, so these results describe local dataplane performance.
-Host CPU measurements include both peers and unrelated activity; helper CPU is
-the client GotaTun process only. One fully occupied core is 100%. This benchmark
-does not exercise the SOCKS/HTTP proxy paths.
+The executable is normally `target/release/tunmux` (or under your configured Cargo
+target directory). Put it on your `PATH` to use the commands below.
 
-The userspace helper writes daemon output to `/var/run/wireguard/<interface>.log`
-instead of retaining its launcher's stdout/stderr. Startup failures report that
-path. In this benchmark those logs live in the disposable mount namespace.
+| Mode | Platforms | Requirements |
+| --- | --- | --- |
+| Direct VPN | Linux, macOS | Privileged helper; changes host routing according to the tunnel configuration |
+| `--proxy` | Linux | `proxy` Cargo feature, kernel backend, privileged helper; isolated network namespace |
+| `--local-proxy` | Linux, macOS | No root; only applications using the proxy send traffic through the VPN |
 
-## Provider features
+Direct mode defaults to `kernel` on Linux and `userspace` on macOS. Linux kernel
+mode needs WireGuard kernel support, `ip`, and `wg`; DNS setup uses `resolvectl`.
+The `userspace` backend embeds GotaTun. Selecting `--backend wg-quick` requires
+an installed `wg-quick` and its platform dependencies. Privileged operations can
+start a helper through the system's elevation tools, such as `sudo`.
 
-Provider implementations and their CLI commands are controlled by independent
-Cargo features: `proton`, `airvpn`, `mullvad`, `ivpn`, and `wgconf`.
-`all-providers` enables all five. Default builds enable `all-providers` and `proxy`,
-preserving the standard CLI. Provider-specific dependencies are optional and are
-enabled by the providers that use them.
+Android uses the shared Rust library. The app and JNI adapter live in the sibling
+`tunmux-android` repository, where APKs are built.
+
+## Usage
+
+### Sign in and connect
+
+Choose your provider's login command. Proton, AirVPN, and IVPN can prompt for
+additional credentials when needed.
 
 ```sh
-# WireGuard profiles only
-cargo build --no-default-features --features wgconf
-# Select providers, with Linux namespace proxy support
-cargo build --no-default-features --features proton,mullvad,proxy
-# Shared infrastructure and status/recovery support, without providers
-cargo build --no-default-features
-```
-
-Disabled providers are absent from CLI subcommands and provider choices. Saved
-provider names and configuration sections remain readable; disconnecting a saved
-session whose provider is disabled reports the feature needed to enable it.
-Library consumers using `default-features = false` must explicitly select their
-provider features. Android consumers can enable `all-providers` without enabling
-Linux proxy support.
-
-## Android app
-
-The Android app and Rust JNI adapter live in the sibling `../tunmux-android`
-repository. Build and release APKs from that repository. This repository owns
-the shared Rust library, including Android target support and credential callback
-hooks. `.github/workflows/ci-android.yml` checks the shared library for all three
-Android app ABIs. The app pins a revision of this library and the `smoltcp` fork;
-see its README for local development against a sibling checkout.
-
-## Release CI (Tag-Based)
-
-Pushing a `v*` tag (for example `v1.2.3`) triggers `.github/workflows/release.yml` to:
-- run `cargo test --locked`
-- build release binaries for Linux and macOS via `.github/workflows/manual-build.yml`
-- upload tarballs and SHA256 files to a GitHub Release for that tag
-
-Publishing that GitHub Release then triggers `.github/workflows/docker.yml` (which calls `.github/workflows/docker-publish.yml`) to build and publish a multi-arch Docker image to GHCR.
-
-Binary version output follows the tag in CI builds:
-
-```bash
-tunmux --version
-```
-
-Container tags:
-- `ghcr.io/<owner>/tunmux:<tag>`
-- `ghcr.io/<owner>/tunmux:latest` (only for non-prerelease tags)
-
-## Quick Start
-
-### 1) Sign in and connect (direct mode)
-
-```bash
 tunmux proton login <username>
-tunmux connect proton --country CH --backend wg-quick
-tunmux status
-tunmux disconnect --provider proton
-```
-
-### 2) Start isolated proxy exits (proxy mode)
-
-```bash
-# First proxy instance (typically SOCKS5 1080, HTTP 8118)
-tunmux connect proton --proxy --country US
-
-# Second proxy instance (next available ports)
-tunmux connect proton --proxy --country CH
-
-# Use a specific proxy
-curl --socks5 127.0.0.1:1080 https://api.ipify.org
-
-# Host traffic remains unchanged unless using proxy
-curl https://api.ipify.org
-```
-
-### 3) Start local-proxy mode (no root)
-
-```bash
-# No sudo required; app traffic goes through SOCKS5/HTTP proxy
-tunmux connect proton --local-proxy --country US
-
-# Use the proxy from an app/tool
-curl --socks5 127.0.0.1:1080 https://api.ipify.org
-
-# Stop local-proxy instance(s)
-tunmux disconnect --provider proton
-```
-
-## Command Map
-
-Top-level commands:
-
-```bash
-tunmux status
-tunmux connect <provider> [provider connect flags]
-tunmux disconnect [instance] [--provider <provider>] [--all]
-tunmux hook run <connectivity|external-ip|dns-detection>
-tunmux hook debug [instance] [--provider <provider>] [--event ifup|ifdown]
-tunmux proton <...>
-tunmux airvpn <...>
-tunmux mullvad <...>
-tunmux ivpn <...>
-tunmux wgconf <...>
-```
-
-Common provider flows:
-
-```bash
-tunmux <provider> login ...
-tunmux <provider> info
-tunmux <provider> servers [--country XX] [--tag ...] [--sort ...]
-tunmux connect <provider> [server] [--country XX] [--sort ...] [--backend ...] [--mtu N] [--proxy|--local-proxy]
-tunmux disconnect [instance] [--provider <provider>] [--all]
-tunmux <provider> logout
-```
-
-`wgconf` provider flow:
-
-```bash
-tunmux connect wgconf --file ./my-tunnel.conf
-tunmux connect wgconf --file ./my-tunnel.conf --save-as work
-tunmux connect wgconf --profile work
-tunmux wgconf list
-tunmux wgconf remove work
-```
-
-Legacy provider-prefixed forms (`tunmux <provider> connect ...`, `tunmux <provider> disconnect ...`) remain supported for compatibility.
-
-Disconnect semantics:
-
-```bash
-tunmux disconnect --all                     # all providers
-tunmux disconnect --provider proton --all   # proton only
-tunmux disconnect --provider wgconf --all   # wgconf only
-tunmux disconnect <instance>                # exact instance
-tunmux disconnect --provider proton         # provider-scoped single/list behavior
-
-# short forms
-tunmux disconnect -a
-tunmux disconnect -p proton -a
-```
-
-Common short forms:
-- `connect`: `-c` (country), `-s` (sort), `-b` (backend)
-- `disconnect`: `-p` (provider), `-a` (all)
-- `servers`: `-c` (country), `-t` (tag), `-s` (sort)
-
-Use verbose logs when needed:
-
-```bash
-tunmux -v connect proton --country CH
-RUST_LOG=debug tunmux disconnect --all
-```
-
-## Provider Examples
-
-### Proton VPN
-
-```bash
-tunmux proton login <username>
-tunmux proton info
-tunmux proton servers --country US --free
-tunmux proton servers --country CH --tag p2p --sort latency
-tunmux connect proton US#1
-tunmux connect proton --country CH --p2p
-tunmux connect proton --country CH --p2p --port-forwarding
-tunmux connect proton --country CH --sort latency
-tunmux connect proton FR#183 --mtu 1280
-tunmux proton ports request --protocol both
-tunmux proton ports request --protocol both --no-daemon
-tunmux proton ports list
-tunmux proton ports list --current
-tunmux proton ports list --current --json
-tunmux proton ports renew --lifetime 60
-tunmux proton ports daemon --protocol both --lifetime 60 --renew-every 45
-tunmux proton ports release
-tunmux disconnect --provider proton --all
-tunmux proton logout
-```
-
-Proton NAT-PMP notes:
-- `tunmux proton ports request ...` now starts the background renew daemon by default.
-- Use `--no-daemon` for a one-shot mapping request.
-- Default daemon renew interval is `lifetime - 15s` (minimum `1s`).
-- `tunmux proton ports list` shows saved mappings (including expired ones).
-- `tunmux proton ports list --current` shows only active mappings for the current direct Proton connection.
-- `tunmux proton ports list --current --json` returns the same filtered view as JSON.
-- `tunmux proton ports release` stops the renew daemon and sends NAT-PMP unmap (lifetime `0`) for saved mappings on the active direct connection.
-- Daemon state files:
-  - PID: `~/.config/tunmux/proton/port_forward_daemon.pid`
-  - Log: `~/.config/tunmux/proton/port_forward_daemon.log`
-
-Typical lifecycle:
-
-```bash
-tunmux connect proton --country DE --port-forwarding
-tunmux proton ports request --protocol both   # request + auto-start renew daemon
-tunmux proton ports list --current --json     # inspect currently active mapping(s)
-tunmux proton ports release                   # stop daemon + release mapping(s)
-```
-
-### AirVPN
-
-```bash
 tunmux airvpn login <username>
-tunmux airvpn info
-tunmux airvpn servers --country NL --tag nl
-tunmux airvpn servers --sort latency
-tunmux connect airvpn Castor
-tunmux connect airvpn --country DE --key "my device"
-tunmux connect airvpn --country DE --sort latency
-tunmux airvpn sessions
-tunmux airvpn generate -s nl -s be -p wg-1637 -o config.conf
-tunmux airvpn ports list
-tunmux airvpn ports add 8080 --protocol tcp --ddns myhost
-tunmux airvpn devices list
-tunmux airvpn api list
-tunmux disconnect --provider airvpn --all
-tunmux airvpn logout
+tunmux mullvad login <account-number>
+tunmux ivpn login <account-id>
 ```
 
-### Mullvad
+Then list servers and connect, for example:
 
-```bash
-tunmux mullvad login <account_number>
-tunmux mullvad create-account
-tunmux mullvad payment monero --json
-tunmux mullvad info
-tunmux mullvad servers --country US --tag us-nyc
-tunmux mullvad servers --sort latency
-tunmux connect mullvad us-nyc-wg-401
-tunmux connect mullvad --country SE --sort latency
-tunmux disconnect --provider mullvad
-tunmux mullvad logout
-```
-
-### IVPN
-
-```bash
-tunmux ivpn create-account
-tunmux ivpn create-account --product pro
-tunmux ivpn payment monero --duration 1m
-tunmux ivpn login <account_id>
-tunmux ivpn info
-tunmux ivpn servers --country US --tag us1
-tunmux ivpn servers --sort latency
-tunmux connect ivpn us-ny4.wg.ivpn.net
-tunmux connect ivpn --country US --sort latency
-tunmux disconnect --provider ivpn
-tunmux ivpn logout
-```
-
-### WGConf (local WireGuard config/profile provider)
-
-```bash
-tunmux connect wgconf --file ./my-tunnel.conf --backend wg-quick
-tunmux connect wgconf --file ./my-tunnel.conf --save-as office
-tunmux connect wgconf --profile office --local-proxy
-tunmux connect wgconf --file ./ipv4-only.conf --backend kernel --disable-ipv6
-tunmux connect wgconf --file ./my-tunnel.conf --backend kernel --mtu 1280
-tunmux wgconf save --file ./my-tunnel.conf --name backup
-tunmux wgconf list
-tunmux wgconf remove backup
-tunmux disconnect --provider wgconf
-```
-
-`--disable-ipv6` is supported by `connect` for `proton`, `airvpn`, `mullvad`,
-`ivpn`, and `wgconf`. It is accepted only for direct kernel mode (no
-`--proxy`/`--local-proxy`) and only when the selected WireGuard config has no
-IPv6 interface address.
-
-`--mtu` is supported by provider `connect` commands. For most providers it
-applies to direct and proxy kernel tunnels, as well as generated wg-quick and
-userspace configs. For `wgconf`, it also applies to direct userspace and
-wg-quick connections. Precedence is `--mtu`, then `[Interface] MTU`, then the
-backend default. Values must be between 576 and 65535; `--local-proxy` does not
-support an MTU override.
-
-Logging uses target-aware tracing directives. `RUST_LOG` overrides `--verbose`
-(`--debug` is an alias); without explicit directives, dependencies log warnings
-and tunmux logs info, or debug with verbosity enabled. For example,
-`RUST_LOG=tunmux=debug,gotatun=warn tunmux status`. Newly started helpers and
-daemons inherit the resolved filter. Existing daemons retain their startup
-filter until restarted.
-
-## Linux Namespace Proxy Mode (`--proxy`)
-
-Each `--proxy` connection creates:
-- a dedicated Linux network namespace
-- a dedicated WireGuard interface in that namespace
-- a local SOCKS5 and HTTP proxy bound on localhost
-
-Multiple instances can run at once, each with different exits and ports.
-
-## Local Proxy Mode (`--local-proxy`)
-
-`--local-proxy` starts a userspace WireGuard tunnel and local SOCKS5/HTTP proxy without `sudo`.
-
-- no root/privileged daemon required
-- no host routing changes (only apps configured to use the proxy are tunneled)
-- available on Linux and macOS
-- supports multiple instances with the same auto-port behavior as `--proxy`
-- hostname resolution for proxy requests prefers the VPN-pushed DNS servers
-- set `TUNMUX_LOCAL_PROXY_DNS_SERVERS` (or `TUNMUX_DNS_SERVERS`) to override local-proxy DNS resolver servers (comma or whitespace separated)
-
-Port behavior:
-- default scan starts at `1080` (SOCKS5) and `8118` (HTTP)
-- each new instance picks the next available localhost ports
-- override with `--socks-port` and `--http-port`
-
-Instance naming is derived from the selected server and used in status/disconnect commands.
-
-## Direct Mode Details
-
-Direct mode is the default when neither `--proxy` nor `--local-proxy` is used.
-- one direct connection is active at a time
-- host traffic is routed through that WireGuard tunnel
-- stored internally as `_direct` connection state
-
-Direct, `--proxy`, and `--local-proxy` sessions can coexist.
-
-## Multi-Instance Disconnect
-
-If multiple instances exist for a provider, running disconnect without an instance will prompt selection:
-
-```bash
+```sh
+tunmux proton servers --country CH
+tunmux connect proton --country CH
+tunmux status
+tunmux wg
 tunmux disconnect --provider proton
 ```
 
-Disconnect all for one provider:
+The account providers also have `info`, `logout`, and `servers` commands.
+Select a server by name or use `--country` and `--sort latency`.
+Provider-specific options,
+including port forwarding, devices, and account creation, are listed in help:
 
-```bash
-tunmux disconnect --provider proton --all
+```sh
+tunmux --help
+tunmux airvpn --help
+tunmux connect proton --help
+tunmux proton ports --help
 ```
 
-Disconnect all active connections across all providers:
+### Use a WireGuard file
 
-```bash
-tunmux disconnect --all
+No provider login is needed for `wgconf`:
+
+```sh
+tunmux connect wgconf --file ./tunnel.conf
+# Save a profile for reuse without connecting:
+tunmux wgconf save --file ./tunnel.conf --name work
+tunmux wgconf list
+tunmux disconnect --provider wgconf
+tunmux connect wgconf --profile work
 ```
 
-## Configuration
+`--save-as work` on a file-based connect also saves the profile.
+`tunmux wgconf remove work` deletes a saved profile.
 
-`tunmux` reads optional defaults from:
+### Use a proxy
 
-`~/.config/tunmux/config.toml`
+Start a rootless proxy, then point an application at its assigned port:
 
-Example:
+```sh
+tunmux connect proton --country US --local-proxy
+tunmux status
+curl --proxy socks5h://127.0.0.1:1080 https://api.ipify.org
+curl --proxy http://127.0.0.1:8118 https://api.ipify.org
+```
+
+Ports start at **1080** for SOCKS5 and **8118** for HTTP. Each instance selects
+available ports; check `status` or choose `--socks-port` and `--http-port` explicitly.
+Use `socks5h://` so hostname resolution happens through the proxy.
+
+On Linux, use `--proxy` instead for an isolated network namespace with a kernel
+WireGuard tunnel. Both proxy modes support multiple exits at once and leave host
+routing unchanged. One direct connection can coexist with proxy instances.
+
+### Disconnect and inspect
+
+```sh
+tunmux status
+tunmux disconnect <instance>                 # name shown by status
+tunmux disconnect --provider proton --all    # every Proton connection
+tunmux disconnect --all                      # every connection
+```
+
+Without an instance or `--all`, disconnect handles a single matching connection
+or lists the candidates when the choice is ambiguous.
+
+Useful connection options:
+
+- `--if-missing`: succeed without reconnecting when the same source and options
+  are already active.
+- `--backend kernel|userspace|wg-quick`: override the platform/configured backend.
+- `--mtu N`: override the interface MTU (576–65535);
+  unavailable in local-proxy mode.
+- `--disable-ipv6`: block host IPv6 egress for an IPv4-only direct kernel tunnel.
+- `--allow-lan`: bypass directly attached LANs in macOS helper-backed direct mode.
+
+## Configuration and diagnostics
+
+Optional defaults live in `~/.config/tunmux/config.toml`:
 
 ```toml
 [general]
-backend = "kernel"                # default: kernel on unix (except macOS), wg-quick on macOS
-credential_store = "keyring"      # keyring or file
+credential_store = "file"
 proxy_access_log = false
-hooks = { ifup = ["builtin:connectivity", "builtin:external-ip"], ifdown = [] }
-privileged_transport = "socket"   # socket or stdio
-privileged_elevation = "auto"     # auto, none, passwordless, or a path such as /usr/bin/sudo
-privileged_autostart = true
-privileged_autostart_timeout_ms = 5000
-privileged_authorized_group = "tunmux"
-privileged_autostop_mode = "timeout"    # never, command, timeout (default: timeout)
-privileged_autostop_timeout_ms = 300000 # idle time before the daemon exits (default: 5 min)
+hooks = { ifup = ["builtin:connectivity"], ifdown = [] }
 
 [proton]
 default_country = "CH"
-hooks = { ifup = ["/usr/local/bin/proton-ifup.sh"], ifdown = ["/usr/local/bin/proton-ifdown.sh"] }
 
 [airvpn]
 default_country = "NL"
 default_device = "laptop"
-hooks = { ifup = [], ifdown = [] }
 
 [mullvad]
 default_country = "SE"
-hooks = { ifup = [], ifdown = [] }
-
-[ivpn]
-default_country = "CH"
-hooks = { ifup = [], ifdown = [] }
-
-[wgconf]
-hooks = { ifup = [], ifdown = [] }
 ```
 
-CLI flags override config values.
-
-Hook behavior:
-- `general.hooks` runs for every provider, then provider-specific hooks run after it.
-- `ifup` runs after successful connect; `ifdown` runs after successful disconnect.
-- Built-ins are opt-in via hook entries:
-  - `builtin:connectivity`: ping IPv4 (`1.1.1.1`) and IPv6 (`2606:4700:4700::1111`)
-  - `builtin:external-ip`: fetch external IP via `https://ipinfo.io` and `https://v6.ipinfo.io`
-  - `builtin:dns-detection`: query `https://<random>-<n>.ipleak.net/dnsdetection/`
-    with a 40-char random host label and incrementing probe number (`-1` to `-10`),
-    then run reverse DNS lookup for each recovered resolver IP
-- Hook commands run with env vars such as `TUNMUX_HOOK_EVENT`, `TUNMUX_PROVIDER`,
-  `TUNMUX_INSTANCE`, `TUNMUX_BACKEND`, `TUNMUX_INTERFACE`, `TUNMUX_SERVER`,
-  `TUNMUX_ENDPOINT`, plus optional proxy fields (`TUNMUX_NAMESPACE`, `TUNMUX_SOCKS_PORT`,
-  `TUNMUX_HTTP_PORT`, `TUNMUX_PROXY_PID`).
-- Hook env also includes `TUNMUX_DNS_SERVERS` when VPN DNS servers are known.
-- When proxy ports are present, hook commands also receive standard proxy vars:
-  `HTTP_PROXY`/`HTTPS_PROXY` and `ALL_PROXY` (plus lowercase variants).
-- Builtin HTTP checks (`external-ip`, `dns-detection`, and proxy-mode `connectivity`) use
-  the active connection proxy automatically when available.
-- `dns-detection` reverse DNS lookup prefers VPN-configured DNS servers first.
-- Manual builtin checks: `tunmux hook run connectivity`, `tunmux hook run external-ip`,
-  or `tunmux hook run dns-detection`.
-- Debug helper: `tunmux hook debug <instance>` prints the exact env payload used for hooks
-  (`--event ifup|ifdown`, default `ifup`).
-
-## Privileged Service
-
-Privileged operations are handled by:
-
-```bash
-sudo tunmux privileged --serve --authorized-group <group>
-```
-
-Supported transports:
-- `socket` (default): Unix socket control channel (`/var/run/tunmux/ctl.sock`, typically `/run/tunmux/ctl.sock`)
-- `stdio`: one-shot helper process over stdin/stdout
-
-Autostart can launch the privileged service when needed (if enabled in config).
-`privileged_elevation` in `[general]` selects how it gains root:
-
-- `auto` (default): run directly when already root, otherwise use the first available of
-  `doas`, `sudo`, `run0`, `pkexec` on Linux, or `sudo`, then the macOS administrator
-  dialog (`osascript`) on macOS
-- `none`: start the service directly without elevation (already root, or the binary has
-  the needed capabilities)
-- `passwordless`: like `auto`, but never prompt; fails if the program needs a password
-  (for NOPASSWD sudoers or `nopass` doas rules)
-- a path such as `/usr/bin/sudo`: use that program
-
-The stdio transport cannot run through the macOS administrator dialog.
-
-Example sudoers entries (adjust binary path for your install). The trailing `*` covers the
-`--log-filter` and `--idle-timeout-ms` arguments that autostart appends:
-
-```bash
-<user-or-group> ALL=(root) NOPASSWD: /usr/bin/tunmux privileged --serve --authorized-group tunmux
-<user-or-group> ALL=(root) NOPASSWD: /usr/bin/tunmux privileged --serve --detach --autostarted --authorized-group tunmux *
-```
-
-For stdio mode:
-
-```bash
-<user-or-group> ALL=(root) NOPASSWD: /usr/bin/tunmux privileged --serve --stdio --autostarted --authorized-group tunmux *
-```
-
-Example doas rule (doas matches the command, not its arguments):
-
-```text
-permit nopass :tunmux as root cmd /usr/bin/tunmux
-```
-
-## Data Layout
-
-User data under `~/.config/tunmux/`:
-
-```text
-~/.config/tunmux/
-  config.toml
-  connections/
-    _direct.json
-    <instance>.json
-  proton/
-    session.json
-    manifest.json
-  airvpn/
-    session.json
-    manifest.json
-    web_session.json
-  mullvad/
-    account_id.json
-    session.json
-    manifest.json
-  ivpn/
-    account_id.json
-    session.json
-    manifest.json
-  wgconf/
-    profiles/
-      <name>.conf
-```
-
-Runtime state (Linux):
-
-```text
-/var/run/tunmux/
-  ctl.sock
-  managed-pids/
-    <pid>.start
-
-/var/lib/tunmux/
-  proxy/
-    <instance>.pid
-    <instance>.log
-  wg/
-    <provider>/<iface>.conf
-```
-
-Runtime state (macOS):
-
-```text
-/var/db/tunmux/
-  proxy/
-  wg/
-```
-
-## Userspace reliability and recovery
-
-The embedded userspace helper collects passive peer statistics without launching
-`wg` or generating outbound probe traffic. A dedicated network worker serializes
-setup, reconciliation, and restoration. macOS network notifications trigger
-reconciliation after a 500 ms debounce (at most two seconds during a burst), with
-ten-second polling as a fallback. Changed gateways require a confirming observation
-and include physical interface identity. Reconciliation preserves configured
-AllowedIPs by default. Unsettled gateways or ownership conflicts are
-reported without overwriting another owner's settings.
-
-Disconnect waits for the helper's cleanup acknowledgment. Commands have a
-three-second deadline, setup a twenty-second budget, reconciliation a ten-second
-budget, rollback a twenty-second
-budget, and device stop a five-second deadline. An in-progress command may finish
-past its operation budget. The client waits up to seventy seconds for teardown;
-a timeout or incomplete restoration is an error, with recovery information retained.
-
-Privileged recovery journals live at
-`/var/run/wireguard/<interface>.recovery.json` with restrictive permissions and
-contain network restoration data, never WireGuard keys. A session lock prevents
-competing helpers. Restart and disconnect recover a stopped helper's journal only
-when the control endpoint is confirmed unavailable. Conflicting DNS or routes stay
-untouched, and pending actions remain journaled for retry. Because this directory
-is runtime storage, these journals cover helper/process crashes rather than
-recovery across a host reboot.
-
-Status reports observed health separately from saved connection metadata. Missing
-permissions, probe timeouts, legacy records without peer identity, and unverifiable
-proxy sessions report unknown. Connection records are written atomically; corrupt
-records are preserved in quarantine. Status does not retire stale sessions.
-
-Native routing, DNS, roaming, signal, and launchd behavior must be validated on the
-host; see [the macOS validation runbook](docs/validation/macos-reliability.md).
-Live structured log forwarding remains deferred.
-
-### macOS service and automatic connections
+Set `general.backend` to override the platform default. Credentials, cached provider
+data, connection state, and saved WireGuard profiles also live under
+`~/.config/tunmux/`. Desktop credentials default to file storage;
+`credential_store = "keyring"` selects the optional keyring backend
+when compiled in.
+See [src/config.rs](src/config.rs) for the complete configuration schema.
 
 ```sh
-sudo tunmux service install                 # root-owned copy in /usr/local/libexec/tunmux
+tunmux -v status
+RUST_LOG=tunmux=debug,gotatun=warn tunmux status
+tunmux hook run connectivity
+tunmux hook run external-ip
+tunmux hook debug <instance>
+```
+
+`RUST_LOG` takes precedence over `-v`. Existing daemons retain their startup log
+filter until restarted. Hooks accept built-in checks or executable paths and run
+on connection up/down events. Local-proxy DNS prefers the tunnel's DNS servers;
+`TUNMUX_LOCAL_PROXY_DNS_SERVERS` overrides them with a comma-separated list.
+
+Status distinguishes observed health from saved metadata. If cleanup fails,
+resolve the reported problem and retry disconnect; recovery journals retain
+unfinished route/DNS restoration work.
+
+## Service setup
+
+Installing a service is optional; rootless local-proxy mode does not need one.
+
+On **Linux with systemd**, first create or choose a group containing the users
+allowed to access the helper, then install:
+
+```sh
+sudo tunmux service install --authorized-group tunmux
+systemctl status tunmux-privileged.socket
+journalctl -u tunmux-privileged.service
+```
+
+The installer does not create groups or change memberships. It copies the binary
+to `/usr/local/libexec/tunmux`, installs the units, and enables socket activation.
+Disconnect all sessions before `sudo tunmux service uninstall`. Linux does not
+support `service reload` or `service diagnose`; use systemd tools.
+
+On **macOS**, install the privileged LaunchDaemon with:
+
+```sh
+sudo tunmux service install
 tunmux service diagnose
 sudo tunmux service reload
 sudo tunmux service uninstall
+```
 
-tunmux autoconnect enable work -- connect wgconf --profile work --backend userspace
-tunmux autoconnect enable exit -- connect airvpn --country NL --local-proxy
+Both platforms accept `service install --binary-path /absolute/path` for a custom
+installation location. The binary and its ancestors must be root-owned and
+protected from writes by other users; Linux service hardening excludes paths
+under `/home`, `/root`, and `/run/user`. Linux upgrades must reuse the installed
+binary path. Profiles and credentials are preserved on uninstall.
+
+### Automatic connections on macOS
+
+After saving a profile and installing the service:
+
+```sh
+tunmux autoconnect enable work -- connect wgconf --profile work
 tunmux autoconnect status
 tunmux autoconnect disable work
 tunmux autoconnect resume work
 ```
 
-Installation uses a socket-activated privileged LaunchDaemon. `autoconnect enable`
-installs a separate user LaunchAgent; ordinary connects never install services.
-For foreground operation, use `autoconnect enable <name> --no-login-agent -- connect ...`
-and run `tunmux autoconnect run` yourself.
-Use `service install --binary-path /absolute/root-owned/path --authorized-group admin`
-to customize installation. `--user <uid>` identifies the login user when installing
-through an administrator dialog; `--config-dir` supports a custom absolute tunmux
-directory. All ancestors of the installed binary must be root-owned and protected
-against group/other writes.
+Enabling installs a user login agent. One direct tunnel and multiple local proxies
+are supported. Manual disconnect suspends the matching entry until explicitly
+resumed. Background attempts never prompt for elevation. Use `--no-login-agent`
+on `enable` and run `tunmux autoconnect run` for foreground operation.
+Logs are in
+`~/.config/tunmux/autoconnect.log`.
 
-`connect --if-missing` accepts an already active connection only when its normalized
-source and options match. Different active sources, unknown health, corrupt state,
-and legacy records without identity remain errors. Both top-level and legacy
-provider-prefixed connect commands accept the option.
+## Rust features
 
-Desired state is private, versioned, and stored in `~/.config/tunmux/desired.json`,
-separately from observed connections and root recovery journals. One desired direct
-tunnel and multiple local proxies are supported on macOS. Provider credentials and
-WGConf private keys remain in their existing stores; desired entries retain source
-references and a SHA-256 profile fingerprint. Changed profiles require enabling the
-entry again. Proxy ports are persisted when first selected.
+Default builds enable **`all-providers` and `proxy`**. Features are additive; use
+`--no-default-features` to build a smaller selection.
 
-Manual disconnect suspends matching desired entries before cleanup. Suspension
-survives login/reboot and requires explicit `autoconnect resume` or `enable`.
-Temporary connection failures retry after 1, 2, 4, 8, 16, and 30 seconds, with bounded
-jitter. Exhaustion waits for a network change or explicit resume; uncertain health
-and permanent failures require intervention. Background attempts never prompt for
-privilege elevation. Logs are in `~/.config/tunmux/autoconnect.log`.
+| Cargo feature | Enables |
+| --- | --- |
+| `proton`, `airvpn`, `mullvad`, `ivpn` | The named provider, its CLI commands, and provider-specific dependencies |
+| `wgconf` | Local WireGuard files and saved profiles |
+| `all-providers` | All five providers |
+| `proxy` | Linux network-namespace proxy support; not required for rootless local-proxy mode |
+| `keyring` | Optional credential storage through the keyring crate |
 
-Local proxies use session identities and a private control socket with cleanup
-acknowledgment. Legacy proxies without identity must be disconnected with the
-version that started them before upgrading. Root recovery and source matching do
-not grant automatic destructive recovery of unverified Linux namespace proxies.
+```sh
+cargo build --locked --no-default-features --features wgconf
+cargo build --locked --no-default-features --features proton,mullvad,proxy
+cargo build --locked --features keyring
+```
 
-`--allow-lan` explicitly bypasses directly attached physical LAN subnets for macOS
-helper-backed direct tunnels. It preserves the more-specific physical LAN routes and omits conflicting VPN
-routes within those prefixes, retains VPN DNS host routes, and journals changes. It does not alter
-WireGuard AllowedIPs. Other backends and proxy modes reject the flag. Reload the
-privileged service when upgrading to gain negotiated LAN-policy support.
+A build with `--no-default-features` alone retains shared infrastructure without
+provider commands. Library consumers using `default-features = false` must choose
+providers explicitly. Android consumers can enable `all-providers` without `proxy`.
 
-Reload suspends automatic work, tears down sessions, and resumes previously enabled
-entries after service activation succeeds. Uninstall completes cleanup before
-removing the installed binary, daemon, and login agent. Profiles, credentials, and
-unresolved recovery journals are preserved; incomplete cleanup aborts removal.
+## Codebase and contributions
+
+The Rust 2021 package provides a library and CLI binary:
+
+| Location | Responsibility |
+| --- | --- |
+| [src/main.rs](src/main.rs), [src/cli.rs](src/cli.rs), [src/lib.rs](src/lib.rs) | Command entry point, Clap arguments, library exports |
+| `src/{proton,airvpn,mullvad,ivpn,wgconf}/` | Provider APIs, models, and command handlers |
+| [src/wireguard/](src/wireguard/) | Configuration, backends, connection state, health, and rootless proxy tunnel |
+| [src/shared/](src/shared/) | Credentials, hooks, persistence, and common connection operations |
+| `src/privileged*`, `src/userspace_helper*` | Privileged requests, embedded GotaTun helper, network setup and recovery |
+| [src/proxy/](src/proxy/), [src/netns.rs](src/netns.rs) | Linux namespace proxies |
+| [src/service.rs](src/service.rs), [src/automation.rs](src/automation.rs) | Service installation and automatic connections |
+| [tests/](tests/), [benches/](benches/), [scripts/](scripts/) | Integration tests, offline benchmarks, and validation tools |
+| [third_party/smoltcp/](third_party/smoltcp/) | Patched TCP/IP stack used with BoringTun for rootless proxies |
+
+Keep changes focused, preserve platform and feature gates, and add behavior tests
+for fixes. Follow rustfmt, use structured `tracing` logs, and propagate errors with
+`Result` and useful context. Never include credentials or private keys in logs,
+fixtures, or bug reports. Agent-specific guidance is in [AGENTS.md](AGENTS.md).
+
+Before submitting a contribution, run the repository checks:
+
+```sh
+bash scripts/ci.sh
+# Optional offline CPU benchmarks (no VPN account or root needed):
+cargo bench --locked --bench offline
+```
+
+The CI script checks formatting, runs Clippy across all targets/features with
+warnings denied, and runs `cargo test --locked`. For feature-gated changes, also
+check the affected `--no-default-features --features ...` configuration. Changes
+to routes, DNS, privileges, or recovery need live validation on the affected OS;
+[scripts/macos_native_validation.py](scripts/macos_native_validation.py) provides
+macOS scenarios (`--help` lists its options).
+
+On the maintainer's Linux setup, `.envrc` selects the shared Nix Android shell.
+Run checks there with:
+
+```sh
+nix develop --no-write-lock-file \
+  "path:$HOME/projects-caddy/nix-dev-shells/android" -c bash scripts/ci.sh
+```
+
+Other environments can run the same Cargo commands with the pinned toolchain.
+Include reproduction steps, OS, backend, enabled features, and validation results
+in issues and pull requests.
 
 ## License
 
-MIT
-
-Copyright (c) 2026 Contributors to tunmux
+[MIT](LICENSE).

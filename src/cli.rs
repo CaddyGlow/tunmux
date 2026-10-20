@@ -2027,7 +2027,7 @@ pub enum ServiceCommand {
     Install {
         #[arg(long, default_value = "/usr/local/libexec/tunmux")]
         binary_path: std::path::PathBuf,
-        #[arg(long, default_value = "admin")]
+        #[arg(long, default_value = if cfg!(target_os = "macos") { "admin" } else { "tunmux" })]
         authorized_group: String,
         /// Login user whose sessions are managed during reload/uninstall
         #[arg(long)]
