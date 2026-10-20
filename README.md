@@ -352,6 +352,30 @@ must share its network namespace; publishing a Docker port alone is insufficient
 Direct/kernel modes need additional privileges and host networking integration.
 `tunmux status` reports connection state; it is not a container health guarantee.
 
+`Dockerfile.distroless` builds a static musl binary on
+`gcr.io/distroless/static-debian13:nonroot` (no shell or networking tools), which
+only suits `--local-proxy` mode:
+`docker build -f Dockerfile.distroless -t tunmux:distroless .`. Its configuration
+lives under `/home/nonroot/.config/tunmux`.
+
+### Local cross-builds
+
+`cargo run -p xtask -- dist` builds and packages every supported target into
+`dist/` with the same archive and checksum layout as the release workflow:
+Linux gnu (glibc 2.28 floor) and static musl for x86-64 and ARM64,
+macOS x86-64/ARM64, and a Flatpak bundle. Select subsets with `linux`, `gnu`,
+`musl`, `macos`, `flatpak`, `flatpak-aarch64` or a target triple;
+`cargo run -p xtask -- targets` lists them. Run it in the Nix dev shell: Linux
+targets use `cargo-zigbuild`, macOS cross-linking needs clang, lld and `SDKROOT`
+pointing at a MacOSX SDK, and targets without an installed Rust standard library
+are skipped. Linux binaries are checked for a distribution loader, no rpath and
+the glibc floor (musl: fully static).
+
+The Flatpak bundle wraps the static musl binary for rootless local-proxy use and
+needs the Flathub `org.freedesktop.Sdk` 25.08 (`--install-flatpak-deps` installs
+it for the current user). Windows (`x86_64-pc-windows-msvc`, via `cargo-xwin`) is
+selectable but does not build yet: the crate is Unix-only.
+
 ## License
 
 [MIT](LICENSE).

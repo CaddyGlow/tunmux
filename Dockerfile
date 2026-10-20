@@ -13,6 +13,7 @@ COPY benches ./benches
 COPY tests ./tests
 COPY LICENSE README.md ./
 COPY third_party ./third_party
+COPY xtask ./xtask
 
 RUN cargo build --release --locked
 

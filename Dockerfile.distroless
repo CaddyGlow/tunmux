@@ -1,0 +1,38 @@
+# Static musl build on a distroless base: no shell, package manager, iproute2,
+# iptables or wireguard-tools. Suited to rootless local-proxy mode; use the
+# default Dockerfile for kernel or namespace modes.
+FROM rust:1-trixie AS builder
+
+ARG TUNMUX_GIT_TAG=dev
+ENV TUNMUX_GIT_TAG=${TUNMUX_GIT_TAG}
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends musl-tools \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+COPY Cargo.toml Cargo.lock rust-toolchain.toml build.rs ./
+COPY src ./src
+COPY launchd ./launchd
+COPY systemd ./systemd
+COPY benches ./benches
+COPY tests ./tests
+COPY LICENSE README.md ./
+COPY third_party ./third_party
+COPY xtask ./xtask
+
+# Buildx runs this stage per platform, so uname -m names the target arch.
+RUN target="$(uname -m)-unknown-linux-musl" \
+    && rustup target add "$target" \
+    && cargo build --release --locked --target "$target" \
+    && install -D "target/$target/release/tunmux" /out/tunmux
+
+FROM gcr.io/distroless/static-debian13:nonroot AS runtime
+
+COPY --from=builder /out/tunmux /usr/local/bin/tunmux
+COPY --from=builder /app/LICENSE /app/README.md /usr/share/doc/tunmux/
+
+USER nonroot:nonroot
+
+ENTRYPOINT ["/usr/local/bin/tunmux"]

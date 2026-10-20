@@ -1,0 +1,21 @@
+# Built by `cargo run -p xtask -- dist flatpak`, which stages the static musl
+# binary and LICENSE next to this manifest. The sandbox suits rootless
+# local-proxy mode only: kernel, namespace and service modes need root.
+app-id: io.tunmux.Tunmux
+runtime: org.freedesktop.Platform
+runtime-version: "25.08"
+sdk: org.freedesktop.Sdk
+command: tunmux
+finish-args:
+  - --share=network
+modules:
+  - name: tunmux
+    buildsystem: simple
+    build-commands:
+      - install -Dm755 tunmux /app/bin/tunmux
+      - install -Dm644 LICENSE /app/share/licenses/io.tunmux.Tunmux/LICENSE
+    sources:
+      - type: file
+        path: tunmux
+      - type: file
+        path: LICENSE

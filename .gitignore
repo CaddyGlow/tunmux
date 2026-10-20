@@ -1,5 +1,6 @@
 # Rust
 /target
+/dist
 .cargo/*
 !.cargo/audit.toml
 
