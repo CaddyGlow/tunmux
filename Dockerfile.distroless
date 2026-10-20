@@ -19,7 +19,6 @@ COPY systemd ./systemd
 COPY benches ./benches
 COPY tests ./tests
 COPY LICENSE README.md ./
-COPY third_party ./third_party
 COPY xtask ./xtask
 
 # Buildx runs this stage per platform, so uname -m names the target arch.

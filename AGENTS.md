@@ -25,13 +25,14 @@ Guidance for coding agents working in `tunmux`.
 
 ### Environment
 
-- Initialize `third_party/smoltcp` with `git submodule update --init --recursive`.
+- The patched `smoltcp` comes from the `CaddyGlow/smoltcp` fork through a pinned
+  `[patch.crates-io]` git revision in `Cargo.toml`; bump `rev` to pick up fork changes.
 - On the maintainer's Linux setup, `.envrc` selects the shared Nix Android shell.
   Run development tools through it, for example:
 
   ```sh
   nix develop --no-write-lock-file \
-    "path:$HOME/projects-caddy/nix-dev-shells/android" -c bash scripts/ci.sh
+    "path:$HOME/projects-caddy/nix-dev-shells/android" -c cargo xtask ci
   ```
 
 - Commands below assume the development shell is active. Preserve toolchain pins,
@@ -68,17 +69,19 @@ Guidance for coding agents working in `tunmux`.
 - Show test output:
   - `cargo test test_select_host_by_hostname -- --nocapture`
 
-### Repo CI helper
+### Repo checks (`cargo xtask ci`)
 
-- CI script used by GitHub Actions: `bash ./scripts/ci.sh`
-- What it runs:
-  - `cargo fmt --all --check`
-  - `cargo clippy --locked --all-targets --all-features -- -D warnings`
-  - `cargo test --locked`
-  - `cargo test --locked --all-features`
-- For feature-gated changes, also run Clippy and `cli::tests` with
-  `--no-default-features --features <selection>`. CI covers no features, each
-  individual provider, both AirVPN crypto backends, `proxy`, and `proxy,wgconf`.
+- GitHub Actions, the git hooks in `.githooks/`, and local runs all call
+  `cargo xtask ci`; the step definitions live in `xtask/src/ci.rs`.
+- `cargo xtask ci` runs `fmt`, `clippy` (workspace, all targets and features,
+  warnings denied), `test` (default and all features), `features`, `markdown` and
+  `audit`. Name steps to run a subset; `docker` and `all` include the image builds.
+- `features` runs Clippy and `cli::tests` per `--no-default-features` selection:
+  none, each provider, both AirVPN crypto backends, `proxy`, and `proxy,wgconf`.
+  Limit it with `--feature-set <name>`; the list is in `FEATURE_SETS`.
+- `--quick` (pre-commit hook) runs fmt and default-feature Clippy. The pre-push
+  hook runs `fmt clippy test markdown`. Enable hooks with
+  `git config core.hooksPath .githooks`.
 - Offline CPU benchmarks: `cargo bench --locked --bench offline`.
 
 ### Android build (when needed)
@@ -207,10 +210,8 @@ Guidance for coding agents working in `tunmux`.
 
 ## 6) Agent Workflow Expectations
 
-- Before finishing substantial changes, run:
-  - `cargo fmt --all --check`
-  - `cargo clippy --locked --all-targets --all-features -- -D warnings`
-  - `cargo test --locked` (or targeted tests while iterating)
+- Before finishing substantial changes, run `cargo xtask ci fmt clippy test`
+  (or targeted tests while iterating).
 - If time is limited, run the most targeted tests first, then broader checks.
 - Keep changes scoped; avoid unrelated refactors.
 - Route, DNS, privilege, and recovery changes require native validation on affected

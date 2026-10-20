@@ -1,4 +1,8 @@
-//! Release build automation: `cargo run -p xtask -- help`.
+//! Release builds and repository checks: `cargo xtask help`.
+
+#[cfg(target_os = "linux")]
+mod bench_wg;
+mod ci;
 
 use std::env;
 use std::fs;
@@ -97,7 +101,16 @@ impl Job<'_> {
 fn main() -> ExitCode {
     let args: Vec<String> = env::args().skip(1).collect();
     let result = match args.first().map(String::as_str) {
+        #[cfg(target_os = "linux")]
+        Some("bench-wg") => bench_wg::main(&args[1..]).map_err(|err| format!("{err:#}")),
+        #[cfg(not(target_os = "linux"))]
+        Some("bench-wg") => Err("bench-wg requires Linux".into()),
         Some("dist") => parse_options(&args[1..]).and_then(|opts| dist(&opts)),
+        Some("ci") if args[1..].iter().any(|a| a == "-h" || a == "--help") => {
+            println!("{}", ci::help());
+            Ok(())
+        }
+        Some("ci") => ci::main(&args[1..]),
         Some("targets") => {
             print_targets();
             Ok(())
@@ -120,10 +133,12 @@ fn main() -> ExitCode {
 fn print_help() {
     println!(
         "\
-Usage: cargo run -p xtask -- <command>
+Usage: cargo xtask <command>
 
 Commands:
+  bench-wg [OPTIONS]            Compare kernel WireGuard and GotaTun (Linux)
   dist [SELECTOR...] [OPTIONS]   Build and package release artifacts into dist/
+  ci [STEP...] [OPTIONS]         Run repository checks (`cargo xtask ci --help`)
   targets                        List known targets and selector groups
   help                           Show this message
 

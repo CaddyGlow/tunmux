@@ -1,0 +1,8 @@
+#!/bin/sh
+# Enable once per clone: git config core.hooksPath .githooks
+# direnv supplies the dev shell when the hook runs outside a loaded terminal.
+set -e
+if command -v direnv >/dev/null 2>&1 && [ -f .envrc ]; then
+  exec direnv exec . cargo xtask ci --quick
+fi
+exec cargo xtask ci --quick

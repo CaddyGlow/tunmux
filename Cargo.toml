@@ -129,7 +129,7 @@ daemonize2 = "0.7"
 gotatun = { version = "0.10", default-features = false, features = ["device", "tun", "ring"] }
 
 [patch.crates-io]
-smoltcp = { path = "third_party/smoltcp" }
+smoltcp = { git = "https://github.com/CaddyGlow/smoltcp.git", rev = "027d31c3c6c27fa92d0e0221ab707dcc72bd69f1" }
 
 [dev-dependencies]
 criterion = { version = "0.5.1", default-features = false, features = ["cargo_bench_support"] }

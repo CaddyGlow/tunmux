@@ -1,0 +1,6 @@
+# The README opens with a centered, theme-aware logo instead of a heading.
+[MD033]
+allowed-elements = ["p", "picture", "source", "img"]
+
+[MD041]
+enabled = false

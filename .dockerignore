@@ -16,8 +16,6 @@
 !launchd/**
 !systemd/
 !systemd/**
-!third_party/
-!third_party/**
 !xtask/
 !xtask/**
 !packaging/

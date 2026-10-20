@@ -17,10 +17,9 @@ Use the Rust toolchain pinned in [rust-toolchain.toml](rust-toolchain.toml).
 Install a C compiler and make for native dependencies (on macOS, install the
 Xcode command-line tools). The optional AWS-LC backend also needs CMake and a C++
 compiler. AirVPN's default RustCrypto backend requires no native crypto library.
-Initialize the bundled `smoltcp` submodule before building:
+Build and run:
 
 ```sh
-git submodule update --init --recursive
 cargo build --release --locked
 cargo run -- --help
 ```
@@ -291,7 +290,7 @@ The Rust 2021 package provides a library and CLI binary:
 | [src/proxy/](src/proxy/), [src/netns.rs](src/netns.rs) | Linux namespace proxies |
 | [src/service.rs](src/service.rs), [src/automation.rs](src/automation.rs) | Service installation and automatic connections |
 | [tests/](tests/), [benches/](benches/), [scripts/](scripts/) | Integration tests, offline benchmarks, and validation tools |
-| [third_party/smoltcp/](third_party/smoltcp/) | Patched TCP/IP stack used with BoringTun for rootless proxies |
+| [CaddyGlow/smoltcp](https://github.com/CaddyGlow/smoltcp) | Patched TCP/IP stack used with BoringTun for rootless proxies (Cargo git patch) |
 
 Keep changes focused, preserve platform and feature gates, and add behavior tests
 for fixes. Follow rustfmt, use structured `tracing` logs, and propagate errors with
@@ -301,37 +300,49 @@ fixtures, or bug reports. Agent-specific guidance is in [AGENTS.md](AGENTS.md).
 Before submitting a contribution, run the repository checks:
 
 ```sh
-bash scripts/ci.sh
+cargo xtask ci
 # Optional offline CPU benchmarks (no VPN account or root needed):
 cargo bench --locked --bench offline
 ```
 
-The CI script checks formatting, runs Clippy across all targets/features with
-warnings denied, and tests both default and all-feature builds. Keyring tests use
-isolated in-memory credentials and never access your account entries.
-For feature-gated changes, also
-check the affected `--no-default-features --features ...` configuration. Changes
-to routes, DNS, privileges, or recovery need live validation on the affected OS;
+`cargo xtask ci` is what GitHub Actions runs: formatting, Clippy across all
+targets/features with warnings denied, default and all-feature tests, the
+per-provider feature matrix, Markdown lint and `cargo audit` (`cargo xtask ci
+--help` lists the steps; `docker` builds and smoke-tests both images). Enable the
+matching git hooks with `git config core.hooksPath .githooks`: pre-commit runs
+`cargo xtask ci --quick`, pre-push runs `fmt clippy test markdown`. Keyring tests
+use isolated in-memory credentials and never access your account entries.
+Changes to routes, DNS, privileges, or recovery need live validation on the
+affected OS;
 [scripts/macos_native_validation.py](scripts/macos_native_validation.py) provides
-macOS scenarios (`--help` lists its options).
+macOS scenarios (`--help` lists its options), including `--scenario autoconnect`
+for isolated local-proxy reconnect and manual-suspension checks. Run that scenario
+as the login user with `--binary` and `--profile-file`; it creates no login agent.
+
+For Linux dataplane comparisons, run `cargo xtask bench-wg --bin /path/to/release/tunmux`.
+This compares kernel WireGuard and GotaTun with local peers, alternating backend
+order and recording throughput, idle/loaded latency, CPU usage, and raw iperf JSON.
+`--help` lists duration, repeat, stream, MTU, and output options. It requires
+`ip`, `wg`, `iperf3`, `ping`, `mount`, `unshare`, and `/dev/net/tun`, plus either
+unprivileged user namespaces or root. Private mount, network, and PID namespaces
+contain the benchmark; no VPN account or internet traffic is needed. This manual
+benchmark is separate from CI and the offline CPU benchmark.
 
 Privileged tests are explicitly ignored by the default suite. Run them only in a
 prepared disposable environment after inspecting their requirements. Live VPN
 validation scripts under `scripts/` are manual tools: they may change connections,
 routes, and DNS. The offline benchmark needs no credentials or privileges.
 
-Lint project Markdown with `rumdl check README.md AGENTS.md` (CI pins version
-0.2.77). CI also builds the Docker image and smoke-tests its CLI.
-
 On the maintainer's Linux setup, `.envrc` selects the shared Nix Android shell.
 Run checks there with:
 
 ```sh
 nix develop --no-write-lock-file \
-  "path:$HOME/projects-caddy/nix-dev-shells/android" -c bash scripts/ci.sh
+  "path:$HOME/projects-caddy/nix-dev-shells/android" -c cargo xtask ci
 ```
 
-Other environments can run the same Cargo commands with the pinned toolchain.
+Other environments can run the same command with the pinned toolchain; CI pins
+cargo-audit and rumdl, and `cargo xtask ci` warns when local versions differ.
 Include reproduction steps, OS, backend, enabled features, and validation results
 in issues and pull requests.
 

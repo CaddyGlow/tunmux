@@ -4,25 +4,22 @@ on:
   push:
   pull_request:
 
+# Every job runs `cargo xtask ci <step>`; the same commands run locally and in
+# the git hooks under .githooks/.
 jobs:
   checks:
-    name: Run CI checks
+    name: Format, Clippy and tests
     runs-on: ubuntu-latest
-
     steps:
       - name: Checkout
         uses: actions/checkout@v4
-        with:
-          submodules: recursive
-
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: "1.99.0"
           components: rustfmt, clippy
-
-      - name: Run repository CI script
-        run: bash ./scripts/ci.sh
+      - name: Run checks
+        run: cargo xtask ci fmt clippy test
 
   macos:
     name: macOS checks
@@ -30,80 +27,86 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
-        with:
-          submodules: recursive
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: "1.99.0"
           components: clippy
-      - name: Check macOS targets
-        run: cargo clippy --locked --all-targets --all-features -- -D warnings
-      - name: Test desktop behavior
-        run: cargo test --locked --all-features
+      - name: Run checks
+        run: cargo xtask ci clippy test
+
+  feature-sets:
+    name: List feature sets
+    runs-on: ubuntu-latest
+    outputs:
+      sets: ${{ steps.list.outputs.sets }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: "1.99.0"
+      - name: List feature sets
+        id: list
+        run: echo "sets=$(cargo xtask ci feature-sets)" >> "$GITHUB_OUTPUT"
 
   provider-features:
-    name: Provider features (${{ matrix.features || 'none' }})
+    name: Provider features (${{ matrix.set }})
+    needs: feature-sets
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
-        features: ["", "proton", "airvpn,crypto-rustcrypto", "airvpn,crypto-aws-lc", "mullvad", "ivpn", "wgconf", "proxy", "proxy,wgconf"]
+        set: ${{ fromJSON(needs.feature-sets.outputs.sets) }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
-        with:
-          submodules: recursive
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: "1.99.0"
           components: clippy
-      - name: Check feature configuration
-        run: cargo clippy --locked --all-targets --no-default-features --features "${{ matrix.features }}" -- -D warnings
-      - name: Test CLI feature availability
-        run: cargo test --locked --no-default-features --features "${{ matrix.features }}" cli::tests
-      - name: Test AirVPN crypto backend
-        if: startsWith(matrix.features, 'airvpn,')
-        run: cargo test --locked --no-default-features --features "${{ matrix.features }}" airvpn::crypto::tests
+      - name: Check feature set
+        env:
+          FEATURE_SET: ${{ matrix.set }}
+        run: cargo xtask ci features --feature-set "$FEATURE_SET"
 
   audit:
     name: Security audit
     runs-on: ubuntu-latest
-
     steps:
       - name: Checkout
         uses: actions/checkout@v4
-
-      - name: Install cargo-audit
-        run: cargo install cargo-audit --version 0.22.2 --locked
-
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: "1.99.0"
       - name: Run cargo audit
-        run: cargo audit
+        run: cargo xtask ci --install-tools audit
 
   markdown:
     name: Markdown lint
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: "1.99.0"
-      - name: Install pinned Markdown linter
-        run: cargo install rumdl --version 0.2.77 --locked
-      - run: rumdl check README.md AGENTS.md
+      - name: Run rumdl
+        run: cargo xtask ci --install-tools markdown
 
   docker:
-    name: Build and smoke-test container
+    name: Build and smoke-test containers
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
         with:
-          submodules: recursive
-      - name: Build container
-        run: docker build --tag tunmux:ci .
-      - name: Check container CLI
-        run: |
-          docker run --rm tunmux:ci --version
-          docker run --rm tunmux:ci --help
-          docker run --rm tunmux:ci status
+          toolchain: "1.99.0"
+      - name: Build and check images
+        run: cargo xtask ci docker

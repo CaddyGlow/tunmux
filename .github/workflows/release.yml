@@ -22,8 +22,6 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
-        with:
-          submodules: recursive
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -42,11 +40,7 @@ jobs:
             exit 1
           fi
       - name: Run repository checks
-        run: bash scripts/ci.sh
-      - name: Install pinned dependency auditor
-        run: cargo install cargo-audit --version 0.22.2 --locked
-      - name: Audit release dependencies
-        run: cargo audit
+        run: cargo xtask ci --install-tools fmt clippy test audit
 
   build:
     name: Build release artifacts
