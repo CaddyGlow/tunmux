@@ -30,6 +30,17 @@ jobs:
         with:
           toolchain: "1.99.0"
           components: rustfmt, clippy
+      - name: Check tag matches Cargo version
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          cargo_version="$(cargo metadata --locked --no-deps --format-version 1 \
+            | jq -r '.packages[] | select(.name == "tunmux") | .version')"
+          if [ "$RELEASE_TAG" != "v${cargo_version}" ]; then
+            echo "::error::Tag $RELEASE_TAG does not match Cargo.toml version v${cargo_version}"
+            exit 1
+          fi
       - name: Run repository checks
         run: bash scripts/ci.sh
       - name: Install pinned dependency auditor
