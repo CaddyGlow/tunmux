@@ -21,6 +21,8 @@ pub struct AirVpnWeb {
     /// AirVPN uses page-specific CSRF tokens.
     ecsrf_cache: std::cell::RefCell<HashMap<String, String>>,
     cookie_store: Arc<CookieStoreMutex>,
+    username: String,
+    password: String,
 }
 
 /// Persisted web session: ecsrf tokens + serialized cookie jar.
@@ -230,7 +232,7 @@ impl AirVpnWeb {
     }
 
     /// Try to restore a saved web session. Returns None if no saved session.
-    fn restore() -> Option<Self> {
+    fn restore(username: &str, password: &str) -> Option<Self> {
         let data = config::load_provider_file(Provider::AirVpn, WEB_SESSION_FILE).ok()??;
         let saved: SavedWebSession = serde_json::from_slice(&data).ok()?;
 
@@ -253,6 +255,8 @@ impl AirVpnWeb {
             client,
             ecsrf_cache: std::cell::RefCell::new(saved.ecsrf),
             cookie_store,
+            username: username.to_string(),
+            password: password.to_string(),
         })
     }
 
@@ -286,7 +290,7 @@ impl AirVpnWeb {
 
     /// Try to restore a saved session; fall back to a full login.
     pub async fn login_or_restore(username: &str, password: &str) -> anyhow::Result<Self> {
-        if let Some(web) = Self::restore() {
+        if let Some(web) = Self::restore(username, password) {
             return Ok(web);
         }
         Self::login(username, password).await
@@ -296,68 +300,32 @@ impl AirVpnWeb {
     pub async fn login(username: &str, password: &str) -> anyhow::Result<Self> {
         let cookie_store = Arc::new(CookieStoreMutex::new(CookieStore::new()));
         let client = Self::build_client(cookie_store.clone())?;
-
-        // Step 1: GET /login/ to extract csrfKey from the login form.
-        // follow_redirects handles the anti-bot entry gate automatically.
-        let login_page_url = format!("{}/login/", BASE_URL);
-        let resp = follow_redirects(&client, &cookie_store, &login_page_url)
-            .await
-            .context("failed to fetch AirVPN login page")?;
-        let body = resp.text().await?;
-        let doc = Html::parse_document(&body);
-
-        let csrf_key =
-            extract_input_value(&doc, "csrfKey").context("could not find csrfKey in login form")?;
-        debug!("login_csrf_key_extracted");
-
-        let ref_value = extract_input_value(&doc, "ref").unwrap_or_default();
-
-        // Step 2: POST login credentials
-        let login_url = format!("{}/login/", BASE_URL);
-        let form = [
-            ("csrfKey", csrf_key.as_str()),
-            ("ref", &ref_value),
-            ("auth", username),
-            ("password", password),
-            ("remember_me", "1"),
-            ("_processLogin", "usernamepassword"),
-        ];
-
-        let resp = client
-            .post(&login_url)
-            .form(&form)
-            .send()
-            .await
-            .context("login POST failed")?;
-
-        let status = resp.status();
-        debug!( status = ?status.as_u16(), "login_response_status");
-
-        if !status.is_redirection() {
-            bail!(
-                "web login failed -- check username and password (status {})",
-                status
-            );
-        }
-
-        // Follow the full redirect chain to establish session
-        if let Some(location) = resp.headers().get("location") {
-            let redirect_url = location.to_str().unwrap_or("/");
-            let url = if redirect_url.starts_with('/') {
-                format!("{}{}", BASE_URL, redirect_url)
-            } else {
-                redirect_url.to_string()
-            };
-            let _ = follow_redirects(&client, &cookie_store, &url).await;
-        }
-
-        debug!("login_succeeded");
+        authenticate(&client, &cookie_store, username, password).await?;
 
         Ok(Self {
             client,
             ecsrf_cache: std::cell::RefCell::new(HashMap::new()),
             cookie_store,
+            username: username.to_string(),
+            password: password.to_string(),
         })
+    }
+
+    /// Discard the expired session and log in again with the same client.
+    async fn reauthenticate(&self) -> anyhow::Result<()> {
+        debug!("web_session_expired");
+        self.ecsrf_cache.borrow_mut().clear();
+        self.cookie_store
+            .lock()
+            .map_err(|e| anyhow::anyhow!("cookie store lock poisoned: {}", e))?
+            .clear();
+        authenticate(
+            &self.client,
+            &self.cookie_store,
+            &self.username,
+            &self.password,
+        )
+        .await
     }
 
     // ── Port management ──────────────────────────────────────────────
@@ -731,19 +699,29 @@ impl AirVpnWeb {
             return Ok(token.clone());
         }
 
-        // Fetch the page and extract the ecsrf token.
-        let page_url = format!("{}{}", BASE_URL, path);
-        let resp = follow_redirects(&self.client, &self.cookie_store, &page_url).await?;
-        let body = resp.text().await?;
-
-        let token = extract_ecsrf(&body)
-            .with_context(|| format!("could not find ecsrf token on {}", path))?;
+        // A page without a token means the saved session has expired.
+        let token = match self.fetch_ecsrf(path).await? {
+            Some(token) => token,
+            None => {
+                self.reauthenticate().await?;
+                self.fetch_ecsrf(path)
+                    .await?
+                    .with_context(|| format!("could not find ecsrf token on {}", path))?
+            }
+        };
         debug!( path = ?path, "ajax_ecsrf_extracted");
 
         self.ecsrf_cache
             .borrow_mut()
             .insert(path.to_string(), token.clone());
         Ok(token)
+    }
+
+    async fn fetch_ecsrf(&self, path: &str) -> anyhow::Result<Option<String>> {
+        let page_url = format!("{}{}", BASE_URL, path);
+        let resp = follow_redirects(&self.client, &self.cookie_store, &page_url).await?;
+        let body = resp.text().await?;
+        Ok(extract_ecsrf(&body))
     }
 
     /// POST an AJAX request with ecsrf and render=ajax parameters.
@@ -811,6 +789,71 @@ impl AirVpnWeb {
             )
         })
     }
+}
+
+/// Sign in on `client`, leaving the session cookies in `cookie_store`.
+async fn authenticate(
+    client: &reqwest::Client,
+    cookie_store: &Arc<CookieStoreMutex>,
+    username: &str,
+    password: &str,
+) -> anyhow::Result<()> {
+    // Step 1: GET /login/ to extract csrfKey from the login form.
+    // follow_redirects handles the anti-bot entry gate automatically.
+    let login_page_url = format!("{}/login/", BASE_URL);
+    let resp = follow_redirects(client, cookie_store, &login_page_url)
+        .await
+        .context("failed to fetch AirVPN login page")?;
+    let body = resp.text().await?;
+    let doc = Html::parse_document(&body);
+
+    let csrf_key =
+        extract_input_value(&doc, "csrfKey").context("could not find csrfKey in login form")?;
+    debug!("login_csrf_key_extracted");
+
+    let ref_value = extract_input_value(&doc, "ref").unwrap_or_default();
+
+    // Step 2: POST login credentials
+    let login_url = format!("{}/login/", BASE_URL);
+    let form = [
+        ("csrfKey", csrf_key.as_str()),
+        ("ref", &ref_value),
+        ("auth", username),
+        ("password", password),
+        ("remember_me", "1"),
+        ("_processLogin", "usernamepassword"),
+    ];
+
+    let resp = client
+        .post(&login_url)
+        .form(&form)
+        .send()
+        .await
+        .context("login POST failed")?;
+
+    let status = resp.status();
+    debug!( status = ?status.as_u16(), "login_response_status");
+
+    if !status.is_redirection() {
+        bail!(
+            "web login failed -- check username and password (status {})",
+            status
+        );
+    }
+
+    // Follow the full redirect chain to establish session
+    if let Some(location) = resp.headers().get("location") {
+        let redirect_url = location.to_str().unwrap_or("/");
+        let url = if redirect_url.starts_with('/') {
+            format!("{}{}", BASE_URL, redirect_url)
+        } else {
+            redirect_url.to_string()
+        };
+        let _ = follow_redirects(client, cookie_store, &url).await;
+    }
+
+    debug!("login_succeeded");
+    Ok(())
 }
 
 /// Extract the value of a hidden input field by name from an HTML document.
@@ -1180,5 +1223,24 @@ impl AirVpnWebApi {
                 &body[..body.len().min(300)]
             )
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_extract_ecsrf_from_logged_in_page() {
+        let html =
+            r#"<div id="eui_data" data-json="{&quot;ecsrf&quot;:&quot;abc123&quot;}"></div>"#;
+        assert_eq!(extract_ecsrf(html).as_deref(), Some("abc123"));
+    }
+
+    #[test]
+    fn test_extract_ecsrf_missing_on_logged_out_page() {
+        let html =
+            r#"<div id="eui_data" data-json="{&quot;datetime_mode&quot;:&quot;auto&quot;}"></div>"#;
+        assert_eq!(extract_ecsrf(html), None);
     }
 }

@@ -127,7 +127,7 @@ fn main() -> std::process::ExitCode {
         TopCommand::Status => {
             let _logging_guard = init_logging(cli.verbose);
             if let Err(e) = cmd_status() {
-                error!( command = ?"status", error = ?e.to_string(), "command_failed");
+                error!( command = ?"status", error = ?format!("{e:#}"), "command_failed");
                 return std::process::ExitCode::FAILURE;
             }
         }
@@ -135,7 +135,7 @@ fn main() -> std::process::ExitCode {
         TopCommand::Wg => {
             let _logging_guard = init_logging(cli.verbose);
             if let Err(e) = cmd_wg() {
-                error!( command = ?"wg", error = ?e.to_string(), "command_failed");
+                error!( command = ?"wg", error = ?format!("{e:#}"), "command_failed");
                 return std::process::ExitCode::FAILURE;
             }
         }
@@ -150,7 +150,7 @@ fn main() -> std::process::ExitCode {
 
             let rt = tokio::runtime::Runtime::new().expect("failed to create tokio runtime");
             if let Err(e) = rt.block_on(run(other, config)) {
-                error!( error = ?e.to_string(), "command_failed");
+                error!( error = ?format!("{e:#}"), "command_failed");
                 return tunmux::automation::failure_exit_code(&e);
             }
         }
