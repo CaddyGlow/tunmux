@@ -3,6 +3,7 @@
 /dist
 .cargo/*
 !.cargo/audit.toml
+!.cargo/config.toml
 
 # Nix
 .data
