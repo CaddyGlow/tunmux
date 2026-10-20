@@ -1,3 +1,10 @@
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="assets/logo/tunmux-lockup-on-dark.svg">
+    <img src="assets/logo/tunmux-lockup-on-light.svg" alt="tunmux" width="360">
+  </picture>
+</p>
+
 # tunmux
 
 A Rust CLI for WireGuard connections through **Proton VPN, AirVPN, Mullvad,

@@ -1,0 +1,15 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" width="256" height="256">
+  <title>tunmux</title>
+  <rect width="256" height="256" rx="56" fill="#e6f4f1"/>
+  <g transform="translate(0 -14)">
+  <g fill="none" stroke-linecap="round" stroke-width="14">
+    <path d="M76 172v-52a52 52 0 0 1 104 0v52" stroke="#0d9488"/>
+    <path d="M128 148c0 34-64 30-64 62" stroke="#d97706"/>
+    <path d="M128 148c0 34 64 30 64 62" stroke="#0d9488"/>
+    <path d="M128 112v98" stroke="#0f172a"/>
+  </g>
+  <circle cx="64" cy="214" r="12" fill="#d97706"/>
+  <circle cx="192" cy="214" r="12" fill="#0d9488"/>
+  <circle cx="128" cy="214" r="12" fill="#0f172a"/>
+  </g>
+</svg>

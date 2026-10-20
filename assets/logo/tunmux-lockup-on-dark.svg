@@ -1,0 +1,29 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 490 120" width="490" height="120">
+  <title>tunmux</title>
+  <g transform="scale(0.46875)">
+    <rect width="256" height="256" rx="56" fill="#0f172a"/>
+    <g transform="translate(0 -14)">
+  <g fill="none" stroke-linecap="round" stroke-width="14">
+      <path d="M76 172v-52a52 52 0 0 1 104 0v52" stroke="#2dd4bf"/>
+      <path d="M128 148c0 34-64 30-64 62" stroke="#f59e0b"/>
+      <path d="M128 148c0 34 64 30 64 62" stroke="#2dd4bf"/>
+      <path d="M128 112v98" stroke="#e2e8f0"/>
+    </g>
+    <circle cx="64" cy="214" r="12" fill="#f59e0b"/>
+    <circle cx="192" cy="214" r="12" fill="#2dd4bf"/>
+    <circle cx="128" cy="214" r="12" fill="#e2e8f0"/>
+  </g>
+  </g>
+  <g transform="translate(150 -5)" fill="none" stroke-width="12" stroke-linecap="round" stroke-linejoin="round">
+    <g stroke="#2dd4bf">
+      <path d="M14 30v58a12 12 0 0 0 12 12h6M0 50h32"/>
+      <path d="M50 50v30a20 20 0 0 0 40 0V50v50"/>
+      <path d="M106 50v50M106 70a20 20 0 0 1 40 0v30"/>
+    </g>
+    <g stroke="#e2e8f0">
+      <path d="M162 50v50M162 64a14 14 0 0 1 28 0v36M190 64a14 14 0 0 1 28 0v36"/>
+      <path d="M234 50v30a20 20 0 0 0 40 0V50v50"/>
+      <path d="M290 50l40 50M330 50l-40 50"/>
+    </g>
+  </g>
+</svg>
