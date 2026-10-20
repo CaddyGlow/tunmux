@@ -12,7 +12,9 @@ Guidance for coding agents working in `tunmux`.
   - macOS: direct, rootless local-proxy, launchd service installation,
     and login-agent autoconnect.
   - Android: shared-library support; app and JNI adapter live in `../tunmux-android`.
-- Default Cargo features: `all-providers` and `proxy`. Each provider is independently
+- Default Cargo features: `all-providers`, `proxy`, and `crypto-rustcrypto`.
+  AirVPN needs `crypto-rustcrypto` or `crypto-aws-lc`; AWS-LC wins if both are enabled.
+  Each provider is independently
   gated; `keyring` is optional. `proxy` enables Linux namespace proxies, not rootless
   local-proxy mode.
 - Direct backend defaults: `kernel` on Linux, embedded GotaTun `userspace` on macOS.
@@ -24,7 +26,6 @@ Guidance for coding agents working in `tunmux`.
 ### Environment
 
 - Initialize `third_party/smoltcp` with `git submodule update --init --recursive`.
-  See README for the public-URL override if the maintainer SSH alias is unavailable.
 - On the maintainer's Linux setup, `.envrc` selects the shared Nix Android shell.
   Run development tools through it, for example:
 
@@ -74,9 +75,10 @@ Guidance for coding agents working in `tunmux`.
   - `cargo fmt --all --check`
   - `cargo clippy --locked --all-targets --all-features -- -D warnings`
   - `cargo test --locked`
+  - `cargo test --locked --all-features`
 - For feature-gated changes, also run Clippy and `cli::tests` with
   `--no-default-features --features <selection>`. CI covers no features, each
-  individual provider, `proxy`, and `proxy,wgconf`.
+  individual provider, both AirVPN crypto backends, `proxy`, and `proxy,wgconf`.
 - Offline CPU benchmarks: `cargo bench --locked --bench offline`.
 
 ### Android build (when needed)
@@ -86,10 +88,11 @@ Guidance for coding agents working in `tunmux`.
 
   ```sh
   cargo ndk -t arm64-v8a -t armeabi-v7a -t x86_64 check --locked --lib \
-    --no-default-features --features all-providers
+    --no-default-features --features all-providers,crypto-rustcrypto
   ```
 
 - App builds and APK release workflows live in `../tunmux-android`.
+- CI repeats the Android library check with `crypto-aws-lc`.
 - Follow that repository's instructions for app builds.
 
 ## 3) Source Layout and Architectural Conventions
@@ -193,6 +196,12 @@ Guidance for coding agents working in `tunmux`.
 - Prefer integration-like behavior tests over brittle implementation-detail tests.
 - Keep tests near code in `#[cfg(test)] mod tests` blocks.
 - CLI integration tests also live in `tests/`.
+- `tests/daemon_stdio.rs` uses `harness = false` so daemonization starts in a
+  single-threaded process; keep fork-based checks out of the standard test harness.
+- Keyring tests use explicit in-memory mock entries, never production credentials.
+- `.cargo/audit.toml` ignores only RUSTSEC-2023-0071: production RSA use is public-key
+  encryption. Reassess this exception before adding any private-key operations.
+- Privileged tests must remain opt-in; live validation belongs in manual scripts.
 - Use descriptive test names that encode behavior and expectation.
 - For network/API logic, existing tests use local mock servers; follow that pattern.
 

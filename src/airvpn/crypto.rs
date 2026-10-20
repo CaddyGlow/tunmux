@@ -1,51 +1,103 @@
 use aes::cipher::{
     block_padding::Pkcs7, BlockDecryptMut, BlockEncryptMut, BlockSizeUser, KeyIvInit,
 };
+#[cfg(feature = "crypto-aws-lc")]
+use aws_lc_rs::rsa::{Pkcs1PublicEncryptingKey, PublicEncryptingKey};
 use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
 use rand::RngCore;
-use rsa::{pkcs1v15::Pkcs1v15Encrypt, BigUint, RsaPublicKey};
+#[cfg(all(feature = "crypto-rustcrypto", not(feature = "crypto-aws-lc")))]
+use rsa::pkcs8::DecodePublicKey;
+#[cfg(all(
+    feature = "crypto-rustcrypto",
+    any(not(feature = "crypto-aws-lc"), test)
+))]
+use rsa::{Pkcs1v15Encrypt, RsaPublicKey};
 
 use crate::error::{AppError, Result};
+
+#[cfg(not(any(feature = "crypto-aws-lc", feature = "crypto-rustcrypto")))]
+compile_error!("AirVPN requires crypto-rustcrypto or crypto-aws-lc");
 
 type Aes256CbcEnc = cbc::Encryptor<aes::Aes256>;
 type Aes256CbcDec = cbc::Decryptor<aes::Aes256>;
 
-/// RSA-4096 public key modulus (base64) from AirVPN.xml
-const RSA_MODULUS_B64: &str = "\
-wuQXz7eZeEBwaaRsVK8iEHpueXoKyQzW8sr8qMUkZIcKtKv5iseXMrTbcGYGpRXdiqXp7FqrSjPS\
-MDuRGaHfjWgjbnW4PwecmgJSfhkWt4xY8OnIwKkuI2Eo0MAa9lduPOQRKSfa9I1PBogIyEUrf7kSj\
-coJQgeY66D429m1BDWY3f65c+8HrCQ8qPg1GY+pSxuwp6+2dV7fd1tiKLQEoJg9NeWGW0he/DDkN\
-Se4c8gFfHj3ANYwDhTQijb+VaVZqPmxVJIzLoE1JOom0/P8fKsvpx3cFOtDS4apiI+N7MyVAMcx5\
-Jjk2AQ/tyDiybwwZ32fOqYJVGxs13guOlgI6h77QxqNIq2bGEjzSRZ4tem1uN7F8AoVKPls6yAUQ\
-K1cWM5AVu4apoNIFG+svS/2kmn0Nx8DRVDvKD+nOByXgqg01Y6r0Se8Tz9EEBTiEopdlKjmO1wlr\
-mW3iWKeFIwZnHt2PMceJMqziV8rRGh9gUMLLJC9qdXCAS4vf5VVnZ+Pq3SK9pP87hOislIu4/Kcn\
-06cotQChpVnALA83hFW5LXJvc85iloWJkuLGAV3CcAwoSA5CG1Uo2S76MM+GLLkVIqUk1PiJMTTl\
-Sw1SlMEflU4bZiZP8di5e2OJI6vOHjdM2oonpPi/Ul5KKmfp+jci+kGMs9+zOyjKFLVIKDE+Vc=";
+/// AirVPN.xml's RSA-4096 public key (exponent 65537), encoded as X.509 SPKI DER.
+const RSA_PUBLIC_KEY_DER_B64: &str = "\
+MIICIjANBgkqhkiG9w0BAQEFAAOCAg8AMIICCgKCAgEAwuQXz7eZeEBwaaRsVK8iEHpueXoKyQzW\
+8sr8qMUkZIcKtKv5iseXMrTbcGYGpRXdiqXp7FqrSjPSMDuRGaHfjWgjbnW4PwecmgJSfhkWt4xY\
+8OnIwKkuI2Eo0MAa9lduPOQRKSfa9I1PBogIyEUrf7kSjcoJQgeY66D429m1BDWY3f65c+8HrCQ8\
+qPg1GY+pSxuwp6+2dV7fd1tiKLQEoJg9NeWGW0he/DDkNSe4c8gFfHj3ANYwDhTQijb+VaVZqPmx\
+VJIzLoE1JOom0/P8fKsvpx3cFOtDS4apiI+N7MyVAMcx5Jjk2AQ/tyDiybwwZ32fOqYJVGxs13gu\
+OlgI6h77QxqNIq2bGEjzSRZ4tem1uN7F8AoVKPls6yAUQK1cWM5AVu4apoNIFG+svS/2kmn0Nx8D\
+RVDvKD+nOByXgqg01Y6r0Se8Tz9EEBTiEopdlKjmO1wlrmW3iWKeFIwZnHt2PMceJMqziV8rRGh9\
+gUMLLJC9qdXCAS4vf5VVnZ+Pq3SK9pP87hOislIu4/Kcn06cotQChpVnALA83hFW5LXJvc85iloW\
+JkuLGAV3CcAwoSA5CG1Uo2S76MM+GLLkVIqUk1PiJMTTlSw1SlMEflU4bZiZP8di5e2OJI6vOHjd\
+M2oonpPi/Ul5KKmfp+jci+kGMs9+zOyjKFLVIKDE+VcCAwEAAQ==";
 
-/// RSA exponent: AQAB = 65537
-const RSA_EXPONENT_B64: &str = "AQAB";
-
-/// Holds a generated AES-256 session key and IV for one API request.
+/// Encrypts AirVPN request envelopes with the provider's RSA public key.
 pub struct AirVpnCrypto {
-    rsa_pub: RsaPublicKey,
+    rsa_pub: RsaBackend,
+}
+
+enum RsaBackend {
+    #[cfg(feature = "crypto-aws-lc")]
+    AwsLc(Pkcs1PublicEncryptingKey),
+    #[cfg(all(
+        feature = "crypto-rustcrypto",
+        any(not(feature = "crypto-aws-lc"), test)
+    ))]
+    RustCrypto(RsaPublicKey),
+}
+
+impl RsaBackend {
+    fn encrypt(&self, plaintext: &[u8]) -> Result<Vec<u8>> {
+        match self {
+            #[cfg(feature = "crypto-aws-lc")]
+            Self::AwsLc(key) => {
+                let mut ciphertext = vec![0; key.ciphertext_size()];
+                key.encrypt(plaintext, &mut ciphertext)
+                    .map_err(|e| AppError::AirVpnCrypto(format!("RSA encrypt failed: {e}")))?;
+                Ok(ciphertext)
+            }
+            #[cfg(all(
+                feature = "crypto-rustcrypto",
+                any(not(feature = "crypto-aws-lc"), test)
+            ))]
+            Self::RustCrypto(key) => key
+                .encrypt(&mut rand::thread_rng(), Pkcs1v15Encrypt, plaintext)
+                .map_err(|e| AppError::AirVpnCrypto(format!("RSA encrypt failed: {e}"))),
+            #[cfg(not(any(feature = "crypto-aws-lc", feature = "crypto-rustcrypto")))]
+            _ => unreachable!(),
+        }
+    }
 }
 
 impl AirVpnCrypto {
     pub fn new() -> Result<Self> {
-        let n_bytes = B64
-            .decode(RSA_MODULUS_B64)
-            .map_err(|e| AppError::AirVpnCrypto(format!("bad RSA modulus: {}", e)))?;
-        let e_bytes = B64
-            .decode(RSA_EXPONENT_B64)
-            .map_err(|e| AppError::AirVpnCrypto(format!("bad RSA exponent: {}", e)))?;
-
-        let n = BigUint::from_bytes_be(&n_bytes);
-        let e = BigUint::from_bytes_be(&e_bytes);
-
-        let rsa_pub = RsaPublicKey::new(n, e)
-            .map_err(|e| AppError::AirVpnCrypto(format!("invalid RSA key: {}", e)))?;
-
-        Ok(Self { rsa_pub })
+        let der = B64
+            .decode(RSA_PUBLIC_KEY_DER_B64)
+            .map_err(|e| AppError::AirVpnCrypto(format!("bad RSA public key encoding: {e}")))?;
+        // AWS-LC wins when both additive Cargo features are enabled.
+        #[cfg(feature = "crypto-aws-lc")]
+        {
+            let public_key = PublicEncryptingKey::from_der(&der)
+                .map_err(|e| AppError::AirVpnCrypto(format!("invalid RSA key: {e}")))?;
+            let key = Pkcs1PublicEncryptingKey::new(public_key)
+                .map_err(|e| AppError::AirVpnCrypto(format!("invalid RSA encryption key: {e}")))?;
+            Ok(Self {
+                rsa_pub: RsaBackend::AwsLc(key),
+            })
+        }
+        #[cfg(all(not(feature = "crypto-aws-lc"), feature = "crypto-rustcrypto"))]
+        {
+            let key = RsaPublicKey::from_public_key_der(&der)
+                .map_err(|e| AppError::AirVpnCrypto(format!("invalid RSA key: {e}")))?;
+            Ok(Self {
+                rsa_pub: RsaBackend::RustCrypto(key),
+            })
+        }
+        #[cfg(not(any(feature = "crypto-aws-lc", feature = "crypto-rustcrypto")))]
+        unreachable!()
     }
 
     /// Encrypt request parameters, returning (s_param, d_param, session) where
@@ -73,12 +125,9 @@ impl AirVpnCrypto {
         );
 
         // RSA-PKCS1v15 encrypt the key/iv data
-        let encrypted_key_iv = self
-            .rsa_pub
-            .encrypt(&mut rng, Pkcs1v15Encrypt, key_iv_data.as_bytes())
-            .map_err(|e| AppError::AirVpnCrypto(format!("RSA encrypt failed: {}", e)))?;
+        let encrypted_key_iv = self.rsa_pub.encrypt(key_iv_data.as_bytes())?;
 
-        let s_param = B64.encode(&encrypted_key_iv);
+        let s_param = B64.encode(encrypted_key_iv);
 
         // Build the request data associative encoding
         // Format: base64(param_name):base64(param_value)\n per pair
@@ -144,7 +193,7 @@ mod tests {
         // s and d should be non-empty base64
         assert!(!s_param.is_empty());
         assert!(!d_param.is_empty());
-        assert!(B64.decode(&s_param).is_ok());
+        assert_eq!(B64.decode(&s_param).unwrap().len(), 512);
         assert!(B64.decode(&d_param).is_ok());
 
         // We can decrypt our own d_param with the session keys
@@ -154,5 +203,88 @@ mod tests {
         // Verify it contains the expected encoded parameters
         assert!(decrypted.contains(&B64.encode(b"act")));
         assert!(decrypted.contains(&B64.encode(b"user")));
+    }
+
+    #[cfg(feature = "crypto-aws-lc")]
+    #[test]
+    fn test_aws_lc_request_envelope() {
+        use aws_lc_rs::rsa::{KeySize, Pkcs1PrivateDecryptingKey, PrivateDecryptingKey};
+
+        let private = PrivateDecryptingKey::generate(KeySize::Rsa2048).unwrap();
+        let crypto = AirVpnCrypto {
+            rsa_pub: RsaBackend::AwsLc(
+                Pkcs1PublicEncryptingKey::new(private.public_key()).unwrap(),
+            ),
+        };
+        let decryptor = Pkcs1PrivateDecryptingKey::new(private).unwrap();
+        assert_request_envelope(crypto, |ciphertext| {
+            let mut plaintext = vec![0; decryptor.min_output_size()];
+            decryptor
+                .decrypt(ciphertext, &mut plaintext)
+                .unwrap()
+                .to_vec()
+        });
+    }
+
+    #[cfg(feature = "crypto-rustcrypto")]
+    #[test]
+    fn test_rustcrypto_request_envelope() {
+        let private = rsa::RsaPrivateKey::new(&mut rand::thread_rng(), 2048).unwrap();
+        let crypto = AirVpnCrypto {
+            rsa_pub: RsaBackend::RustCrypto(RsaPublicKey::from(&private)),
+        };
+        assert_request_envelope(crypto, |ciphertext| {
+            private.decrypt(Pkcs1v15Encrypt, ciphertext).unwrap()
+        });
+    }
+
+    #[cfg(all(feature = "crypto-aws-lc", feature = "crypto-rustcrypto"))]
+    #[test]
+    fn test_aws_lc_envelope_decrypts_with_rustcrypto() {
+        use rsa::pkcs8::EncodePublicKey;
+
+        let private = rsa::RsaPrivateKey::new(&mut rand::thread_rng(), 2048).unwrap();
+        let der = RsaPublicKey::from(&private).to_public_key_der().unwrap();
+        let key = PublicEncryptingKey::from_der(der.as_bytes()).unwrap();
+        let crypto = AirVpnCrypto {
+            rsa_pub: RsaBackend::AwsLc(Pkcs1PublicEncryptingKey::new(key).unwrap()),
+        };
+        assert_request_envelope(crypto, |ciphertext| {
+            private.decrypt(Pkcs1v15Encrypt, ciphertext).unwrap()
+        });
+    }
+
+    fn assert_request_envelope(crypto: AirVpnCrypto, decrypt: impl Fn(&[u8]) -> Vec<u8>) {
+        let params = [("act", "user"), ("login", "test"), ("password", "secret")];
+        let (s_param, d_param, session) = crypto.encrypt_request(&params).unwrap();
+
+        let encrypted_keys = B64.decode(s_param).unwrap();
+        let envelope = decrypt(&encrypted_keys);
+        assert_eq!(
+            envelope,
+            format!(
+                "{}:{}\n{}:{}\n",
+                B64.encode(b"key"),
+                B64.encode(session.key),
+                B64.encode(b"iv"),
+                B64.encode(session.iv),
+            )
+            .as_bytes()
+        );
+        let expected: String = params
+            .iter()
+            .map(|(key, value)| format!("{}:{}\n", B64.encode(key), B64.encode(value)))
+            .collect();
+        assert_eq!(
+            crypto
+                .decrypt_response(&B64.decode(d_param).unwrap(), &session)
+                .unwrap(),
+            expected
+        );
+
+        // PKCS#1 v1.5 encryption must use fresh randomized padding.
+        let first = crypto.rsa_pub.encrypt(b"same plaintext").unwrap();
+        let second = crypto.rsa_pub.encrypt(b"same plaintext").unwrap();
+        assert_ne!(first, second);
     }
 }

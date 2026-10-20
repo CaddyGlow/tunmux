@@ -1,8 +1,8 @@
 // tunmux library crate
 //
 // Exports portable modules for use by the Android JNI crate and any
-// future library consumers. Linux-only modules (privileged daemon,
-// network namespaces, proxy) are gated behind cfg(not(target_os = "android")).
+// future library consumers. Desktop helpers are excluded on Android; network
+// namespaces and namespace proxies have additional Linux and feature guards.
 
 // Provider-agnostic infrastructure
 pub mod cli;

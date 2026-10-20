@@ -1,6 +1,6 @@
 //! Shared helpers for the --local-proxy userspace WireGuard proxy mode.
 //!
-//! Used by all four provider handler modules to spawn and stop the
+//! Used by provider handler modules to spawn and stop the
 //! local-proxy-daemon subprocess.
 
 use std::net::{IpAddr, SocketAddr};

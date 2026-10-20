@@ -56,10 +56,6 @@ struct MullvadTokenResponse {
 #[derive(Debug, serde::Deserialize)]
 struct MullvadDeviceResponse {
     id: String,
-    #[allow(dead_code)]
-    name: String,
-    #[allow(dead_code)]
-    pubkey: String,
     ipv4_address: String,
     ipv6_address: String,
 }

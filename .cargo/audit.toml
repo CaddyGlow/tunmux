@@ -1,0 +1,7 @@
+[advisories]
+# RUSTSEC-2023-0071 concerns private-key operations and timing-based key recovery.
+# Production uses rsa only to encrypt AirVPN session keys with a fixed public key.
+# Private keys/decryption occur only in offline tests with generated test keys.
+# Review this exception if RSA usage changes; remove it when upstream is patched.
+# https://rustsec.org/advisories/RUSTSEC-2023-0071
+ignore = ["RUSTSEC-2023-0071"]

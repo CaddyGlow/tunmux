@@ -1,5 +1,3 @@
-#![allow(dead_code)]
-
 use serde::{Deserialize, Serialize};
 
 /// Persisted Proton session data written to ~/.config/tunmux/proton/session.json

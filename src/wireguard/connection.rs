@@ -56,6 +56,9 @@ impl ConnectionState {
     pub fn save(&self) -> Result<()> {
         config::ensure_connections_dir()?;
         let path = config::connections_dir().join(format!("{}.json", self.instance_name));
+        #[cfg(target_os = "android")]
+        let state = self;
+        #[cfg(not(target_os = "android"))]
         let mut state = self.clone();
         #[cfg(not(target_os = "android"))]
         if state.backend == WgBackend::LocalProxy && state.session_id.is_none() {

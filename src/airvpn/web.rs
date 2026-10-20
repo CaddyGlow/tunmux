@@ -234,8 +234,11 @@ impl AirVpnWeb {
         let data = config::load_provider_file(Provider::AirVpn, WEB_SESSION_FILE).ok()??;
         let saved: SavedWebSession = serde_json::from_slice(&data).ok()?;
 
-        #[allow(deprecated)]
-        let store = CookieStore::load_json(saved.cookies.as_bytes()).ok()?;
+        // Preserve the existing line-delimited cookie format for saved sessions.
+        let store = CookieStore::load(saved.cookies.as_bytes(), |cookie| {
+            serde_json::from_str(cookie)
+        })
+        .ok()?;
 
         // Check that we have at least one real cookie (not just an empty jar).
         store.iter_any().next()?;
@@ -261,9 +264,8 @@ impl AirVpnWeb {
                 .lock()
                 .map_err(|e| anyhow::anyhow!("cookie store lock poisoned: {}", e))?;
             let mut buf = Vec::new();
-            #[allow(deprecated)]
             store
-                .save_json(&mut buf)
+                .save(&mut buf, serde_json::to_string)
                 .map_err(|e| anyhow::anyhow!("failed to serialize cookies: {}", e))?;
             let cookies = String::from_utf8(buf).context("cookies not utf-8")?;
 
@@ -944,7 +946,6 @@ impl AirVpnWebApi {
         })
     }
 
-    #[allow(dead_code)]
     #[must_use]
     pub fn api_key(&self) -> &str {
         &self.api_key
@@ -999,7 +1000,6 @@ impl AirVpnWebApi {
     }
 
     /// GET an API endpoint, returning the parsed JSON response.
-    #[allow(dead_code)]
     pub async fn get<T: serde::de::DeserializeOwned>(
         &self,
         path: &str,
@@ -1022,7 +1022,6 @@ impl AirVpnWebApi {
     }
 
     /// POST form data to an API endpoint, returning the parsed JSON response.
-    #[allow(dead_code)]
     pub async fn post<T: serde::de::DeserializeOwned>(
         &self,
         path: &str,

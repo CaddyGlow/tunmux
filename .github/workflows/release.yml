@@ -17,7 +17,7 @@ env:
 
 jobs:
   test:
-    name: Validate with cargo test
+    name: Validate release
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
@@ -27,8 +27,15 @@ jobs:
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
-      - name: Run tests
-        run: cargo test --locked
+        with:
+          toolchain: "1.99.0"
+          components: rustfmt, clippy
+      - name: Run repository checks
+        run: bash scripts/ci.sh
+      - name: Install pinned dependency auditor
+        run: cargo install cargo-audit --version 0.22.2 --locked
+      - name: Audit release dependencies
+        run: cargo audit
 
   build:
     name: Build release artifacts
@@ -58,3 +65,14 @@ jobs:
           files: dist/*
           generate_release_notes: true
           prerelease: ${{ contains(github.ref_name, '-') }}
+
+  docker:
+    name: Publish release container
+    needs: release
+    permissions:
+      contents: read
+      packages: write
+    uses: ./.github/workflows/docker-publish.yml
+    with:
+      ref: ${{ github.ref }}
+      version: ${{ github.ref_name }}

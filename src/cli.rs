@@ -104,7 +104,7 @@ pub struct Cli {
 
 #[derive(Subcommand)]
 pub enum TopCommand {
-    /// Install and manage the macOS privileged service
+    /// Install and manage the privileged service
     Service {
         #[command(subcommand)]
         command: ServiceCommand,
@@ -1523,14 +1523,13 @@ mod tests {
         feature = "wgconf"
     ))]
     use super::ConnectProviderCommand;
-    #[cfg(feature = "wgconf")]
     use super::ProviderArg;
     #[cfg(feature = "wgconf")]
     use super::WgconfCommand;
     use super::{Cli, HookBuiltinArg, HookCommand, TopCommand};
     #[cfg(feature = "proton")]
     use super::{ProtonCommand, ProtonPortAction};
-    use clap::Parser;
+    use clap::{error::ErrorKind, Parser, ValueEnum};
 
     #[cfg(feature = "wgconf")]
     #[test]
@@ -1913,67 +1912,54 @@ mod tests {
 
     #[test]
     fn parse_hook_run_builtin_command() {
-        let cli = Cli::try_parse_from(["tunmux", "hook", "run", "external-ip"])
-            .expect("parse hook run builtin");
-
-        match cli.command {
-            TopCommand::Hook {
-                command: HookCommand::Run { builtin },
-            } => assert_eq!(builtin, HookBuiltinArg::ExternalIp),
-            _ => panic!("expected hook run command"),
-        }
-
-        let cli = Cli::try_parse_from(["tunmux", "hook", "run", "dns-detection"])
-            .expect("parse hook run dns-detection builtin");
-
-        match cli.command {
-            TopCommand::Hook {
-                command: HookCommand::Run { builtin },
-            } => assert_eq!(builtin, HookBuiltinArg::DnsDetection),
-            _ => panic!("expected hook run command"),
+        for (name, expected) in [
+            ("connectivity", HookBuiltinArg::Connectivity),
+            ("external-ip", HookBuiltinArg::ExternalIp),
+            ("dns-detection", HookBuiltinArg::DnsDetection),
+        ] {
+            let cli = Cli::try_parse_from(["tunmux", "hook", "run", name]).unwrap();
+            match cli.command {
+                TopCommand::Hook {
+                    command: HookCommand::Run { builtin },
+                } => assert_eq!(builtin, expected, "{name}"),
+                _ => panic!("expected hook run command for {name}"),
+            }
         }
     }
 
     #[test]
     fn parse_connect_proxy_flags_are_mutually_exclusive() {
-        for provider in ["proton", "airvpn", "mullvad", "ivpn"] {
-            let parsed =
-                Cli::try_parse_from(["tunmux", "connect", provider, "--proxy", "--local-proxy"]);
-            assert!(
-                parsed.is_err(),
-                "expected conflict parse error for {provider}"
-            );
+        for provider in ProviderArg::value_variants() {
+            let value = provider.to_possible_value().unwrap();
+            let name = value.get_name();
+            let mut args = vec!["tunmux", "connect", name, "--proxy", "--local-proxy"];
+            if name == "wgconf" {
+                args.extend(["--file", "/tmp/test.conf"]);
+            }
+            let error = Cli::try_parse_from(args)
+                .err()
+                .expect("conflicting proxy modes");
+            assert_eq!(error.kind(), ErrorKind::ArgumentConflict, "{name}: {error}");
         }
-
-        let parsed = Cli::try_parse_from([
-            "tunmux",
-            "connect",
-            "wgconf",
-            "--file",
-            "/tmp/test.conf",
-            "--proxy",
-            "--local-proxy",
-        ]);
-        assert!(parsed.is_err(), "expected conflict parse error for wgconf");
     }
 
     #[test]
     fn parse_provider_disconnect_rejects_instance_with_all() {
-        let proton = Cli::try_parse_from(["tunmux", "proton", "disconnect", "x", "--all"]);
-        assert!(proton.is_err());
-
-        let airvpn = Cli::try_parse_from(["tunmux", "airvpn", "disconnect", "x", "--all"]);
-        assert!(airvpn.is_err());
-
-        let mullvad = Cli::try_parse_from(["tunmux", "mullvad", "disconnect", "x", "--all"]);
-        assert!(mullvad.is_err());
-
-        let ivpn = Cli::try_parse_from(["tunmux", "ivpn", "disconnect", "x", "--all"]);
-        assert!(ivpn.is_err());
-
-        let wgconf = Cli::try_parse_from(["tunmux", "wgconf", "disconnect", "x", "--all"]);
-        assert!(wgconf.is_err());
+        for provider in ProviderArg::value_variants() {
+            let value = provider.to_possible_value().unwrap();
+            let name = value.get_name();
+            for args in [
+                vec!["tunmux", name, "disconnect", "x", "--all"],
+                vec!["tunmux", "disconnect", "x", "--provider", name, "--all"],
+            ] {
+                let error = Cli::try_parse_from(args)
+                    .err()
+                    .expect("conflicting disconnect selection");
+                assert_eq!(error.kind(), ErrorKind::ArgumentConflict, "{name}: {error}");
+            }
+        }
     }
+
     #[test]
     fn test_cli_exposes_only_enabled_providers() {
         use clap::{CommandFactory, ValueEnum};

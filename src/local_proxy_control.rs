@@ -173,7 +173,7 @@ pub struct Control {
     pub stop: tokio::sync::mpsc::Receiver<UnixStream>,
     id: String,
     path: PathBuf,
-    socket_identity: (u64, u64),
+    socket_identity: Option<(u64, u64)>,
     stopped: Arc<AtomicBool>,
     thread: Option<std::thread::JoinHandle<()>>,
     lock: Option<nix::fcntl::Flock<std::fs::File>>,
@@ -205,7 +205,7 @@ impl Control {
         let listener = UnixListener::bind(&path)?;
         use std::os::unix::fs::MetadataExt;
         let metadata = std::fs::symlink_metadata(&path)?;
-        let socket_identity = (metadata.dev(), metadata.ino());
+        let socket_identity = Some((metadata.dev(), metadata.ino()));
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
         listener.set_nonblocking(true)?;
         let r = Receipt {
@@ -291,16 +291,22 @@ impl Control {
     }
 }
 impl Control {
-    fn remove_socket(&self) -> std::io::Result<()> {
+    fn remove_socket(&mut self) -> std::io::Result<()> {
         use std::os::unix::fs::MetadataExt;
+        let Some(identity) = self.socket_identity else {
+            return Ok(());
+        };
         match std::fs::symlink_metadata(&self.path) {
-            Ok(metadata) if (metadata.dev(), metadata.ino()) == self.socket_identity => {
+            Ok(metadata) if (metadata.dev(), metadata.ino()) == identity => {
                 std::fs::remove_file(&self.path)
             }
             Ok(_) => Ok(()),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
             Err(error) => Err(error),
-        }
+        }?;
+        // A later socket can reuse this inode after we release the session lock.
+        self.socket_identity = None;
+        Ok(())
     }
 }
 impl Drop for Control {

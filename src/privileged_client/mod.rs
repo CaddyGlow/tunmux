@@ -147,14 +147,12 @@ impl PrivilegedClient {
         }
     }
 
-    #[allow(dead_code)]
     pub fn namespace_create(&self, name: &str) -> Result<()> {
         self.send_unit(PrivilegedRequest::NamespaceCreate {
             name: name.to_string(),
         })
     }
 
-    #[allow(dead_code)]
     pub fn namespace_delete(&self, name: &str) -> Result<()> {
         self.send_unit(PrivilegedRequest::NamespaceDelete {
             name: name.to_string(),
@@ -180,7 +178,6 @@ impl PrivilegedClient {
         })
     }
 
-    #[allow(dead_code)]
     pub fn netns_exec(&self, namespace: &str, args: &[&str]) -> Result<()> {
         self.send(PrivilegedRequest::NetnsExec {
             namespace: namespace.to_string(),
@@ -357,7 +354,6 @@ impl PrivilegedClient {
 
     /// Run `wg show <interface>` as root and return the output.
     /// Works for kernel, wg-quick, and userspace (gotatun) backends.
-    #[allow(dead_code)]
     pub fn wg_show(&self, interface: &str) -> Result<String> {
         match self.send(PrivilegedRequest::WgShow {
             interface: interface.to_string(),
@@ -384,20 +380,17 @@ impl PrivilegedClient {
         })
     }
 
-    #[allow(dead_code)]
     pub fn remove_dir_all(&self, path: &str) -> Result<()> {
         self.send_unit(PrivilegedRequest::RemoveDirAll {
             path: path.to_string(),
         })
     }
 
-    #[allow(dead_code)]
     pub fn kill_pid(&self, pid: u32, signal: KillSignal) -> Result<()> {
         self.send_unit(PrivilegedRequest::KillPid { pid, signal })
     }
 
     #[allow(clippy::too_many_arguments)]
-    #[allow(dead_code)]
     pub fn spawn_proxy_daemon(
         &self,
         netns: &str,

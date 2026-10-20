@@ -1,5 +1,3 @@
-#![allow(dead_code)]
-
 /// Ed25519 key generation, X25519 conversion, PEM encoding, and Proton fingerprints.
 ///
 /// Reference: python-proton-vpn-api-core/proton/vpn/session/key_mgr.py

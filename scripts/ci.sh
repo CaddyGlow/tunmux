@@ -9,5 +9,6 @@ cargo clippy --locked --all-targets --all-features -- -D warnings
 
 echo "[ci] Running tests"
 cargo test --locked
+cargo test --locked --all-features
 
 echo "[ci] All checks passed"

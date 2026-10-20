@@ -71,12 +71,8 @@ pub struct IvpnLoginData {
 
 #[derive(Debug, Clone, serde::Deserialize)]
 struct IvpnServiceStatus {
-    #[allow(dead_code)]
     #[serde(default)]
     is_active: bool,
-    #[allow(dead_code)]
-    #[serde(default)]
-    active_until: i64,
 }
 
 #[derive(Debug, Clone, serde::Deserialize)]
@@ -96,18 +92,6 @@ struct IvpnSessionNewResponse {
     message: String,
     #[serde(default)]
     token: String,
-    #[allow(dead_code)]
-    #[serde(default)]
-    vpn_username: String,
-    #[allow(dead_code)]
-    #[serde(default)]
-    vpn_password: String,
-    #[allow(dead_code)]
-    #[serde(default)]
-    device_name: String,
-    #[allow(dead_code)]
-    #[serde(default)]
-    service_status: Option<IvpnServiceStatus>,
     #[serde(default)]
     wireguard: Option<IvpnWireGuardLogin>,
 }

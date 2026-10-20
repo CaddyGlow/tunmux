@@ -7,20 +7,15 @@ direct VPN connection or run separate VPN exits as local SOCKS5/HTTP proxies.
 ## Build
 
 Use the Rust toolchain pinned in [rust-toolchain.toml](rust-toolchain.toml).
+Install a C compiler and make for native dependencies (on macOS, install the
+Xcode command-line tools). The optional AWS-LC backend also needs CMake and a C++
+compiler. AirVPN's default RustCrypto backend requires no native crypto library.
 Initialize the bundled `smoltcp` submodule before building:
 
 ```sh
 git submodule update --init --recursive
 cargo build --release --locked
 cargo run -- --help
-```
-
-The submodule URL uses the maintainer's SSH alias. If that alias is unavailable,
-configure the public URL locally before initializing it:
-
-```sh
-git config submodule.third_party/smoltcp.url https://github.com/CaddyGlow/smoltcp.git
-git submodule update --init --recursive
 ```
 
 The executable is normally `target/release/tunmux` (or under your configured Cargo
@@ -158,8 +153,9 @@ default_country = "SE"
 Set `general.backend` to override the platform default. Credentials, cached provider
 data, connection state, and saved WireGuard profiles also live under
 `~/.config/tunmux/`. Desktop credentials default to file storage;
-`credential_store = "keyring"` selects the optional keyring backend
-when compiled in.
+`credential_store = "keyring"` selects the optional native backend when compiled
+in: Secret Service on Linux (requires an unlocked desktop keyring and session
+D-Bus), or Keychain on macOS.
 See [src/config.rs](src/config.rs) for the complete configuration schema.
 
 ```sh
@@ -232,7 +228,8 @@ Logs are in
 
 ## Rust features
 
-Default builds enable **`all-providers` and `proxy`**. Features are additive; use
+Default builds enable **`all-providers`, `proxy`, and `crypto-rustcrypto`**.
+Features are additive; use
 `--no-default-features` to build a smaller selection.
 
 | Cargo feature | Enables |
@@ -242,16 +239,36 @@ Default builds enable **`all-providers` and `proxy`**. Features are additive; us
 | `all-providers` | All five providers |
 | `proxy` | Linux network-namespace proxy support; not required for rootless local-proxy mode |
 | `keyring` | Optional credential storage through the keyring crate |
+| `crypto-rustcrypto` | Pure Rust RSA encryption for AirVPN (default) |
+| `crypto-aws-lc` | AWS-LC RSA encryption for AirVPN; takes precedence when both crypto features are enabled |
 
 ```sh
 cargo build --locked --no-default-features --features wgconf
 cargo build --locked --no-default-features --features proton,mullvad,proxy
 cargo build --locked --features keyring
+cargo build --locked --features crypto-aws-lc
+# AWS-LC only, excluding the rsa crate from the build:
+cargo build --locked --no-default-features --features all-providers,proxy,crypto-aws-lc
+# AirVPN with pure Rust RSA:
+cargo build --locked --no-default-features --features airvpn,crypto-rustcrypto
 ```
 
 A build with `--no-default-features` alone retains shared infrastructure without
 provider commands. Library consumers using `default-features = false` must choose
-providers explicitly. Android consumers can enable `all-providers` without `proxy`.
+providers explicitly. AirVPN requires one of the two crypto features. Android
+consumers can enable `all-providers,crypto-rustcrypto` without `proxy`.
+
+These flags select AirVPN's RSA implementation; they do not replace the TLS or
+WireGuard crypto stacks. RustCrypto avoids AWS-LC's native build, but other
+dependencies still require a C compiler.
+
+[`.cargo/audit.toml`](.cargo/audit.toml) contains one exception for
+[RUSTSEC-2023-0071](https://rustsec.org/advisories/RUSTSEC-2023-0071). The advisory
+concerns private-key operations; production code only encrypts with AirVPN's
+public key. Private-key decryption is limited to offline tests. Review this
+exception if RSA usage changes and remove it when a patched version is available.
+Cargo audits the entire lockfile, including optional dependencies, so selecting
+AWS-LC alone does not remove the lockfile finding.
 
 ## Codebase and contributions
 
@@ -283,11 +300,21 @@ cargo bench --locked --bench offline
 ```
 
 The CI script checks formatting, runs Clippy across all targets/features with
-warnings denied, and runs `cargo test --locked`. For feature-gated changes, also
+warnings denied, and tests both default and all-feature builds. Keyring tests use
+isolated in-memory credentials and never access your account entries.
+For feature-gated changes, also
 check the affected `--no-default-features --features ...` configuration. Changes
 to routes, DNS, privileges, or recovery need live validation on the affected OS;
 [scripts/macos_native_validation.py](scripts/macos_native_validation.py) provides
 macOS scenarios (`--help` lists its options).
+
+Privileged tests are explicitly ignored by the default suite. Run them only in a
+prepared disposable environment after inspecting their requirements. Live VPN
+validation scripts under `scripts/` are manual tools: they may change connections,
+routes, and DNS. The offline benchmark needs no credentials or privileges.
+
+Lint project Markdown with `rumdl check README.md AGENTS.md` (CI pins version
+0.2.77). CI also builds the Docker image and smoke-tests its CLI.
 
 On the maintainer's Linux setup, `.envrc` selects the shared Nix Android shell.
 Run checks there with:
@@ -300,6 +327,23 @@ nix develop --no-write-lock-file \
 Other environments can run the same Cargo commands with the pinned toolchain.
 Include reproduction steps, OS, backend, enabled features, and validation results
 in issues and pull requests.
+
+## Releases and containers
+
+Pushing a `v*` tag runs the checks and `cargo audit`, builds Linux x86-64 and
+macOS x86-64/ARM64 archives, and publishes a GitHub Release.
+Archives include the binary, README,
+license, and an accompanying SHA-256 checksum file. Versions containing `-` are
+marked as prereleases. The release workflow then publishes the container image;
+the Docker workflow also supports manual publication.
+
+Build a container locally with `docker build -t tunmux .`. It runs as an
+unprivileged user and is intended for rootless `--local-proxy` connections.
+Provider login and proxy startup must run in the same container with persistent
+configuration storage. The proxy listens on container localhost, so consumers
+must share its network namespace; publishing a Docker port alone is insufficient.
+Direct/kernel modes need additional privileges and host networking integration.
+`tunmux status` reports connection state; it is not a container health guarantee.
 
 ## License
 

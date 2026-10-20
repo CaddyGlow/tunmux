@@ -29,7 +29,8 @@ use cli::{Cli, HookBuiltinArg, HookCommand, HookEventArg, ProviderArg, TopComman
 use wireguard::connection::ConnectionState;
 
 fn main() -> std::process::ExitCode {
-    if userspace_helper::maybe_run_from_env() {
+    // SAFETY: no logging, runtime, or worker threads have been initialized.
+    if unsafe { userspace_helper::maybe_run_from_env() } {
         return std::process::ExitCode::SUCCESS;
     }
 

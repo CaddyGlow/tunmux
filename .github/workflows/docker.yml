@@ -1,9 +1,6 @@
 name: Docker Image
 
 on:
-  release:
-    types:
-      - published
   workflow_dispatch:
     inputs:
       ref:
@@ -24,5 +21,5 @@ jobs:
       packages: write
     uses: ./.github/workflows/docker-publish.yml
     with:
-      ref: ${{ github.event.release.tag_name || github.event.inputs.ref || github.ref }}
-      version: ${{ github.event.release.tag_name || github.event.inputs.version || github.ref_name }}
+      ref: ${{ inputs.ref }}
+      version: ${{ inputs.version }}

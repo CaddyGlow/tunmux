@@ -39,13 +39,10 @@ jobs:
         include:
           - runner: ubuntu-latest
             target: x86_64-unknown-linux-gnu
-            android_abi: ""
-          - runner: macos-14
+          - runner: macos-15-intel
             target: x86_64-apple-darwin
-            android_abi: ""
           - runner: macos-14
             target: aarch64-apple-darwin
-            android_abi: ""
 
     steps:
       - name: Checkout
@@ -57,48 +54,52 @@ jobs:
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
         with:
+          toolchain: "1.99.0"
           targets: ${{ matrix.target }}
 
       - name: Rust cache
         uses: Swatinem/rust-cache@v2
 
-      - name: Setup Android NDK
-        if: matrix.android_abi != ''
-        uses: nttld/setup-ndk@v1
-        with:
-          ndk-version: r26d
-
-      - name: Install cargo-ndk
-        if: matrix.android_abi != ''
-        run: cargo install cargo-ndk --locked
-
       - name: Build native target
-        if: matrix.android_abi == ''
         env:
           TUNMUX_GIT_TAG: ${{ inputs.version }}
         run: cargo build --release --locked --target ${{ matrix.target }}
 
-      - name: Build Android target
-        if: matrix.android_abi != ''
-        env:
-          TUNMUX_GIT_TAG: ${{ inputs.version }}
-        run: cargo ndk -t ${{ matrix.android_abi }} build --release --locked
-
       - name: Package artifact
         shell: bash
+        env:
+          RELEASE_VERSION: ${{ inputs.version }}
+          RELEASE_TARGET: ${{ matrix.target }}
         run: |
           set -euo pipefail
-          version="${{ inputs.version }}"
-          asset_dir="${APP_NAME}-${version}-${{ matrix.target }}"
+          version="$RELEASE_VERSION"
+          [[ "$version" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]] || exit 1
+          asset_dir="${APP_NAME}-${version}-${RELEASE_TARGET}"
           mkdir -p dist "${asset_dir}"
-          cp "target/${{ matrix.target }}/release/${APP_NAME}" "${asset_dir}/"
+          cp "target/${RELEASE_TARGET}/release/${APP_NAME}" LICENSE README.md "${asset_dir}/"
           tar -czf "dist/${asset_dir}.tar.gz" "${asset_dir}"
 
+          cd dist
           if command -v sha256sum >/dev/null 2>&1; then
-            sha256sum "dist/${asset_dir}.tar.gz" > "dist/${asset_dir}.tar.gz.sha256"
+            sha256sum "${asset_dir}.tar.gz" > "${asset_dir}.tar.gz.sha256"
           else
-            shasum -a 256 "dist/${asset_dir}.tar.gz" > "dist/${asset_dir}.tar.gz.sha256"
+            shasum -a 256 "${asset_dir}.tar.gz" > "${asset_dir}.tar.gz.sha256"
           fi
+
+      - name: Smoke-test packaged binary
+        shell: bash
+        env:
+          RELEASE_VERSION: ${{ inputs.version }}
+          RELEASE_TARGET: ${{ matrix.target }}
+        run: |
+          set -euo pipefail
+          asset_dir="${APP_NAME}-${RELEASE_VERSION}-${RELEASE_TARGET}"
+          mkdir -p smoke
+          tar -xzf "dist/${asset_dir}.tar.gz" -C smoke
+          test -s "smoke/${asset_dir}/LICENSE"
+          test -s "smoke/${asset_dir}/README.md"
+          "smoke/${asset_dir}/${APP_NAME}" --version | grep -Fx "tunmux ${RELEASE_VERSION}"
+          "smoke/${asset_dir}/${APP_NAME}" --help
 
       - name: Upload packaged artifact
         uses: actions/upload-artifact@v4

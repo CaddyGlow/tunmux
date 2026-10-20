@@ -6,6 +6,10 @@ resolver = "2"
 name = "tunmux"
 version = "0.1.0"
 edition = "2021"
+description = "Multi-provider WireGuard VPN CLI and library"
+license = "MIT"
+repository = "https://github.com/CaddyGlow/tunmux"
+readme = "README.md"
 build = "build.rs"
 
 [lib]
@@ -21,15 +25,17 @@ name = "offline"
 harness = false
 
 [features]
-default = ["proxy", "all-providers"]
+default = ["proxy", "all-providers", "crypto-rustcrypto"]
 all-providers = ["proton", "airvpn", "mullvad", "ivpn", "wgconf"]
 proton = ["dep:rpassword", "dep:num-bigint", "dep:num-traits", "dep:bcrypt", "dep:ed25519-dalek", "dep:curve25519-dalek", "dep:x509-parser"]
-airvpn = ["dep:rpassword", "dep:rsa", "dep:aes", "dep:cbc", "dep:scraper", "dep:reqwest_cookie_store", "dep:cookie", "dep:roxmltree", "reqwest/cookies"]
+airvpn = ["dep:rpassword", "dep:aes", "dep:cbc", "dep:scraper", "dep:reqwest_cookie_store", "dep:cookie", "dep:roxmltree", "reqwest/cookies"]
+crypto-aws-lc = ["dep:aws-lc-rs"]
+crypto-rustcrypto = ["dep:rsa"]
 mullvad = ["dep:ed25519-dalek", "dep:curve25519-dalek", "dep:reqwest_cookie_store", "reqwest/cookies"]
 ivpn = ["dep:rpassword", "dep:ed25519-dalek", "dep:curve25519-dalek", "reqwest/cookies"]
 wgconf = []
 proxy = []
-keyring = ["dep:keyring"]
+keyring = ["dep:keyring", "dep:dbus-secret-service"]
 
 [dependencies]
 # CLI
@@ -72,7 +78,8 @@ bytes = "1"
 crossbeam-queue = "0.3"
 
 # Crypto - AirVPN API
-rsa = { version = "0.9", features = ["std"], optional = true }
+aws-lc-rs = { version = "1.18", default-features = false, features = ["non-fips", "alloc"], optional = true }
+rsa = { version = "0.9", default-features = false, features = ["std"], optional = true }
 aes = { version = "0.8", optional = true }
 cbc = { version = "0.1", optional = true }
 
@@ -92,7 +99,7 @@ thiserror = "2"
 anyhow = "1"
 
 # Keyring (optional)
-keyring = { version = "3", optional = true }
+keyring = { version = "3", optional = true, features = ["apple-native", "sync-secret-service"] }
 
 # Userspace WireGuard crypto + virtual TCP/IP stack for local-proxy mode
 boringtun = "0.7"
@@ -105,6 +112,11 @@ smoltcp = { version = "0.14", default-features = false, features = [
     "alloc",
 ] }
 
+# Enable only the selected Secret Service implementation's crypto features.
+# keyring's umbrella crypto features also pull unused backends into Cargo.lock.
+[target.'cfg(target_os = "linux")'.dependencies]
+dbus-secret-service = { version = "4.1", optional = true, features = ["crypto-rust", "vendored"] }
+
 [target.'cfg(not(target_os = "android"))'.dependencies]
 # Password input (terminal only)
 rpassword = { version = "7", optional = true }
@@ -113,7 +125,7 @@ rpassword = { version = "7", optional = true }
 nix = { version = "0.31", features = ["sched", "net", "fs", "signal", "process", "user", "mount"] }
 
 # Daemonization and userspace WireGuard (unix, non-Android)
-daemonize = "0.5"
+daemonize2 = "0.7"
 gotatun = { version = "0.10", default-features = false, features = ["device", "tun", "ring"] }
 
 [patch.crates-io]
@@ -121,3 +133,7 @@ smoltcp = { path = "third_party/smoltcp" }
 
 [dev-dependencies]
 criterion = { version = "0.5.1", default-features = false, features = ["cargo_bench_support"] }
+
+[[test]]
+name = "daemon_stdio"
+harness = false
