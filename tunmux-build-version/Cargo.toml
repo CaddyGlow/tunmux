@@ -1,0 +1,7 @@
+[package]
+name = "tunmux-build-version"
+description = "Version strings: the package version plus the git commit"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
