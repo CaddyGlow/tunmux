@@ -622,7 +622,7 @@ fn controller() -> anyhow::Result<()> {
                 retry.permanent = true;
                 continue;
             }
-            let result = std::process::Command::new(std::env::current_exe()?)
+            let result = std::process::Command::new(crate::shared::executable::cli_executable()?)
                 .args(&entry.spec.args)
                 .arg("--if-missing")
                 .env(

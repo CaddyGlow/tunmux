@@ -5,6 +5,8 @@
 // namespaces and namespace proxies have additional Linux and feature guards.
 
 // Provider-agnostic infrastructure
+#[cfg(not(target_os = "android"))]
+pub mod api;
 pub mod cli;
 pub mod config;
 pub mod error;

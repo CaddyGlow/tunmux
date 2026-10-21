@@ -1,17 +1,18 @@
 //! Main window: a single dashboard with the connection status on top, the
 //! server browser below and dialogs for accounts, provider tools and settings.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
 
 use egui::{Align, Color32, Layout, RichText, Ui};
 
 use crate::live::Live;
-use crate::mock::{ConnectError, MockBackend};
+use crate::mock::{ConnectError, Store};
 use crate::model::{
     Backend, ConnectSpec, ConnectionView, Health, Mode, Provider, ServerView, SortKey, TrayState,
 };
 use crate::tray::{self, TrayAction, TrayModel};
+use crate::worker::{Event, Job, Worker};
 
 const TOAST_TTL: Duration = Duration::from_secs(4);
 
@@ -37,6 +38,8 @@ pub struct LoginForm {
     pub secret: String,
     pub code: String,
     pub error: Option<String>,
+    /// Mullvad: replace a different saved account ID.
+    pub replace: bool,
 }
 
 pub struct Settings {
@@ -52,11 +55,11 @@ pub struct Settings {
 }
 
 pub struct TunmuxApp {
-    pub backend: MockBackend,
+    pub backend: Store,
     provider: Provider,
-    country: Option<&'static str>,
+    country: Option<String>,
     search: String,
-    tag: Option<&'static str>,
+    tag: Option<String>,
     pub spec: ConnectSpec,
     sort: SortKey,
     sort_desc: bool,
@@ -73,6 +76,11 @@ pub struct TunmuxApp {
     pub actions: Vec<Action>,
     /// Real connection status; `None` runs everything on mock data.
     pub live: Option<Live>,
+    /// Runs library calls in live mode.
+    pub worker: Option<Worker>,
+    /// Providers whose server list was requested, and load errors.
+    servers_requested: HashSet<Provider>,
+    server_errors: HashMap<Provider, String>,
     #[cfg(target_os = "linux")]
     pub systray: Option<crate::systray::Handle>,
     tray_signature: String,
@@ -82,11 +90,20 @@ pub struct TunmuxApp {
 }
 
 impl TunmuxApp {
-    pub fn new(live: Option<Live>) -> Self {
+    pub fn new(live: Option<Live>, mut worker: Option<Worker>) -> Self {
         let mut favorites = HashSet::new();
-        favorites.insert((Provider::AirVpn, "Hydrus".to_string()));
+        if live.is_none() {
+            favorites.insert((Provider::AirVpn, "Hydrus".to_string()));
+        }
+        if let Some(w) = &mut worker {
+            w.send(Job::Accounts);
+        }
         Self {
-            backend: MockBackend::new(),
+            backend: if live.is_some() {
+                Store::empty()
+            } else {
+                Store::sample()
+            },
             provider: Provider::AirVpn,
             country: None,
             search: String::new(),
@@ -116,6 +133,9 @@ impl TunmuxApp {
             },
             actions: Vec::new(),
             live,
+            worker,
+            servers_requested: HashSet::new(),
+            server_errors: HashMap::new(),
             #[cfg(target_os = "linux")]
             systray: None,
             tray_signature: String::new(),
@@ -139,20 +159,18 @@ impl TunmuxApp {
     }
 
     pub fn tray_model(&self) -> TrayModel {
-        match &self.live {
-            // Connecting from the GUI is not wired to the library yet.
-            Some(live) => TrayModel {
-                conns: live.snapshot().connections,
-                ..TrayModel::default()
-            },
-            None => TrayModel {
-                conns: self.backend.connections.clone(),
-                quick: Provider::ALL
-                    .into_iter()
-                    .filter(|p| p.needs_account() && self.backend.is_logged_in(*p))
-                    .collect(),
-                recent: self.backend.recent.clone(),
-            },
+        TrayModel {
+            conns: self.connections(),
+            // Quick connect needs a loaded server list to pick from.
+            quick: Provider::ALL
+                .into_iter()
+                .filter(|p| {
+                    p.needs_account()
+                        && self.backend.is_logged_in(*p)
+                        && self.backend.servers.iter().any(|s| s.provider == *p)
+                })
+                .collect(),
+            recent: self.backend.recent.clone(),
         }
     }
 
@@ -176,18 +194,79 @@ impl TunmuxApp {
         if self.live.is_none() {
             self.backend.tick();
         }
-        let messages = self
-            .live
-            .as_ref()
-            .map(Live::take_messages)
+        let events = self
+            .worker
+            .as_mut()
+            .map(Worker::take_events)
             .unwrap_or_default();
-        for message in messages {
-            match message {
-                Ok(text) => self.toast(text),
-                Err(text) => self.toast_error(text),
-            }
+        for event in events {
+            self.handle_event(event);
         }
         self.sync_tray();
+    }
+
+    pub(crate) fn send(&mut self, job: Job) {
+        if let Some(w) = &mut self.worker {
+            w.send(job);
+        }
+    }
+
+    pub fn is_busy(&self) -> bool {
+        self.worker.as_ref().is_some_and(Worker::is_busy)
+    }
+
+    fn handle_event(&mut self, event: Event) {
+        match event {
+            Event::Accounts(infos) => {
+                self.backend.set_accounts(infos);
+                // Load server lists of logged-in providers once, so quick
+                // connect and the table have something to offer.
+                let wanted: Vec<Provider> = Provider::ALL
+                    .into_iter()
+                    .filter(|p| self.backend.is_logged_in(*p))
+                    .filter(|p| !self.servers_requested.contains(p))
+                    .collect();
+                for p in wanted {
+                    self.request_servers(p);
+                }
+            }
+            Event::Servers(p, result) => {
+                let p = Provider::from(p);
+                match result {
+                    Ok(servers) => {
+                        self.server_errors.remove(&p);
+                        self.backend
+                            .set_servers(p, servers.into_iter().map(ServerView::from).collect());
+                    }
+                    Err(error) => {
+                        self.server_errors.insert(p, error);
+                    }
+                }
+            }
+            Event::Login(p, result) => {
+                let p = Provider::from(p);
+                match result {
+                    Ok(tunmux::api::LoginOutcome::LoggedIn { .. }) => {
+                        self.login = LoginForm::default();
+                        self.servers_requested.remove(&p);
+                        self.toast(format!("Logged in to {}", p.label()));
+                    }
+                    Ok(tunmux::api::LoginOutcome::NeedsTwoFactor) => {
+                        self.backend.set_two_factor(p);
+                        self.login.error = None;
+                    }
+                    Err(error) => self.login.error = Some(error),
+                }
+            }
+            Event::Done(Ok(text)) => self.toast(text),
+            Event::Done(Err(text)) => self.toast_error(text),
+            Event::Idle => {}
+        }
+    }
+
+    pub fn request_servers(&mut self, p: Provider) {
+        self.servers_requested.insert(p);
+        self.send(Job::Servers(p.into()));
     }
 
     fn copy(&mut self, ctx: Option<&egui::Context>, text: String) -> Result<(), String> {
@@ -227,9 +306,9 @@ impl TunmuxApp {
             match action {
                 Action::Connect(server, replace) => self.connect(server, replace),
                 Action::Disconnect(instance) => match &self.live {
-                    Some(live) => {
-                        live.disconnect(Some(&instance));
+                    Some(_) => {
                         self.toast(format!("Disconnecting {instance}"));
+                        self.send(Job::Disconnect(instance));
                     }
                     None => {
                         self.backend.disconnect(&instance);
@@ -264,9 +343,9 @@ impl TunmuxApp {
         match action {
             TrayAction::Disconnect(i) => self.actions.push(Action::Disconnect(i)),
             TrayAction::DisconnectAll => match &self.live {
-                Some(live) => {
-                    live.disconnect(None);
+                Some(_) => {
                     self.toast("Disconnecting all");
+                    self.send(Job::DisconnectAll);
                 }
                 None => {
                     self.backend.disconnect_all();
@@ -308,11 +387,7 @@ impl TunmuxApp {
 
     fn connect(&mut self, server: ServerView, replace: bool) {
         if self.live.is_some() {
-            self.toast_error(format!(
-                "Connecting from the window is not wired yet; run: tunmux connect {} {}",
-                server.provider.label().to_lowercase(),
-                server.name
-            ));
+            self.connect_live(server, replace);
             return;
         }
         let spec = self.spec.clone();
@@ -332,6 +407,31 @@ impl TunmuxApp {
         }
     }
 
+    fn connect_live(&mut self, server: ServerView, replace: bool) {
+        let p = server.provider;
+        if p.needs_account() && !self.backend.is_logged_in(p) {
+            self.toast_error(format!("Log in to {} first", p.label()));
+            self.actions.push(Action::OpenAccounts(p));
+            return;
+        }
+        // Same naming as the library; it still refuses a live instance, this
+        // only lets the user confirm a replace first.
+        let instance = Store::instance_name(&server, self.spec.mode);
+        let running = self.connections().iter().any(|c| c.instance == instance);
+        let spec = self.spec.to_api(&server.name);
+        if running && !replace {
+            self.pending_replace = Some((server, instance));
+            return;
+        }
+        self.backend.add_recent(p, &server.name, self.spec.mode);
+        self.toast(format!("Connecting {} {}", p.label(), server.name));
+        self.send(if running {
+            Job::Replace(instance, p.into(), spec)
+        } else {
+            Job::Connect(p.into(), spec)
+        });
+    }
+
     fn filtered_servers(&self) -> Vec<ServerView> {
         let needle = self.search.to_lowercase();
         let mut rows: Vec<ServerView> = self
@@ -339,8 +439,8 @@ impl TunmuxApp {
             .servers
             .iter()
             .filter(|s| s.provider == self.provider)
-            .filter(|s| self.country.is_none_or(|c| s.country_code == c))
-            .filter(|s| self.tag.is_none_or(|t| s.tags.contains(&t)))
+            .filter(|s| self.country.as_ref().is_none_or(|c| s.country_code == *c))
+            .filter(|s| self.tag.as_ref().is_none_or(|t| s.tags.contains(t)))
             .filter(|s| {
                 needle.is_empty()
                     || s.name.to_lowercase().contains(&needle)
@@ -549,43 +649,45 @@ impl TunmuxApp {
                 self.tag = None;
             }
 
-            let mut countries: Vec<&'static str> = self
+            let mut countries: Vec<String> = self
                 .backend
                 .servers
                 .iter()
-                .filter(|s| s.provider == self.provider)
-                .map(|s| s.country_code)
+                .filter(|s| s.provider == self.provider && !s.country_code.is_empty())
+                .map(|s| s.country_code.clone())
                 .collect();
             countries.sort_unstable();
             countries.dedup();
             ui.label("Country");
             egui::ComboBox::from_id_salt("country")
-                .selected_text(self.country.unwrap_or("Any"))
+                .selected_text(self.country.as_deref().unwrap_or("Any"))
                 .width(60.0)
                 .show_ui(ui, |ui| {
                     ui.selectable_value(&mut self.country, None, "Any");
                     for c in countries {
-                        ui.selectable_value(&mut self.country, Some(c), c);
+                        let label = c.clone();
+                        ui.selectable_value(&mut self.country, Some(c), label);
                     }
                 });
 
-            let mut tags: Vec<&'static str> = self
+            let mut tags: Vec<String> = self
                 .backend
                 .servers
                 .iter()
                 .filter(|s| s.provider == self.provider)
-                .flat_map(|s| s.tags.iter().copied())
+                .flat_map(|s| s.tags.iter().cloned())
                 .collect();
             tags.sort_unstable();
             tags.dedup();
             if !tags.is_empty() {
                 ui.label("Feature");
                 egui::ComboBox::from_id_salt("tag")
-                    .selected_text(self.tag.unwrap_or("Any"))
+                    .selected_text(self.tag.as_deref().unwrap_or("Any"))
                     .show_ui(ui, |ui| {
                         ui.selectable_value(&mut self.tag, None, "Any");
                         for t in tags {
-                            ui.selectable_value(&mut self.tag, Some(t), t);
+                            let label = t.clone();
+                            ui.selectable_value(&mut self.tag, Some(t), label);
                         }
                     });
             }
@@ -605,7 +707,7 @@ impl TunmuxApp {
             ui.menu_button("Advanced", |ui| self.advanced_options(ui));
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                 let quick = egui::Button::new(RichText::new("Quick connect").strong());
-                let target = self.best_server(self.provider, self.country);
+                let target = self.best_server(self.provider, self.country.as_deref());
                 let resp = ui
                     .add_enabled(target.is_some(), quick)
                     .on_hover_text("Lowest ping, or lowest load if not probed yet");
@@ -614,10 +716,12 @@ impl TunmuxApp {
                         self.actions.push(Action::Connect(s, false));
                     }
                 }
-                if ui
-                    .button("Probe ping")
-                    .on_hover_text("TCP probe of every listed endpoint")
-                    .clicked()
+                // Live latency probing is not wired yet.
+                if self.live.is_none()
+                    && ui
+                        .button("Probe ping")
+                        .on_hover_text("TCP probe of every listed endpoint")
+                        .clicked()
                 {
                     self.backend.probe_pings(self.provider);
                     self.sort = SortKey::Ping;
@@ -680,7 +784,26 @@ impl TunmuxApp {
             return;
         }
         if self.live.is_some() {
-            ui.weak("Sample server list: browsing and connecting are wired to the library next.");
+            let loaded = self.backend.servers.iter().any(|s| s.provider == provider);
+            if let Some(error) = self.server_errors.get(&provider).cloned() {
+                ui.horizontal(|ui| {
+                    ui.colored_label(tray::state_color(TrayState::Degraded), error);
+                    if ui.small_button("Retry").clicked() {
+                        self.request_servers(provider);
+                    }
+                });
+                return;
+            }
+            if !loaded {
+                if !self.servers_requested.contains(&provider) {
+                    self.request_servers(provider);
+                }
+                ui.horizontal(|ui| {
+                    ui.spinner();
+                    ui.weak(format!("Loading {} servers...", provider.label()));
+                });
+                return;
+            }
         }
         let rows = self.filtered_servers();
         let connected: Vec<(String, String)> = self
@@ -867,14 +990,17 @@ impl TunmuxApp {
                     .filter(|a| a.provider.needs_account() && self.backend.is_logged_in(a.provider))
                     .count();
                 let source = if self.live.is_some() {
-                    "live status, sample servers and accounts"
+                    ""
                 } else {
-                    "mock data"
+                    " - mock data"
                 };
                 ui.weak(format!(
-                    "{} tunnel(s), {accounts} account(s) - {source}",
+                    "{} tunnel(s), {accounts} account(s){source}",
                     self.connections().len()
                 ));
+                if self.is_busy() {
+                    ui.spinner().on_hover_text("Working...");
+                }
             });
         });
     }
@@ -998,11 +1124,13 @@ impl TunmuxApp {
     pub fn show(&mut self, ui: &mut Ui) {
         let ctx = ui.ctx().clone();
         // Uptime (and mock traffic) moves every second.
-        ctx.request_repaint_after(if self.live.is_none() && self.backend.is_busy() {
-            Duration::from_millis(100)
-        } else {
-            Duration::from_secs(1)
-        });
+        ctx.request_repaint_after(
+            if self.is_busy() || (self.live.is_none() && self.backend.is_busy()) {
+                Duration::from_millis(100)
+            } else {
+                Duration::from_secs(1)
+            },
+        );
 
         egui::Panel::top("status")
             .frame(egui::Frame::side_top_panel(ui.style()).inner_margin(10.0))

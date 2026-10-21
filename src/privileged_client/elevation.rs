@@ -85,12 +85,23 @@ impl Elevation {
             return Ok(Self::Direct);
         }
 
-        AUTO_CANDIDATES
+        let available: Vec<(ElevatorKind, PathBuf)> = AUTO_CANDIDATES
             .iter()
             .filter_map(|name| find_in_path(name))
             .map(|program| (ElevatorKind::from_program(&program), program))
             // osascript has no non-interactive mode.
-            .find(|(kind, _)| prompt == Prompt::Allowed || *kind != ElevatorKind::Osascript)
+            .filter(|(kind, _)| prompt == Prompt::Allowed || *kind != ElevatorKind::Osascript)
+            .collect();
+        // Without a terminal (a desktop front-end), sudo and doas cannot ask
+        // for a password, so prefer a program that prompts through an agent.
+        let headless = prompt == Prompt::Allowed && !std::io::stdin().is_terminal();
+        let preferred = available
+            .iter()
+            .position(|(kind, _)| headless && kind.prompts_without_tty())
+            .unwrap_or(0);
+        available
+            .into_iter()
+            .nth(preferred)
             .map(|(kind, program)| Self::Program {
                 program,
                 kind,

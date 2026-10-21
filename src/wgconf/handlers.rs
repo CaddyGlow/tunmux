@@ -529,6 +529,27 @@ fn list_profiles() -> anyhow::Result<Vec<String>> {
     list_profiles_in(&provider_dir())
 }
 
+/// Saved profile names.
+pub(crate) fn profile_names() -> anyhow::Result<Vec<String>> {
+    list_profiles()
+}
+
+/// Saved profiles, offered as servers; connect takes the profile name.
+pub(crate) fn server_list() -> anyhow::Result<Vec<crate::api::ServerInfo>> {
+    Ok(list_profiles()?
+        .into_iter()
+        .map(|name| crate::api::ServerInfo {
+            provider: PROVIDER,
+            name,
+            country_code: String::new(),
+            city: String::new(),
+            load: None,
+            score: None,
+            tags: Vec::new(),
+        })
+        .collect())
+}
+
 fn list_profiles_in(provider: &Path) -> anyhow::Result<Vec<String>> {
     let dir = profile_dir_in(provider);
     if !dir.exists() {

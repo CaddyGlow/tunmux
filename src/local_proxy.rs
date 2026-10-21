@@ -254,7 +254,7 @@ fn proc_alive(pid: u32) -> bool {
 }
 
 fn self_executable() -> anyhow::Result<std::path::PathBuf> {
-    if let Ok(current) = std::env::current_exe() {
+    if let Ok(current) = crate::shared::executable::cli_executable() {
         if current.exists() {
             return Ok(current);
         }

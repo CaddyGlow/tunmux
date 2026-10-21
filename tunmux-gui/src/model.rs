@@ -12,6 +12,30 @@ pub enum Provider {
     WgConf,
 }
 
+impl From<tunmux::config::Provider> for Provider {
+    fn from(p: tunmux::config::Provider) -> Self {
+        match p {
+            tunmux::config::Provider::Proton => Provider::Proton,
+            tunmux::config::Provider::AirVpn => Provider::AirVpn,
+            tunmux::config::Provider::Mullvad => Provider::Mullvad,
+            tunmux::config::Provider::Ivpn => Provider::Ivpn,
+            tunmux::config::Provider::Wgconf => Provider::WgConf,
+        }
+    }
+}
+
+impl From<Provider> for tunmux::config::Provider {
+    fn from(p: Provider) -> Self {
+        match p {
+            Provider::Proton => tunmux::config::Provider::Proton,
+            Provider::AirVpn => tunmux::config::Provider::AirVpn,
+            Provider::Mullvad => tunmux::config::Provider::Mullvad,
+            Provider::Ivpn => tunmux::config::Provider::Ivpn,
+            Provider::WgConf => tunmux::config::Provider::Wgconf,
+        }
+    }
+}
+
 impl Provider {
     /// Map the provider directory name saved in `ConnectionState::provider`.
     pub fn from_dir_name(name: &str) -> Option<Self> {
@@ -112,6 +136,28 @@ pub struct ConnectSpec {
     pub access_log: bool,
 }
 
+impl ConnectSpec {
+    /// Library connect arguments for `server`.
+    pub fn to_api(&self, server: &str) -> tunmux::api::ConnectSpec {
+        tunmux::api::ConnectSpec {
+            server: Some(server.to_string()),
+            country: None,
+            mode: match self.mode {
+                Mode::Direct => tunmux::api::ConnectMode::Direct,
+                Mode::NetnsProxy => tunmux::api::ConnectMode::NamespaceProxy,
+                Mode::LocalProxy => tunmux::api::ConnectMode::LocalProxy,
+            },
+            backend: (self.backend != Backend::Auto).then(|| self.backend.label().to_string()),
+            disable_ipv6: self.disable_ipv6,
+            mtu: self.mtu,
+            socks_port: self.socks_port,
+            http_port: self.http_port,
+            allow_lan: self.allow_lan,
+            proxy_access_log: self.access_log,
+        }
+    }
+}
+
 impl Default for ConnectSpec {
     fn default() -> Self {
         Self {
@@ -131,12 +177,27 @@ impl Default for ConnectSpec {
 pub struct ServerView {
     pub provider: Provider,
     pub name: String,
-    pub country_code: &'static str,
-    pub city: &'static str,
+    pub country_code: String,
+    pub city: String,
     pub load: Option<f32>,
     pub score: Option<f64>,
-    pub tags: Vec<&'static str>,
+    pub tags: Vec<String>,
     pub ping_ms: Option<u32>,
+}
+
+impl From<tunmux::api::ServerInfo> for ServerView {
+    fn from(s: tunmux::api::ServerInfo) -> Self {
+        Self {
+            provider: s.provider.into(),
+            name: s.name,
+            country_code: s.country_code,
+            city: s.city,
+            load: s.load,
+            score: s.score,
+            tags: s.tags,
+            ping_ms: None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

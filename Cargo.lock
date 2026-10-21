@@ -5304,11 +5304,13 @@ dependencies = [
 name = "tunmux-gui"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
  "arboard",
  "eframe",
  "egui",
  "ksni",
  "rustix 1.1.5",
+ "tokio",
  "tracing",
  "tunmux",
 ]

@@ -319,7 +319,7 @@ impl PrivilegedClient {
     }
 
     fn elevated_daemon_command(&self, elevation: &Elevation, interactive: bool) -> Result<Command> {
-        let exe = std::env::current_exe()
+        let exe = crate::shared::executable::cli_executable()
             .map_err(|e| AppError::Other(format!("cannot resolve current executable: {}", e)))?;
         elevation
             .command(&exe, &self.daemon_args(), interactive)
@@ -413,7 +413,8 @@ impl PrivilegedClient {
     }
 
     pub(crate) fn manual_start_command(&self) -> String {
-        let exe = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("tunmux"));
+        let exe =
+            crate::shared::executable::cli_executable().unwrap_or_else(|_| PathBuf::from("tunmux"));
         let stdio = if matches!(self.transport, PrivilegedTransport::Stdio) {
             " --stdio"
         } else {

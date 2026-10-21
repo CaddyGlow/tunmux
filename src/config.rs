@@ -464,7 +464,7 @@ pub fn load_manifest<T: DeserializeOwned>(provider: Provider, filename: &str) ->
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::{
         delete_session, load_session, save_session, session_path, AppConfig, CredentialStore,
         Provider,
@@ -474,12 +474,13 @@ mod tests {
     use std::sync::{Mutex, OnceLock};
     use std::time::{SystemTime, UNIX_EPOCH};
 
-    fn env_lock() -> &'static Mutex<()> {
+    /// Serialises tests that change process environment such as XDG_CONFIG_HOME.
+    pub(crate) fn env_lock() -> &'static Mutex<()> {
         static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
         LOCK.get_or_init(|| Mutex::new(()))
     }
 
-    fn unique_test_dir(name: &str) -> PathBuf {
+    pub(crate) fn unique_test_dir(name: &str) -> PathBuf {
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map(|d| d.as_nanos())

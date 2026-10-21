@@ -5,6 +5,7 @@ use egui::{Color32, RichText, Ui};
 use crate::app::{Action, LoginForm, TunmuxApp};
 use crate::model::{Backend, LoginState, Mode, Provider, TrayState};
 use crate::tray;
+use crate::worker::Job;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum ToolsTab {
@@ -57,10 +58,17 @@ impl TunmuxApp {
         ui.heading(p.label());
         if !p.needs_account() {
             ui.label("WireGuard config files need no account.");
-            ui.label(format!(
-                "{} saved profiles.",
-                self.backend.wg_profiles.len()
-            ));
+            match (&self.live, &self.backend.account(p).state) {
+                (Some(_), LoginState::LoggedIn { detail, .. }) => {
+                    ui.label(format!("{detail}."));
+                }
+                _ => {
+                    ui.label(format!(
+                        "{} saved profiles.",
+                        self.backend.wg_profiles.len()
+                    ));
+                }
+            }
             if ui.button("Manage profiles...").clicked() {
                 self.show_tools = true;
             }
@@ -89,7 +97,11 @@ impl TunmuxApp {
                 ui.add_space(8.0);
                 ui.horizontal(|ui| {
                     if ui.button("Refresh server list").clicked() {
-                        self.toast(format!("{} server list refreshed", p.label()));
+                        if self.live.is_some() {
+                            self.request_servers(p);
+                        } else {
+                            self.toast(format!("{} server list refreshed", p.label()));
+                        }
                     }
                     let tunnels = self
                         .backend
@@ -104,8 +116,12 @@ impl TunmuxApp {
                         logout
                     };
                     if logout.clicked() {
-                        self.backend.logout(p);
-                        self.toast(format!("Logged out of {}", p.label()));
+                        if self.live.is_some() {
+                            self.send(Job::Logout(p.into()));
+                        } else {
+                            self.backend.logout(p);
+                            self.toast(format!("Logged out of {}", p.label()));
+                        }
                     }
                 });
             }
@@ -142,9 +158,20 @@ impl TunmuxApp {
         if let Some(err) = &self.login.error {
             ui.colored_label(Color32::from_rgb(220, 80, 60), err);
         }
+        if p == Provider::Mullvad && self.live.is_some() {
+            ui.checkbox(&mut self.login.replace, "Replace a different saved account");
+        }
         ui.horizontal(|ui| {
-            submit |= ui.button("Log in").clicked();
-            if p == Provider::Mullvad && ui.button("Create account").clicked() {
+            submit |= ui
+                .add_enabled(!self.is_busy(), egui::Button::new("Log in"))
+                .clicked();
+            if self.is_busy() {
+                ui.spinner();
+            }
+            if p == Provider::Mullvad
+                && self.live.is_none()
+                && ui.button("Create account").clicked()
+            {
                 self.login.user = "7342 9921 0458 1167".into();
                 self.toast("New Mullvad account created; add time before connecting");
             }
@@ -156,7 +183,16 @@ impl TunmuxApp {
             Provider::Ivpn => ui.weak("Format i-XXXX-XXXX-XXXX."),
             Provider::WgConf => unreachable!(),
         };
-        if submit {
+        if submit && self.live.is_some() {
+            self.login.error = None;
+            let credentials = tunmux::api::Credentials {
+                account: self.login.user.trim().to_string(),
+                password: self.login.secret.clone(),
+                two_factor: None,
+                replace_saved_account: self.login.replace,
+            };
+            self.send(Job::Login(p.into(), credentials));
+        } else if submit {
             let (user, secret) = (self.login.user.clone(), self.login.secret.clone());
             match self.backend.login(p, &user, &secret) {
                 Ok(needs_2fa) => {
@@ -189,7 +225,18 @@ impl TunmuxApp {
                 self.login = LoginForm::default();
             }
         });
-        if submit {
+        if submit && self.live.is_some() {
+            // The library logs in again with the code; the password is kept
+            // in the form until then.
+            self.login.error = None;
+            let credentials = tunmux::api::Credentials {
+                account: self.login.user.trim().to_string(),
+                password: self.login.secret.clone(),
+                two_factor: Some(self.login.code.trim().to_string()),
+                replace_saved_account: self.login.replace,
+            };
+            self.send(Job::Login(p.into(), credentials));
+        } else if submit {
             let (user, code) = (self.login.user.clone(), self.login.code.clone());
             match self.backend.submit_two_factor(p, &user, &code) {
                 Ok(()) => {
@@ -219,6 +266,11 @@ impl TunmuxApp {
                 });
                 ui.data_mut(|d| d.insert_temp(id, tab));
                 ui.separator();
+                if self.live.is_some() {
+                    ui.weak(
+                        "Sample data: provider tools are wired to the library in a later step.",
+                    );
+                }
                 match tab {
                     ToolsTab::AirVpn => self.airvpn_tools(ui),
                     ToolsTab::Proton => self.proton_tools(ui),
@@ -370,6 +422,9 @@ impl TunmuxApp {
     }
 
     fn settings_body(&mut self, ui: &mut Ui) {
+        if self.live.is_some() {
+            ui.weak("Sample settings: not saved to config.toml yet.");
+        }
         let s = &mut self.settings;
         ui.strong("Connections");
         egui::Grid::new("set_conn").num_columns(2).show(ui, |ui| {

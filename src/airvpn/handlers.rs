@@ -50,11 +50,21 @@ pub async fn dispatch(command: AirVpnCommand, config: &AppConfig) -> anyhow::Res
 
 async fn cmd_login(username: &str, config: &AppConfig) -> anyhow::Result<()> {
     let password = rpassword::prompt_password("Password: ")?;
+    login(username, &password, config).await?;
+    println!("Logged in as {}", username);
+    Ok(())
+}
 
+/// Log in, then save the session and the server list.
+pub(crate) async fn login(
+    username: &str,
+    password: &str,
+    config: &AppConfig,
+) -> anyhow::Result<crate::api::LoginOutcome> {
     let client = AirVpnClient::new()?;
 
     // Authenticate
-    let session = client.login(username, &password).await?;
+    let session = client.login(username, password).await?;
     println!(
         "Authenticated as {} ({} WireGuard key(s))",
         username,
@@ -62,15 +72,39 @@ async fn cmd_login(username: &str, config: &AppConfig) -> anyhow::Result<()> {
     );
 
     // Fetch manifest (server list)
-    let manifest = client.fetch_manifest(username, &password).await?;
+    let manifest = client.fetch_manifest(username, password).await?;
     println!("Fetched {} servers", manifest.servers.len());
 
     // Save session and manifest
     config::save_session(PROVIDER, &session, config)?;
     save_manifest(&manifest)?;
 
-    println!("Logged in as {}", username);
-    Ok(())
+    Ok(crate::api::LoginOutcome::LoggedIn {
+        account: username.to_string(),
+        detail: format!("{} WireGuard key(s)", session.keys.len()),
+    })
+}
+
+/// Servers from the list saved at login.
+pub(crate) fn server_list() -> anyhow::Result<Vec<crate::api::ServerInfo>> {
+    let manifest = load_manifest()?;
+    Ok(manifest
+        .servers
+        .iter()
+        .map(|s| crate::api::ServerInfo {
+            provider: PROVIDER,
+            name: s.name.clone(),
+            country_code: s.country_code.to_uppercase(),
+            city: s.location.clone(),
+            load: Some(airvpn_load_perc(s) as f32),
+            score: None,
+            tags: if airvpn_server_matches_tags(s, &["ipv6".into()]) {
+                vec!["ipv6".into()]
+            } else {
+                Vec::new()
+            },
+        })
+        .collect())
 }
 
 async fn cmd_logout(config: &AppConfig) -> anyhow::Result<()> {

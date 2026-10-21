@@ -233,6 +233,53 @@ async fn cmd_login(account_number: &str, force: bool, config: &AppConfig) -> any
     Ok(())
 }
 
+/// Log in without prompting. A different saved account ID is replaced only
+/// with `replace_saved_account`, where the CLI asks for confirmation.
+pub(crate) async fn login(
+    account_number: &str,
+    replace_saved_account: bool,
+    config: &AppConfig,
+) -> anyhow::Result<crate::api::LoginOutcome> {
+    if let Some(existing) = load_saved_account_id()? {
+        if existing != account_number && !replace_saved_account {
+            anyhow::bail!(
+                "a different Mullvad account ID is saved ({existing}); confirm replacing it"
+            );
+        }
+    }
+    let client = api_client()?;
+    let session = login_with_client(&client, account_number, config).await?;
+    Ok(crate::api::LoginOutcome::LoggedIn {
+        account: account_number.to_string(),
+        detail: format!("expires {}", session.account_expiry),
+    })
+}
+
+/// Active relays from the cached list, fetching it when missing.
+pub(crate) async fn server_list() -> anyhow::Result<Vec<crate::api::ServerInfo>> {
+    let client = api_client()?;
+    let manifest = load_manifest_cached_or_fetch(&client).await?;
+    Ok(manifest
+        .wireguard
+        .relays
+        .iter()
+        .filter(|r| r.active)
+        .map(|r| crate::api::ServerInfo {
+            provider: PROVIDER,
+            name: r.hostname.clone(),
+            country_code: country_code_from_location(&r.location),
+            city: manifest
+                .locations
+                .get(&r.location)
+                .map(|l| l.city.clone())
+                .unwrap_or_default(),
+            load: None,
+            score: None,
+            tags: Vec::new(),
+        })
+        .collect())
+}
+
 async fn login_with_client(
     client: &Client,
     account_number: &str,

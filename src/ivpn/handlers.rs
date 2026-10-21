@@ -299,6 +299,22 @@ async fn cmd_monero_payment(
 }
 
 async fn cmd_login(account_id: &str, config: &AppConfig) -> anyhow::Result<()> {
+    let mut two_factor = || Ok(Some(rpassword::prompt_password("2FA code: ")?));
+    if let crate::api::LoginOutcome::LoggedIn { detail, .. } =
+        login(account_id, &mut two_factor, config).await?
+    {
+        println!("Logged in to IVPN account {}{}", account_id, detail);
+    }
+    Ok(())
+}
+
+/// Log in and save the session. `two_factor` supplies the TOTP code when the
+/// account requires one; returning `None` stops with `NeedsTwoFactor`.
+pub(crate) async fn login(
+    account_id: &str,
+    two_factor: &mut dyn FnMut() -> anyhow::Result<Option<String>>,
+    config: &AppConfig,
+) -> anyhow::Result<crate::api::LoginOutcome> {
     let client = api_client()?;
     let keys = crypto::keys::VpnKeys::generate()?;
     let wg_public_key = keys.wg_public_key();
@@ -306,7 +322,9 @@ async fn cmd_login(account_id: &str, config: &AppConfig) -> anyhow::Result<()> {
 
     let mut response = session_new(&client, account_id, &wg_public_key, None).await?;
     if response.status == CODE_2FA_REQUIRED {
-        let code = rpassword::prompt_password("2FA code: ")?;
+        let Some(code) = two_factor()? else {
+            return Ok(crate::api::LoginOutcome::NeedsTwoFactor);
+        };
         response = session_new(&client, account_id, &wg_public_key, Some(code.trim())).await?;
     }
 
@@ -347,16 +365,35 @@ async fn cmd_login(account_id: &str, config: &AppConfig) -> anyhow::Result<()> {
         let _ = save_manifest(&manifest);
     }
 
-    println!(
-        "Logged in to IVPN account {}{}",
-        account_id,
-        if session.device_name.is_empty() {
+    Ok(crate::api::LoginOutcome::LoggedIn {
+        account: account_id.to_string(),
+        detail: if session.device_name.is_empty() {
             String::new()
         } else {
             format!(" (device: {})", session.device_name)
-        }
-    );
-    Ok(())
+        },
+    })
+}
+
+/// One row per WireGuard host, from the cached list, fetching it when missing.
+pub(crate) async fn server_list() -> anyhow::Result<Vec<crate::api::ServerInfo>> {
+    let client = api_client()?;
+    let manifest = load_manifest_cached_or_fetch(&client).await?;
+    Ok(manifest
+        .wireguard
+        .iter()
+        .flat_map(|server| {
+            server.hosts.iter().map(|host| crate::api::ServerInfo {
+                provider: PROVIDER,
+                name: host.hostname.clone(),
+                country_code: server.country_code.to_uppercase(),
+                city: server.city.clone(),
+                load: Some(host.load as f32),
+                score: None,
+                tags: Vec::new(),
+            })
+        })
+        .collect())
 }
 
 async fn cmd_logout(config: &AppConfig) -> anyhow::Result<()> {

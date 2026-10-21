@@ -49,15 +49,33 @@ pub async fn dispatch(command: ProtonCommand, config: &AppConfig) -> anyhow::Res
 
 async fn cmd_login(username: &str, config: &AppConfig) -> anyhow::Result<()> {
     let password = rpassword::prompt_password("Password: ")?;
+    let mut two_factor = || Ok(Some(rpassword::prompt_password("2FA code: ")?));
+    if let crate::api::LoginOutcome::LoggedIn { detail, .. } =
+        login(username, &password, &mut two_factor, config).await?
+    {
+        println!("Logged in as {} ({})", username, detail);
+    }
+    Ok(())
+}
 
+/// Log in and save the session. `two_factor` supplies the TOTP code when the
+/// account requires one; returning `None` stops with `NeedsTwoFactor`.
+pub(crate) async fn login(
+    username: &str,
+    password: &str,
+    two_factor: &mut dyn FnMut() -> anyhow::Result<Option<String>>,
+    config: &AppConfig,
+) -> anyhow::Result<crate::api::LoginOutcome> {
     let mut client = api::http::ProtonClient::new()?;
 
     // SRP authentication
-    let auth = api::auth::login(&mut client, username, &password).await?;
+    let auth = api::auth::login(&mut client, username, password).await?;
 
     // Handle 2FA if required
     if auth.two_factor.totp_required() {
-        let code = rpassword::prompt_password("2FA code: ")?;
+        let Some(code) = two_factor()? else {
+            return Ok(crate::api::LoginOutcome::NeedsTwoFactor);
+        };
         api::auth::submit_2fa(&client, code.trim()).await?;
     }
 
@@ -91,8 +109,34 @@ async fn cmd_login(username: &str, config: &AppConfig) -> anyhow::Result<()> {
     };
 
     config::save_session(PROVIDER, &session, config)?;
-    println!("Logged in as {} ({})", username, session.plan_title);
-    Ok(())
+    Ok(crate::api::LoginOutcome::LoggedIn {
+        account: session.vpn_username,
+        detail: session.plan_title,
+    })
+}
+
+/// Servers this account can connect to, from the cached list.
+pub(crate) async fn server_list(config: &AppConfig) -> anyhow::Result<Vec<crate::api::ServerInfo>> {
+    let session: models::session::Session = config::load_session(PROVIDER, config)?;
+    let servers = load_servers_cached_or_fetch(&session).await?;
+    Ok(servers
+        .into_iter()
+        .filter(|s| s.is_enabled() && s.best_physical().is_some() && s.tier <= session.max_tier)
+        .map(|s| crate::api::ServerInfo {
+            provider: PROVIDER,
+            tags: s
+                .feature_tags()
+                .split(',')
+                .filter(|t| !t.is_empty())
+                .map(str::to_lowercase)
+                .collect(),
+            name: s.name,
+            country_code: s.exit_country,
+            city: s.city.unwrap_or_default(),
+            load: Some(s.load as f32),
+            score: Some(s.score),
+        })
+        .collect())
 }
 
 async fn cmd_logout(config: &AppConfig) -> anyhow::Result<()> {
@@ -604,8 +648,8 @@ fn spawn_proton_ports_daemon(
     lifetime: u32,
     renew_every: u64,
 ) -> anyhow::Result<u32> {
-    let exe =
-        std::env::current_exe().unwrap_or_else(|_| std::path::PathBuf::from("/proc/self/exe"));
+    let exe = crate::shared::executable::cli_executable()
+        .unwrap_or_else(|_| std::path::PathBuf::from("/proc/self/exe"));
     let log_path = proton_ports_daemon_log_path();
     if let Some(parent) = log_path.parent() {
         std::fs::create_dir_all(parent)?;

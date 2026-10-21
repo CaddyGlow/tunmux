@@ -1,6 +1,7 @@
-//! Fake backend used to review the interface before it is wired to the
-//! tunmux library. Connections take a moment to come up so the transient
-//! states are visible.
+//! Data the window shows. `Store::sample()` fills it with sample data for
+//! reviewing the interface (`--mock`), where connections take a moment to come
+//! up so the transient states are visible. In live mode `Store::empty()` is
+//! filled with accounts and servers from the library.
 
 use std::time::{Duration, Instant, SystemTime};
 
@@ -35,7 +36,7 @@ pub struct WgProfile {
     pub endpoint: String,
 }
 
-pub struct MockBackend {
+pub struct Store {
     pub accounts: Vec<AccountView>,
     pub servers: Vec<ServerView>,
     pub connections: Vec<ConnectionView>,
@@ -49,8 +50,66 @@ pub struct MockBackend {
     last_tick: Instant,
 }
 
-impl MockBackend {
-    pub fn new() -> Self {
+impl Store {
+    /// No sample data; live mode fills accounts and servers.
+    pub fn empty() -> Self {
+        Self {
+            accounts: Provider::ALL
+                .into_iter()
+                .map(|provider| AccountView {
+                    provider,
+                    state: LoginState::LoggedOut,
+                    servers_cached: 0,
+                })
+                .collect(),
+            servers: Vec::new(),
+            connections: Vec::new(),
+            recent: Vec::new(),
+            air_ports: Vec::new(),
+            air_devices: Vec::new(),
+            air_api_keys: Vec::new(),
+            proton_forwards: Vec::new(),
+            wg_profiles: Vec::new(),
+            corrupt_states: Vec::new(),
+            last_tick: Instant::now(),
+        }
+    }
+
+    pub fn set_accounts(&mut self, infos: Vec<tunmux::api::AccountInfo>) {
+        for info in infos {
+            let provider = Provider::from(info.provider);
+            let acc = self.account_mut(provider);
+            acc.state = match info.account {
+                Some(account) => LoginState::LoggedIn {
+                    account,
+                    detail: info.detail,
+                },
+                // Keep a 2FA prompt open until the user finishes or cancels.
+                None if acc.state == LoginState::NeedsTwoFactor => LoginState::NeedsTwoFactor,
+                None => LoginState::LoggedOut,
+            };
+        }
+        self.refresh_counts();
+    }
+
+    pub fn set_servers(&mut self, provider: Provider, servers: Vec<ServerView>) {
+        self.servers.retain(|s| s.provider != provider);
+        self.servers.extend(servers);
+        self.refresh_counts();
+    }
+
+    pub fn set_two_factor(&mut self, provider: Provider) {
+        self.account_mut(provider).state = LoginState::NeedsTwoFactor;
+    }
+
+    pub fn add_recent(&mut self, provider: Provider, server: &str, mode: Mode) {
+        self.recent
+            .retain(|(p, s, m)| !(*p == provider && s == server && *m == mode));
+        self.recent.insert(0, (provider, server.to_string(), mode));
+        self.recent.truncate(5);
+    }
+
+    pub fn sample() -> Self {
         let mut me = Self {
             accounts: vec![
                 logged_in(
@@ -237,8 +296,8 @@ impl MockBackend {
             instance: instance.clone(),
             provider: server.provider,
             server: server.name.clone(),
-            country_code: server.country_code.into(),
-            city: server.city.into(),
+            country_code: server.country_code.clone(),
+            city: server.city.clone(),
             mode: spec.mode,
             backend: if spec.mode == Mode::LocalProxy {
                 "local-proxy"
@@ -259,11 +318,7 @@ impl MockBackend {
         });
         // Direct first, then proxies in connect order.
         self.connections.sort_by_key(|c| !c.is_direct());
-        self.recent
-            .retain(|(p, s, m)| !(*p == server.provider && *s == server.name && *m == spec.mode));
-        self.recent
-            .insert(0, (server.provider, server.name.clone(), spec.mode));
-        self.recent.truncate(5);
+        self.add_recent(server.provider, &server.name, spec.mode);
         Ok(instance)
     }
 
@@ -311,7 +366,7 @@ impl MockBackend {
             .filter(|s| s.provider == provider)
             .enumerate()
         {
-            let base: u32 = match s.country_code {
+            let base: u32 = match s.country_code.as_str() {
                 "CH" | "DE" | "NL" | "FR" => 8,
                 "SE" | "GB" => 25,
                 "US" | "CA" => 95,
@@ -609,11 +664,11 @@ fn fake_servers() -> Vec<ServerView> {
             |&(provider, name, cc, city, load, score, tags)| ServerView {
                 provider,
                 name: name.into(),
-                country_code: cc,
-                city,
+                country_code: cc.into(),
+                city: city.into(),
                 load,
                 score,
-                tags: tags.to_vec(),
+                tags: tags.iter().map(|t| t.to_string()).collect(),
                 ping_ms: None,
             },
         )

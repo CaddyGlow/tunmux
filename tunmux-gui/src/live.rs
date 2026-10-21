@@ -16,8 +16,8 @@
 //! already running, and otherwise keeps their last observation.
 
 use std::collections::{HashMap, HashSet};
-use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
+#[cfg(not(target_os = "linux"))]
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime};
@@ -42,9 +42,6 @@ pub struct Snapshot {
     pub corrupt: Vec<String>,
 }
 
-/// Outcome of a CLI action, shown as a toast.
-pub type Message = Result<String, String>;
-
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Refresh {
     /// Startup or state files changed: probe everything.
@@ -57,19 +54,15 @@ pub struct Live {
     snapshot: Arc<Mutex<Snapshot>>,
     window_open: Arc<AtomicBool>,
     waker: Waker,
-    notify: Notify,
-    messages_tx: Sender<Message>,
-    messages: Receiver<Message>,
 }
 
 impl Live {
     /// Start the watcher thread. `on_change` runs on that thread after each
     /// refresh, also while the window is closed.
-    pub fn start(notify: Notify, on_change: impl Fn(&Snapshot) + Send + 'static) -> Self {
+    pub fn start(on_change: impl Fn(&Snapshot) + Send + 'static) -> Self {
         let snapshot = Arc::new(Mutex::new(Snapshot::default()));
         let window_open = Arc::new(AtomicBool::new(false));
         let (waker, wait) = waker();
-        let (messages_tx, messages) = mpsc::channel();
         {
             let snapshot = snapshot.clone();
             let window_open = window_open.clone();
@@ -82,9 +75,6 @@ impl Live {
             snapshot,
             window_open,
             waker,
-            notify,
-            messages_tx,
-            messages,
         }
     }
 
@@ -102,73 +92,6 @@ impl Live {
     pub fn waker(&self) -> Waker {
         self.waker.clone()
     }
-
-    pub fn take_messages(&self) -> Vec<Message> {
-        self.messages.try_iter().collect()
-    }
-
-    /// Disconnect one instance, or all of them, through the tunmux CLI.
-    /// Interim until the library exposes a disconnect API.
-    pub fn disconnect(&self, instance: Option<&str>) {
-        let mut args = vec!["disconnect".to_string()];
-        match instance {
-            Some(i) => args.push(i.to_string()),
-            None => args.push("--all".into()),
-        }
-        let tx = self.messages_tx.clone();
-        let waker = self.waker.clone();
-        let notify = self.notify.clone();
-        std::thread::spawn(move || {
-            let _ = tx.send(run_cli(&args));
-            waker.wake();
-            notify();
-        });
-    }
-}
-
-fn run_cli(args: &[String]) -> Message {
-    let bin = tunmux_bin();
-    let output = Command::new(&bin)
-        .args(args)
-        .stdin(Stdio::null())
-        .output()
-        .map_err(|e| format!("cannot run {}: {e}", bin.display()))?;
-    let text = |bytes: &[u8]| {
-        String::from_utf8_lossy(bytes)
-            .lines()
-            .rev()
-            .find(|l| !l.trim().is_empty())
-            .unwrap_or_default()
-            .trim()
-            .to_string()
-    };
-    if output.status.success() {
-        let line = text(&output.stdout);
-        Ok(if line.is_empty() {
-            format!("tunmux {} done", args.join(" "))
-        } else {
-            line
-        })
-    } else {
-        let line = text(&output.stderr);
-        Err(if line.is_empty() {
-            format!("tunmux {} failed ({})", args.join(" "), output.status)
-        } else {
-            line
-        })
-    }
-}
-
-/// `TUNMUX_BIN`, else a `tunmux` next to this executable, else `PATH`.
-fn tunmux_bin() -> std::path::PathBuf {
-    if let Some(bin) = std::env::var_os("TUNMUX_BIN") {
-        return bin.into();
-    }
-    std::env::current_exe()
-        .ok()
-        .map(|exe| exe.with_file_name("tunmux"))
-        .filter(|p| p.is_file())
-        .unwrap_or_else(|| "tunmux".into())
 }
 
 /// Saved state plus the last observation for each instance.

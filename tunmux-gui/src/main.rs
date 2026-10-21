@@ -14,7 +14,9 @@ mod model;
 #[cfg(target_os = "linux")]
 mod systray;
 mod tray;
+mod worker;
 
+use std::path::PathBuf;
 use std::sync::mpsc::{self, Receiver};
 use std::sync::{Arc, Mutex};
 
@@ -30,8 +32,21 @@ fn main() -> eframe::Result {
         .inspect_err(|e| eprintln!("tunmux-gui: logging disabled: {e}"))
         .ok();
     let args: Vec<String> = std::env::args().skip(1).collect();
+    if let Some(arg) = args
+        .iter()
+        .find(|a| !["--mock", "--hidden"].contains(&a.as_str()))
+    {
+        // Also stops a helper re-exec aimed at the wrong binary from
+        // opening a second window.
+        eprintln!("tunmux-gui: unknown argument {arg:?}; options: --mock, --hidden");
+        std::process::exit(2);
+    }
     let mock = args.iter().any(|a| a == "--mock");
     let hidden = args.iter().any(|a| a == "--hidden");
+    let cli = (!mock).then(find_cli).flatten();
+    if let Some(path) = &cli {
+        tunmux::shared::executable::set_cli_executable(path.clone());
+    }
 
     let window_ctx: WindowCtx = Arc::default();
     let repaint: live::Notify = {
@@ -58,7 +73,7 @@ fn main() -> eframe::Result {
         let live = (!mock).then(|| {
             let handle = systray.clone();
             let repaint = repaint.clone();
-            let live = live::Live::start(repaint.clone(), move |snap| {
+            let live = live::Live::start(move |snap| {
                 if let Some(h) = &handle {
                     let conns = snap.connections.clone();
                     h.update(|t| t.model.conns = conns);
@@ -77,11 +92,18 @@ fn main() -> eframe::Result {
         drop(actions_tx);
         (!mock).then(|| {
             let repaint = repaint.clone();
-            live::Live::start(repaint.clone(), move |_| repaint())
+            live::Live::start(move |_| repaint())
         })
     };
 
-    let mut app = TunmuxApp::new(live);
+    let worker = live
+        .is_some()
+        .then(|| worker::Worker::start(repaint.clone()));
+    let mut app = TunmuxApp::new(live, worker);
+    if !mock && cli.is_none() {
+        tracing::warn!("gui_cli_not_found");
+        app.toast_error("tunmux not found next to tunmux-gui or on PATH; connecting needs it");
+    }
     #[cfg(target_os = "linux")]
     let has_tray = systray.is_some();
     #[cfg(not(target_os = "linux"))]
@@ -115,6 +137,19 @@ fn main() -> eframe::Result {
         handle.shutdown().wait();
     }
     Ok(())
+}
+
+/// The tunmux CLI, which the library spawns for the privileged helper and
+/// proxy daemons: next to this binary first, so versions match, then PATH.
+fn find_cli() -> Option<PathBuf> {
+    let sibling = std::env::current_exe()
+        .ok()
+        .and_then(|exe| exe.parent().map(|dir| dir.join("tunmux")));
+    let on_path = std::env::var_os("PATH")
+        .into_iter()
+        .flat_map(|paths| std::env::split_paths(&paths).collect::<Vec<_>>())
+        .map(|dir| dir.join("tunmux"));
+    sibling.into_iter().chain(on_path).find(|p| p.is_file())
 }
 
 fn run_window(
