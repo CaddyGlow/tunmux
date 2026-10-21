@@ -1,5 +1,5 @@
 [workspace]
-members = [".", "xtask"]
+members = [".", "xtask", "tunmux-gui"]
 resolver = "2"
 
 [package]

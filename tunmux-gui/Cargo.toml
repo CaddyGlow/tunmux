@@ -1,0 +1,15 @@
+[package]
+name = "tunmux-gui"
+version = "0.1.0"
+edition = "2021"
+description = "Tray and egui front-end for tunmux"
+license = "MIT"
+publish = false
+
+[[bin]]
+name = "tunmux-gui"
+path = "src/main.rs"
+
+[dependencies]
+eframe = { version = "0.37", default-features = false, features = ["glow", "default_fonts", "wayland", "x11", "clipboard"] }
+egui = "0.37"
