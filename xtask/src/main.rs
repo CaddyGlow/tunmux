@@ -141,7 +141,7 @@ fn print_help() {
 Usage: cargo xtask <command>
 
 Commands:
-  bench-wg [OPTIONS]            Compare kernel WireGuard and GotaTun (Linux)
+  bench-wg [OPTIONS]            Compare kernel WireGuard, GotaTun and local proxy (Linux)
   dist [SELECTOR...] [OPTIONS]   Build and package release artifacts into dist/
   ci [STEP...] [OPTIONS]         Run repository checks (`cargo xtask ci --help`)
   targets                        List known targets and selector groups
