@@ -285,21 +285,21 @@ pub enum TopCommand {
         /// Choose the local SOCKS5 listening port for proxy mode
         ///
         /// Internal compatibility argument supplied by the parent. The effective listening port
-        /// comes from --config-b64; this value does not override the serialized configuration.
+        /// comes from the configuration on stdin; this value does not override it.
         #[arg(long)]
         socks_port: u16,
 
         /// Choose the local HTTP proxy listening port
         ///
         /// Internal compatibility argument supplied by the parent. The effective listening port
-        /// comes from --config-b64; this value does not override the serialized configuration.
+        /// comes from the configuration on stdin; this value does not override it.
         #[arg(long)]
         http_port: u16,
 
         /// Record proxy request activity in the instance log
         ///
         /// Internal compatibility argument supplied by the parent. The effective access-log setting
-        /// is read from --config-b64 and controls per-request proxy activity logging.
+        /// is read from the configuration on stdin and controls per-request proxy activity logging.
         #[arg(long)]
         proxy_access_log: bool,
 
@@ -316,13 +316,6 @@ pub enum TopCommand {
         /// the inherited logging configuration.
         #[arg(long)]
         log_file: String,
-
-        /// Read the local-proxy configuration as base64-encoded JSON
-        ///
-        /// Internal serialization of LocalProxyConfig, including WireGuard credentials. Supplied
-        /// by the launching process; do not include this value in diagnostic logs.
-        #[arg(long)]
-        config_b64: String,
     },
 
     /// Internal privileged service mode (hidden)
@@ -1699,8 +1692,6 @@ mod tests {
                 "/tmp/x.pid",
                 "--log-file",
                 "/tmp/x.log",
-                "--config-b64",
-                "e30=",
                 "--proxy-access-log",
             ],
         ];

@@ -97,8 +97,9 @@ pub fn spawn_daemon(
     let pid_file = pid_path.to_string_lossy();
     let log_file = log_path.to_string_lossy();
 
+    // The config holds WireGuard private keys. It travels over stdin so it never
+    // appears in argv, which every local user can read from /proc/<pid>/cmdline.
     let json = serde_json::to_string(cfg)?;
-    let config_b64 = base64::engine::general_purpose::STANDARD.encode(&json);
 
     let exe = self_executable()?;
 
@@ -125,18 +126,23 @@ pub fn spawn_daemon(
         &pid_file,
         "--log-file",
         &log_file,
-        "--config-b64",
-        &config_b64,
     ]);
     if proxy_access_log {
         cmd.arg("--proxy-access-log");
     }
 
     let mut child = cmd
+        .stdin(Stdio::piped())
         .stderr(Stdio::piped())
         .stdout(Stdio::null())
         .spawn()
         .context("failed to spawn local-proxy-daemon")?;
+
+    // Write the config and close stdin so the daemon sees EOF. A failed write means
+    // the child already exited; its stderr below carries the reason.
+    if let Some(mut stdin) = child.stdin.take() {
+        let _ = std::io::Write::write_all(&mut stdin, json.as_bytes());
+    }
 
     // Wait for the intermediate process (it exits after the second fork).
     let stderr_handle = child.stderr.take();
@@ -289,9 +295,12 @@ pub fn disconnect(
 
 /// Body of the hidden `local-proxy-daemon` subcommand: daemonize unless
 /// `TUNMUX_LOCAL_PROXY_FOREGROUND` is set, then serve until stopped.
-pub fn run_daemon(pid_file: &str, log_file: &str, config_b64: &str) -> anyhow::Result<()> {
-    // Decode config before daemonizing so errors surface to the shell.
-    let json = base64::engine::general_purpose::STANDARD.decode(config_b64)?;
+///
+/// The `LocalProxyConfig` JSON is read from stdin, written there by `spawn_daemon`.
+pub fn run_daemon(pid_file: &str, log_file: &str) -> anyhow::Result<()> {
+    // Read and decode config before daemonizing so errors surface to the shell.
+    let mut json = Vec::new();
+    std::io::Read::read_to_end(&mut std::io::stdin(), &mut json)?;
     let mut cfg: crate::wireguard::proxy_tunnel::LocalProxyConfig = serde_json::from_slice(&json)?;
     let dns_override_source =
         if let Some((source, dns_servers)) = local_proxy_dns_override_from_env() {

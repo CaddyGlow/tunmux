@@ -107,10 +107,8 @@ fn main() -> std::process::ExitCode {
             proxy_access_log: _,
             pid_file,
             log_file,
-            config_b64,
         } => {
-            if let Err(e) = tunmux_core::local_proxy::run_daemon(&pid_file, &log_file, &config_b64)
-            {
+            if let Err(e) = tunmux_core::local_proxy::run_daemon(&pid_file, &log_file) {
                 eprintln!("local-proxy-daemon error: {}", e);
                 return std::process::ExitCode::FAILURE;
             }
