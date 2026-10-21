@@ -4,6 +4,12 @@
 //! never read from the terminal. Connect, disconnect, logout and AirVPN login
 //! run the CLI paths, so their progress lines still go to stdout.
 
+mod system;
+mod tools;
+
+pub use system::*;
+pub use tools::*;
+
 use crate::cli::ConnectOptions;
 use crate::config::{AppConfig, Provider};
 use crate::wireguard::connection::ConnectionState;

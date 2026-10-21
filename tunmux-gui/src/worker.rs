@@ -3,7 +3,10 @@
 
 use std::sync::mpsc::{self, Receiver, Sender};
 
-use tunmux::api::{self, AccountInfo, ConnectSpec, Credentials, LoginOutcome, ServerInfo};
+use tunmux::api::{
+    self, AccountInfo, AirAction, AirOverview, ConnectSpec, Credentials, GeneralSettings,
+    LoginOutcome, ProtonPorts, ServerInfo, WgProfile,
+};
 use tunmux::config::Provider;
 
 use crate::live::Notify;
@@ -18,12 +21,29 @@ pub enum Job {
     Replace(String, Provider, ConnectSpec),
     Disconnect(String),
     DisconnectAll,
+    AirOverview,
+    /// Apply a change, then reload the overview.
+    Air(AirAction),
+    ProtonPorts,
+    ProtonRequestPort,
+    ProtonReleasePorts,
+    ProtonRenewCertificate,
+    WgProfiles,
+    WgImport(std::path::PathBuf, String),
+    WgRemove(String),
+    /// Write config.toml, then use it for later jobs.
+    SaveGeneral(GeneralSettings),
 }
 
 pub enum Event {
     Accounts(Vec<AccountInfo>),
     Servers(Provider, Result<Vec<ServerInfo>, String>),
     Login(Provider, Result<LoginOutcome, String>),
+    Air(Result<AirOverview, String>),
+    Proton(Result<ProtonPorts, String>),
+    /// Saved profiles; the wgconf server list follows them.
+    Wg(Result<Vec<WgProfile>, String>),
+    General(GeneralSettings),
     /// Outcome of an action, shown as a toast.
     Done(Result<String, String>),
     /// A job finished; the next one may start.
@@ -56,9 +76,9 @@ impl Worker {
                         return;
                     }
                 };
-                let config = tunmux::config::load_config();
+                let mut config = tunmux::config::load_config();
                 for job in job_rx {
-                    for event in runtime.block_on(run(job, &config)) {
+                    for event in runtime.block_on(run(job, &mut config)) {
                         let _ = event_tx.send(event);
                     }
                     let _ = event_tx.send(Event::Idle);
@@ -91,7 +111,7 @@ impl Worker {
     }
 }
 
-async fn run(job: Job, config: &tunmux::config::AppConfig) -> Vec<Event> {
+async fn run(job: Job, config: &mut tunmux::config::AppConfig) -> Vec<Event> {
     let text = |e: anyhow::Error| format!("{e:#}");
     match job {
         Job::Accounts => vec![Event::Accounts(api::accounts(config))],
@@ -134,7 +154,77 @@ async fn run(job: Job, config: &tunmux::config::AppConfig) -> Vec<Event> {
                 .map(|()| "Disconnected all".to_string())
                 .map_err(text),
         )],
+        Job::AirOverview => vec![Event::Air(api::airvpn_overview(config).await.map_err(text))],
+        Job::Air(action) => {
+            let mut events = Vec::new();
+            if let Err(error) = api::airvpn_apply(&action, config).await {
+                events.push(Event::Done(Err(text(error))));
+            }
+            events.push(Event::Air(api::airvpn_overview(config).await.map_err(text)));
+            events
+        }
+        Job::ProtonPorts => vec![proton(config)],
+        Job::ProtonRequestPort => vec![
+            Event::Done(
+                api::proton_request_port(config)
+                    .await
+                    .map(|()| "Forwarded port requested".to_string())
+                    .map_err(text),
+            ),
+            proton(config),
+        ],
+        Job::ProtonReleasePorts => vec![
+            Event::Done(
+                api::proton_release_ports(config)
+                    .await
+                    .map(|()| "Forwarded ports released".to_string())
+                    .map_err(text),
+            ),
+            proton(config),
+        ],
+        Job::ProtonRenewCertificate => vec![
+            Event::Done(
+                api::proton_renew_certificate(config)
+                    .await
+                    .map(|()| "Proton certificate renewed".to_string())
+                    .map_err(text),
+            ),
+            proton(config),
+        ],
+        Job::WgProfiles => vec![wg()],
+        Job::WgImport(path, name) => vec![
+            Event::Done(
+                api::wgconf_import(&path, &name)
+                    .map(|()| format!("Imported profile {}", name.trim()))
+                    .map_err(text),
+            ),
+            wg(),
+        ],
+        Job::WgRemove(name) => vec![
+            Event::Done(
+                api::wgconf_remove(&name)
+                    .map(|()| format!("Removed profile {name}"))
+                    .map_err(text),
+            ),
+            wg(),
+        ],
+        Job::SaveGeneral(settings) => {
+            let saved = api::save_general_settings(&settings).map_err(text);
+            *config = tunmux::config::load_config();
+            vec![
+                Event::Done(saved.map(|()| "Settings saved to config.toml".to_string())),
+                Event::General(GeneralSettings::from_config(config)),
+            ]
+        }
     }
+}
+
+fn proton(config: &tunmux::config::AppConfig) -> Event {
+    Event::Proton(api::proton_ports(config).map_err(|e| format!("{e:#}")))
+}
+
+fn wg() -> Event {
+    Event::Wg(api::wgconf_profiles().map_err(|e| format!("{e:#}")))
 }
 
 async fn connect(

@@ -5,12 +5,14 @@ use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
 
 use egui::{Align, Color32, Layout, RichText, Ui};
+use tunmux::api::{GeneralSettings, SystemStatus};
 
 use crate::live::Live;
 use crate::mock::{ConnectError, Store};
 use crate::model::{
     Backend, ConnectSpec, ConnectionView, Health, Mode, Provider, ServerView, SortKey, TrayState,
 };
+use crate::prefs::Prefs;
 use crate::tray::{self, TrayAction, TrayModel};
 use crate::worker::{Event, Job, Worker};
 
@@ -43,15 +45,22 @@ pub struct LoginForm {
 }
 
 pub struct Settings {
-    pub default_mode: Mode,
-    pub backend: Backend,
-    pub autoconnect: bool,
+    /// GUI-only settings, saved to gui.toml on change.
+    pub prefs: Prefs,
     pub start_at_login: bool,
-    pub start_in_tray: bool,
-    pub close_to_tray: bool,
-    pub credential_store: &'static str,
-    pub log_level: &'static str,
-    pub service_installed: bool,
+    /// config.toml `[general]`; changes are saved through the worker.
+    pub general: GeneralSettings,
+    pub credential_store: String,
+    /// Probed when the settings window opens.
+    pub system: Option<SystemStatus>,
+}
+
+/// A tab of the provider tools window.
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Tool {
+    AirVpn,
+    Proton,
+    WgConf,
 }
 
 pub struct TunmuxApp {
@@ -81,6 +90,9 @@ pub struct TunmuxApp {
     /// Providers whose server list was requested, and load errors.
     servers_requested: HashSet<Provider>,
     server_errors: HashMap<Provider, String>,
+    /// Tool tabs whose data was requested, and load errors.
+    tools_requested: HashSet<Tool>,
+    pub tool_errors: HashMap<Tool, String>,
     #[cfg(target_os = "linux")]
     pub systray: Option<crate::systray::Handle>,
     tray_signature: String,
@@ -90,7 +102,7 @@ pub struct TunmuxApp {
 }
 
 impl TunmuxApp {
-    pub fn new(live: Option<Live>, mut worker: Option<Worker>) -> Self {
+    pub fn new(live: Option<Live>, mut worker: Option<Worker>, prefs: Prefs) -> Self {
         let mut favorites = HashSet::new();
         if live.is_none() {
             favorites.insert((Provider::AirVpn, "Hydrus".to_string()));
@@ -108,7 +120,10 @@ impl TunmuxApp {
             country: None,
             search: String::new(),
             tag: None,
-            spec: ConnectSpec::default(),
+            spec: ConnectSpec {
+                mode: prefs.default_mode,
+                ..ConnectSpec::default()
+            },
             sort: SortKey::Load,
             sort_desc: false,
             favorites,
@@ -120,22 +135,24 @@ impl TunmuxApp {
             login: LoginForm::default(),
             pending_replace: None,
             toasts: Vec::new(),
-            settings: Settings {
-                default_mode: Mode::Direct,
-                backend: Backend::Auto,
-                autoconnect: false,
-                start_at_login: true,
-                start_in_tray: true,
-                close_to_tray: true,
-                credential_store: "auto",
-                log_level: "info",
-                service_installed: false,
+            settings: {
+                let config = tunmux::config::load_config();
+                Settings {
+                    prefs,
+                    start_at_login: crate::prefs::start_at_login(),
+                    general: GeneralSettings::from_config(&config),
+                    credential_store: format!("{:?}", config.general.credential_store)
+                        .to_lowercase(),
+                    system: None,
+                }
             },
             actions: Vec::new(),
             live,
             worker,
             servers_requested: HashSet::new(),
             server_errors: HashMap::new(),
+            tools_requested: HashSet::new(),
+            tool_errors: HashMap::new(),
             #[cfg(target_os = "linux")]
             systray: None,
             tray_signature: String::new(),
@@ -258,10 +275,56 @@ impl TunmuxApp {
                     Err(error) => self.login.error = Some(error),
                 }
             }
+            Event::Air(result) => self.tool_loaded(Tool::AirVpn, result, |store, air| {
+                store.air = Some(air);
+            }),
+            Event::Proton(result) => self.tool_loaded(Tool::Proton, result, |store, ports| {
+                store.proton = Some(ports);
+            }),
+            Event::Wg(result) => {
+                self.tool_loaded(Tool::WgConf, result, |store, profiles| {
+                    store.wg_profiles = Some(profiles);
+                });
+                // The profiles are the wgconf server list and account detail.
+                self.request_servers(Provider::WgConf);
+                self.send(Job::Accounts);
+            }
+            Event::General(general) => self.settings.general = general,
             Event::Done(Ok(text)) => self.toast(text),
             Event::Done(Err(text)) => self.toast_error(text),
             Event::Idle => {}
         }
+    }
+
+    fn tool_loaded<T>(
+        &mut self,
+        tool: Tool,
+        result: Result<T, String>,
+        store: impl FnOnce(&mut Store, T),
+    ) {
+        match result {
+            Ok(data) => {
+                self.tool_errors.remove(&tool);
+                store(&mut self.backend, data);
+            }
+            Err(error) => {
+                self.tool_errors.insert(tool, error);
+            }
+        }
+    }
+
+    /// Load a tool tab's data once; `force` reloads it.
+    pub fn request_tool(&mut self, tool: Tool, force: bool) {
+        if self.live.is_none() || (!force && self.tools_requested.contains(&tool)) {
+            return;
+        }
+        self.tools_requested.insert(tool);
+        self.tool_errors.remove(&tool);
+        self.send(match tool {
+            Tool::AirVpn => Job::AirOverview,
+            Tool::Proton => Job::ProtonPorts,
+            Tool::WgConf => Job::WgProfiles,
+        });
     }
 
     pub fn request_servers(&mut self, p: Provider) {

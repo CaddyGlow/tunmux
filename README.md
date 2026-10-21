@@ -135,6 +135,27 @@ Useful connection options:
 - `--disable-ipv6`: block host IPv6 egress for an IPv4-only direct kernel tunnel.
 - `--allow-lan`: bypass directly attached LANs in macOS helper-backed direct mode.
 
+### Desktop app
+
+`tunmux-gui` is a window and system tray for the same accounts and connections.
+On Linux the tray uses StatusNotifierItem (KDE, waybar, GNOME with the
+AppIndicator extension). Build both binaries so the GUI can find `tunmux` next
+to it, otherwise on `PATH`:
+
+```sh
+cargo build --release --locked -p tunmux -p tunmux-gui
+target/release/tunmux-gui            # --hidden: start in the tray only
+```
+
+The tray shows connection status, quick connect, recent servers, and
+disconnect. The window logs in, browses and connects to servers in each mode,
+and has provider tools for AirVPN ports, devices and API keys, Proton port
+forwarding and certificate renewal, and `wgconf` profiles. Settings save the
+backend and proxy access log to `config.toml`; GUI-only options go to
+`~/.config/tunmux/gui.toml`, and "Start at login" writes an XDG autostart entry.
+Started without a terminal, the privileged helper asks for elevation through
+`run0` or `pkexec`. `--mock` shows sample data without touching any account.
+
 ## Configuration and diagnostics
 
 Optional defaults live in `~/.config/tunmux/config.toml`:

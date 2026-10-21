@@ -85,6 +85,14 @@ fn installation() -> anyhow::Result<Installation> {
 pub fn installed() -> bool {
     cfg!(target_os = "macos") && Path::new(PLIST).exists()
 }
+/// Whether the privileged helper is installed as a system service.
+pub fn system_service_installed() -> anyhow::Result<bool> {
+    if cfg!(target_os = "macos") {
+        return Ok(installed());
+    }
+    // The socket unit is world-readable; the install manifest may not be.
+    Ok(LinuxPaths::system().units.join(LINUX_SOCKET).exists())
+}
 fn dispatch_macos(command: ServiceCommand) -> anyhow::Result<()> {
     anyhow::ensure!(
         cfg!(target_os = "macos"),

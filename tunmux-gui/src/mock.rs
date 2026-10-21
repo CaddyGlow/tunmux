@@ -5,6 +5,10 @@
 
 use std::time::{Duration, Instant, SystemTime};
 
+use tunmux::api::{
+    AirAction, AirApiKey, AirDevice, AirOverview, AirPort, ProtonForward, ProtonPorts, WgProfile,
+};
+
 use crate::model::{
     AccountView, Backend, ConnectSpec, ConnectionView, Health, LoginState, Mode, Provider,
     ServerView,
@@ -18,34 +22,15 @@ pub enum ConnectError {
     NotLoggedIn(Provider),
 }
 
-pub struct AirPort {
-    pub port: u16,
-    pub protocol: &'static str,
-    pub device: &'static str,
-    pub enabled: bool,
-}
-
-pub struct ProtonForward {
-    pub instance: String,
-    pub port: u16,
-    pub expires_in: Duration,
-}
-
-pub struct WgProfile {
-    pub name: String,
-    pub endpoint: String,
-}
-
 pub struct Store {
     pub accounts: Vec<AccountView>,
     pub servers: Vec<ServerView>,
     pub connections: Vec<ConnectionView>,
     pub recent: Vec<(Provider, String, Mode)>,
-    pub air_ports: Vec<AirPort>,
-    pub air_devices: Vec<&'static str>,
-    pub air_api_keys: Vec<&'static str>,
-    pub proton_forwards: Vec<ProtonForward>,
-    pub wg_profiles: Vec<WgProfile>,
+    /// Provider tool data; `None` until loaded.
+    pub air: Option<AirOverview>,
+    pub proton: Option<ProtonPorts>,
+    pub wg_profiles: Option<Vec<WgProfile>>,
     pub corrupt_states: Vec<String>,
     last_tick: Instant,
 }
@@ -65,11 +50,9 @@ impl Store {
             servers: Vec::new(),
             connections: Vec::new(),
             recent: Vec::new(),
-            air_ports: Vec::new(),
-            air_devices: Vec::new(),
-            air_api_keys: Vec::new(),
-            proton_forwards: Vec::new(),
-            wg_profiles: Vec::new(),
+            air: None,
+            proton: None,
+            wg_profiles: None,
             corrupt_states: Vec::new(),
             last_tick: Instant::now(),
         }
@@ -136,33 +119,41 @@ impl Store {
                 (Provider::AirVpn, "Hydrus".into(), Mode::Direct),
                 (Provider::Proton, "CH#12".into(), Mode::LocalProxy),
             ],
-            air_ports: vec![
-                AirPort {
-                    port: 41337,
-                    protocol: "tcp+udp",
-                    device: "laptop",
-                    enabled: true,
-                },
-                AirPort {
-                    port: 51820,
-                    protocol: "udp",
-                    device: "default",
-                    enabled: false,
-                },
-            ],
-            air_devices: vec!["default", "laptop", "phone"],
-            air_api_keys: vec!["tunmux-gui (read)", "homelab"],
-            proton_forwards: Vec::new(),
-            wg_profiles: vec![
+            air: Some(AirOverview {
+                ports: vec![
+                    air_port(41337, "both", "laptop", true),
+                    air_port(51820, "udp", "default", false),
+                ],
+                devices: ["default", "laptop", "phone"]
+                    .iter()
+                    .enumerate()
+                    .map(|(i, name)| AirDevice {
+                        id: format!("dev{i}"),
+                        name: (*name).into(),
+                        wg_ipv4: format!("10.128.0.{}", i + 2),
+                    })
+                    .collect(),
+                api_keys: vec![AirApiKey {
+                    id: "key0".into(),
+                    name: "homelab".into(),
+                    secret_short: "3f9a...".into(),
+                }],
+            }),
+            proton: Some(ProtonPorts {
+                forwards: Vec::new(),
+                daemon_running: false,
+                certificate_expires: Some(SystemTime::now() + Duration::from_secs(6 * 86_400)),
+            }),
+            wg_profiles: Some(vec![
                 WgProfile {
                     name: "home".into(),
-                    endpoint: "vpn.example.net:51820".into(),
+                    endpoint: Some("vpn.example.net:51820".into()),
                 },
                 WgProfile {
                     name: "office".into(),
-                    endpoint: "203.0.113.7:51820".into(),
+                    endpoint: Some("203.0.113.7:51820".into()),
                 },
-            ],
+            ]),
             corrupt_states: Vec::new(),
             last_tick: Instant::now(),
         };
@@ -432,18 +423,86 @@ impl Store {
     }
 
     pub fn proton_forward(&mut self) {
-        if let Some(c) = self
+        let Some(instance) = self
             .connections
             .iter()
             .find(|c| c.provider == Provider::Proton)
-        {
-            let instance = c.instance.clone();
-            self.proton_forwards.push(ProtonForward {
-                instance,
-                port: 47000 + self.proton_forwards.len() as u16 * 13,
-                expires_in: Duration::from_secs(60),
+            .map(|c| c.instance.clone())
+        else {
+            return;
+        };
+        let proton = self.proton.get_or_insert_with(ProtonPorts::default);
+        let port = 47000 + proton.forwards.len() as u16 * 13;
+        for protocol in ["tcp", "udp"] {
+            proton.forwards.push(ProtonForward {
+                instance: instance.clone(),
+                protocol: protocol.into(),
+                public_port: port,
+                expires_at: SystemTime::now() + Duration::from_secs(60),
             });
         }
+        proton.daemon_running = true;
+    }
+
+    pub fn proton_release(&mut self) {
+        if let Some(proton) = &mut self.proton {
+            proton.forwards.clear();
+            proton.daemon_running = false;
+        }
+    }
+
+    /// Sample-data version of `tunmux::api::airvpn_apply`.
+    pub fn air_apply(&mut self, action: &AirAction) {
+        let Some(air) = &mut self.air else { return };
+        match action {
+            AirAction::AddPort(port) => {
+                let port = if *port == 0 {
+                    40000 + air.ports.len() as u16 * 111
+                } else {
+                    *port
+                };
+                air.ports.push(air_port(port, "both", "default", true));
+            }
+            AirAction::RemovePort(port) => air.ports.retain(|p| p.port != *port),
+            AirAction::SetProtocol(port, protocol) => {
+                if let Some(p) = air.ports.iter_mut().find(|p| p.port == *port) {
+                    p.protocol = protocol.clone();
+                }
+            }
+            AirAction::AddDevice => {
+                let n = air.devices.len();
+                air.devices.push(AirDevice {
+                    id: format!("dev{n}"),
+                    name: "New device".into(),
+                    wg_ipv4: format!("10.128.0.{}", n + 2),
+                });
+            }
+            AirAction::RenameDevice { id, name } => {
+                if let Some(d) = air.devices.iter_mut().find(|d| d.id == *id) {
+                    d.name = name.clone();
+                }
+            }
+            AirAction::DeleteDevice(id) => air.devices.retain(|d| d.id != *id),
+            AirAction::AddApiKey => {
+                let n = air.api_keys.len();
+                air.api_keys.push(AirApiKey {
+                    id: format!("key{n}"),
+                    name: "New API key".into(),
+                    secret_short: "0c1d...".into(),
+                });
+            }
+            AirAction::DeleteApiKey(id) => air.api_keys.retain(|k| k.id != *id),
+        }
+    }
+}
+
+fn air_port(port: u16, protocol: &str, device: &str, enabled: bool) -> AirPort {
+    AirPort {
+        port,
+        protocol: protocol.into(),
+        local_port: 0,
+        enabled,
+        device: device.into(),
     }
 }
 

@@ -178,6 +178,12 @@ fn cmd_info(config: &AppConfig) -> anyhow::Result<()> {
 }
 
 async fn cmd_renew(config: &AppConfig) -> anyhow::Result<()> {
+    renew_certificate(config).await?;
+    println!("Proton VPN certificate renewed.");
+    Ok(())
+}
+
+pub(crate) async fn renew_certificate(config: &AppConfig) -> anyhow::Result<()> {
     let mut session: models::session::Session = config::load_session(PROVIDER, config)?;
     let keep_port_forwarding = session.certificate_port_forwarding;
     renew_proton_certificate(&mut session, config, keep_port_forwarding)
@@ -187,9 +193,7 @@ async fn cmd_renew(config: &AppConfig) -> anyhow::Result<()> {
                 "could not renew Proton certificate from saved session (token may be expired): {}. run `tunmux proton login <username>`",
                 err
             )
-        })?;
-    println!("Proton VPN certificate renewed.");
-    Ok(())
+        })
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -283,6 +287,44 @@ async fn cmd_ports(action: ProtonPortAction, config: &AppConfig) -> anyhow::Resu
             .await
         }
     }
+}
+
+/// Unexpired mappings, daemon liveness and certificate expiry, for the API.
+pub(crate) fn port_forward_status(config: &AppConfig) -> anyhow::Result<crate::api::ProtonPorts> {
+    let now = current_unix_timestamp()? as u64;
+    let at = |secs: u64| UNIX_EPOCH + Duration::from_secs(secs);
+    let forwards = load_proton_port_forward_state()?
+        .mappings
+        .into_iter()
+        .filter(|mapping| mapping.expires_at_unix > now)
+        .map(|mapping| crate::api::ProtonForward {
+            instance: mapping.instance_name,
+            protocol: mapping.protocol.to_string(),
+            public_port: mapping.public_port,
+            expires_at: at(mapping.expires_at_unix),
+        })
+        .collect();
+    let daemon_running = read_proton_ports_daemon_pid()?.is_some_and(process_alive);
+    let certificate_expires = config::load_session::<models::session::Session>(PROVIDER, config)
+        .ok()
+        .and_then(|session| proton_certificate_not_after_unix(&session))
+        .and_then(|secs| u64::try_from(secs).ok())
+        .map(at);
+    Ok(crate::api::ProtonPorts {
+        forwards,
+        daemon_running,
+        certificate_expires,
+    })
+}
+
+/// `ports request` with the CLI defaults: both protocols, an assigned port,
+/// a 60 s lease renewed by the daemon.
+pub(crate) async fn request_port(config: &AppConfig) -> anyhow::Result<()> {
+    cmd_ports_request("both", 0, 1, 60, false, config).await
+}
+
+pub(crate) async fn release_ports(config: &AppConfig) -> anyhow::Result<()> {
+    cmd_ports_release(config).await
 }
 
 fn cmd_ports_list(current_only: bool, json_output: bool) -> anyhow::Result<()> {

@@ -11,6 +11,7 @@ mod dialogs;
 mod live;
 mod mock;
 mod model;
+mod prefs;
 #[cfg(target_os = "linux")]
 mod systray;
 mod tray;
@@ -27,6 +28,12 @@ use tray::TrayAction;
 type WindowCtx = Arc<Mutex<Option<egui::Context>>>;
 
 fn main() -> eframe::Result {
+    let prefs = prefs::Prefs::load();
+    if let Some(filter) = prefs.log_filter() {
+        if let Err(e) = tunmux::logging::configure(false, Some(&filter)) {
+            eprintln!("tunmux-gui: log level {:?} ignored: {e}", prefs.log_level);
+        }
+    }
     // Library code logs through `tracing`; keep the guard to flush on exit.
     let _logging = tunmux::logging::init_terminal(false)
         .inspect_err(|e| eprintln!("tunmux-gui: logging disabled: {e}"))
@@ -99,7 +106,7 @@ fn main() -> eframe::Result {
     let worker = live
         .is_some()
         .then(|| worker::Worker::start(repaint.clone()));
-    let mut app = TunmuxApp::new(live, worker);
+    let mut app = TunmuxApp::new(live, worker, prefs);
     if !mock && cli.is_none() {
         tracing::warn!("gui_cli_not_found");
         app.toast_error("tunmux not found next to tunmux-gui or on PATH; connecting needs it");
@@ -118,7 +125,7 @@ fn main() -> eframe::Result {
     loop {
         if open {
             run_window(&mut app, &actions, &window_ctx)?;
-            if app.quit || !has_tray || !app.settings.close_to_tray {
+            if app.quit || !has_tray || !app.settings.prefs.close_to_tray {
                 break;
             }
             open = false;

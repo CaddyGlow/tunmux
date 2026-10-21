@@ -534,6 +534,44 @@ pub(crate) fn profile_names() -> anyhow::Result<Vec<String>> {
     list_profiles()
 }
 
+/// Saved profiles with the peer endpoint, for the API.
+pub(crate) fn profiles() -> anyhow::Result<Vec<crate::api::WgProfile>> {
+    list_profiles()?
+        .into_iter()
+        .map(|name| {
+            let text = load_profile_content(&name)?;
+            let endpoint = wireguard::config::parse_config(&text)
+                .ok()
+                .and_then(|parsed| {
+                    select_peer_with_endpoint(&parsed)
+                        .ok()
+                        .and_then(|peer| peer.endpoint.clone())
+                });
+            Ok(crate::api::WgProfile { name, endpoint })
+        })
+        .collect()
+}
+
+/// Save the config at `path` as profile `name` once it parses with a peer
+/// endpoint; an existing profile of that name is not replaced.
+pub(crate) fn import_profile(path: &Path, name: &str) -> anyhow::Result<()> {
+    let name = validate_profile_name(name)?;
+    anyhow::ensure!(
+        !list_profiles()?.contains(&name),
+        "a profile named {name} already exists"
+    );
+    let text =
+        fs::read_to_string(path).with_context(|| format!("failed to read {}", path.display()))?;
+    let parsed = wireguard::config::parse_config(&text)
+        .with_context(|| format!("{} is not a WireGuard config", path.display()))?;
+    select_peer_with_endpoint(&parsed)?;
+    save_profile_content(&name, &text)
+}
+
+pub(crate) fn delete_profile(name: &str) -> anyhow::Result<()> {
+    remove_profile(name)
+}
+
 /// Saved profiles, offered as servers; connect takes the profile name.
 pub(crate) fn server_list() -> anyhow::Result<Vec<crate::api::ServerInfo>> {
     Ok(list_profiles()?

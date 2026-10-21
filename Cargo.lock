@@ -5073,6 +5073,7 @@ dependencies = [
  "indexmap",
  "toml_datetime",
  "toml_parser",
+ "toml_writer",
  "winnow",
 ]
 
@@ -5293,6 +5294,7 @@ dependencies = [
  "time",
  "tokio",
  "toml",
+ "toml_edit",
  "tracing",
  "tracing-appender",
  "tracing-log",
@@ -5310,7 +5312,9 @@ dependencies = [
  "egui",
  "ksni",
  "rustix 1.1.5",
+ "serde",
  "tokio",
+ "toml",
  "tracing",
  "tunmux",
 ]

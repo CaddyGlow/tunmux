@@ -119,7 +119,7 @@ fn refresh(
         }
     };
     let dir = tunmux::config::connections_dir();
-    let helper_up = kind == Refresh::Full || helper_running();
+    let helper_up = kind == Refresh::Full || tunmux::api::helper_process_running();
     let mut next = HashMap::new();
     for state in states {
         let name = state.instance_name.clone();
@@ -171,29 +171,6 @@ fn interface_missing(state: &ConnectionState) -> bool {
 
 #[cfg(not(target_os = "linux"))]
 fn interface_missing(_state: &ConnectionState) -> bool {
-    false
-}
-
-/// Whether a `tunmux privileged --serve` process exists, read from /proc
-/// so the check itself never activates the helper socket.
-#[cfg(target_os = "linux")]
-fn helper_running() -> bool {
-    let Ok(entries) = std::fs::read_dir("/proc") else {
-        return false;
-    };
-    entries.flatten().any(|entry| {
-        let Ok(cmdline) = std::fs::read(entry.path().join("cmdline")) else {
-            return false;
-        };
-        let args: Vec<&[u8]> = cmdline.split(|b| *b == 0).collect();
-        args.first().is_some_and(|a| a.ends_with(b"tunmux"))
-            && args.iter().any(|a| *a == b"privileged")
-            && args.iter().any(|a| *a == b"--serve")
-    })
-}
-
-#[cfg(not(target_os = "linux"))]
-fn helper_running() -> bool {
     false
 }
 
