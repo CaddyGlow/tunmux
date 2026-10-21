@@ -294,25 +294,13 @@ pub(super) fn dispatch(
                     };
                 }
             };
+            // The registry holds only pids this service spawned, keyed by
+            // start time, so a reused pid fails here. The executable name is
+            // not checked: packaging may rename or wrap the binary.
             if !managed {
                 return PrivilegedResponse::Error {
                     code: "Authorization".into(),
                     message: format!("pid {} is not managed by privileged service", pid),
-                };
-            }
-            if let Ok(exe) = std::fs::read_link(format!("/proc/{}/exe", pid)) {
-                let exe_str = exe.to_string_lossy();
-                let exe_name = exe_str.strip_suffix(" (deleted)").unwrap_or(&exe_str);
-                if !exe_name.ends_with("/tunmux") {
-                    return PrivilegedResponse::Error {
-                        code: "Authorization".into(),
-                        message: "target pid not tunmux".into(),
-                    };
-                }
-            } else {
-                return PrivilegedResponse::Error {
-                    code: "Kernel".into(),
-                    message: "failed reading /proc/<pid>/exe".into(),
                 };
             }
 

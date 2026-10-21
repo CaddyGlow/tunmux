@@ -529,6 +529,34 @@ mod tests {
     }
 
     #[test]
+    fn kill_pid_signals_registered_process_whatever_its_executable() {
+        with_managed_pid_registry_dir(|| {
+            let mut child = std::process::Command::new("sleep")
+                .arg("30")
+                .spawn()
+                .expect("spawn sleep");
+            register_managed_pid(child.id()).expect("register managed pid");
+
+            let mut state = ControlState::new(false);
+            let response = dispatch(
+                PrivilegedRequest::KillPid {
+                    pid: child.id(),
+                    signal: KillSignal::Term,
+                },
+                &mut state,
+            );
+
+            assert!(
+                matches!(response, PrivilegedResponse::Unit),
+                "expected success, got {:?}",
+                response
+            );
+            let status = child.wait().expect("wait for sleep");
+            assert!(!status.success(), "sleep should end by signal");
+        });
+    }
+
+    #[test]
     fn kill_pid_rejects_stale_registry_entry_and_cleans_file() {
         with_managed_pid_registry_dir(|| {
             let pid = std::process::id();
