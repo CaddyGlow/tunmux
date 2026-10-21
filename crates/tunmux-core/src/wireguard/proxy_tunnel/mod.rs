@@ -494,18 +494,40 @@ pub async fn run_local_proxy(
 
 fn tune_udp_buffers(udp: &UdpSocket) {
     let sock = socket2::SockRef::from(udp);
-    if let Err(error) = sock.set_recv_buffer_size(UDP_SOCKET_BUF) {
-        warn!(error = %error, "udp_recv_buffer_resize_failed");
+    // With CAP_NET_ADMIN the buffers may exceed rmem_max/wmem_max.
+    #[cfg(target_os = "linux")]
+    let forced = {
+        use nix::sys::socket::{setsockopt, sockopt};
+        setsockopt(udp, sockopt::RcvBufForce, &UDP_SOCKET_BUF).is_ok()
+            && setsockopt(udp, sockopt::SndBufForce, &UDP_SOCKET_BUF).is_ok()
+    };
+    #[cfg(not(target_os = "linux"))]
+    let forced = false;
+    if !forced {
+        if let Err(error) = sock.set_recv_buffer_size(UDP_SOCKET_BUF) {
+            warn!(error = %error, "udp_recv_buffer_resize_failed");
+        }
+        if let Err(error) = sock.set_send_buffer_size(UDP_SOCKET_BUF) {
+            warn!(error = %error, "udp_send_buffer_resize_failed");
+        }
     }
-    if let Err(error) = sock.set_send_buffer_size(UDP_SOCKET_BUF) {
-        warn!(error = %error, "udp_send_buffer_resize_failed");
-    }
+    let recv_buf = sock.recv_buffer_size().ok();
     info!(
         requested = UDP_SOCKET_BUF,
-        recv_buf = sock.recv_buffer_size().ok(),
+        forced,
+        recv_buf,
         send_buf = sock.send_buffer_size().ok(),
         "local_proxy_udp_buffers"
     );
+    // Linux reports twice the size it granted, so this fires below rmem_max = 4 MiB.
+    if let Some(granted) = recv_buf.filter(|&granted| granted < UDP_SOCKET_BUF) {
+        warn!(
+            requested = UDP_SOCKET_BUF,
+            granted,
+            hint = "sysctl -w net.core.rmem_max=8388608 net.core.wmem_max=8388608",
+            "local_proxy_udp_recv_buffer_capped: fast downloads may drop packets"
+        );
+    }
 }
 
 fn network_len(result: TunnResult<'_>) -> Option<usize> {
