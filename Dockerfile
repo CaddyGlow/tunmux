@@ -3,14 +3,9 @@ FROM rust:1-bookworm AS builder
 WORKDIR /app
 
 COPY Cargo.toml Cargo.lock rust-toolchain.toml ./
-COPY src ./src
-COPY launchd ./launchd
-COPY systemd ./systemd
-COPY benches ./benches
-COPY tests ./tests
+COPY crates ./crates
 COPY LICENSE README.md ./
 COPY xtask ./xtask
-COPY tunmux-build-version ./tunmux-build-version
 
 RUN cargo build --release --locked
 

@@ -6,7 +6,7 @@ publish = false
 description = "Release build automation for tunmux"
 
 [dependencies]
-tunmux-build-version = { path = "../tunmux-build-version" }
+tunmux-build-version.workspace = true
 anyhow = "1"
 serde_json = "1"
 sha2 = "0.10"

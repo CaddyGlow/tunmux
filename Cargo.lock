@@ -5258,7 +5258,6 @@ version = "0.1.0"
 dependencies = [
  "aes",
  "anyhow",
- "arboard",
  "aws-lc-rs",
  "base64 0.23.1",
  "bcrypt",
@@ -5273,12 +5272,9 @@ dependencies = [
  "daemonize2",
  "dbus-secret-service",
  "ed25519-dalek",
- "eframe",
- "egui",
  "gotatun",
  "hickory-resolver",
  "keyring",
- "ksni",
  "log",
  "nix",
  "num-bigint",
@@ -5289,7 +5285,6 @@ dependencies = [
  "roxmltree",
  "rpassword",
  "rsa",
- "rustix 1.1.5",
  "scraper",
  "serde",
  "serde_json",
@@ -5311,6 +5306,24 @@ dependencies = [
 [[package]]
 name = "tunmux-build-version"
 version = "0.1.0"
+
+[[package]]
+name = "tunmux-gui"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "arboard",
+ "eframe",
+ "egui",
+ "ksni",
+ "rustix 1.1.5",
+ "serde",
+ "tokio",
+ "toml",
+ "tracing",
+ "tunmux",
+ "tunmux-build-version",
+]
 
 [[package]]
 name = "type-map"

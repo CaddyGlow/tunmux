@@ -162,7 +162,12 @@ fn clippy() -> Result<()> {
 
 fn test() -> Result<()> {
     run(&mut cargo(&["test", "--locked"]))?;
-    run(&mut cargo(&["test", "--locked", "--all-features"]))
+    run(&mut cargo(&[
+        "test",
+        "--locked",
+        "--workspace",
+        "--all-features",
+    ]))
 }
 
 fn features(only: &[String]) -> Result<()> {

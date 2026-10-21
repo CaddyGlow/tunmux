@@ -5,7 +5,14 @@ Guidance for coding agents working in `tunmux`.
 ## 1) Project Snapshot
 
 - Language: Rust (edition 2021); use the toolchain pinned in `rust-toolchain.toml`.
-- Crate layout: single package with library + binary (`src/lib.rs`, `src/main.rs`).
+- Crate layout: Cargo workspace with packages under `crates/` and automation
+  in `xtask/`.
+  `crates/tunmux` holds the library and CLI (`src/lib.rs`, `src/main.rs`),
+  `crates/tunmux-gui` the egui and tray front-end on the library API, and
+  `crates/tunmux-build-version` derives version strings from git. Root
+  commands default to `crates/tunmux`; pass `-p tunmux-gui` or `--workspace`
+  for the GUI.
+  Paths in sections 3 and 5 are relative to `crates/tunmux/`.
 - Domain: multi-provider VPN CLI (`proton`, `airvpn`, `mullvad`, `ivpn`, `wgconf`).
 - Platforms:
   - Linux: direct, namespace proxy, rootless local-proxy, and systemd service installation.
@@ -26,7 +33,8 @@ Guidance for coding agents working in `tunmux`.
 ### Environment
 
 - The patched `smoltcp` comes from the `CaddyGlow/smoltcp` fork through a pinned
-  `[patch.crates-io]` git revision in `Cargo.toml`; bump `rev` to pick up fork changes.
+  `[patch.crates-io]` git revision in the root `Cargo.toml`; bump `rev` to pick
+  up fork changes.
 - On the maintainer's Linux setup, `.envrc` selects the shared Nix Android shell.
   Run development tools through it, for example:
 

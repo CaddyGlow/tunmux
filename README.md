@@ -139,12 +139,12 @@ Useful connection options:
 
 `tunmux-gui` is a window and system tray for the same accounts and connections.
 On Linux the tray uses StatusNotifierItem (KDE, waybar, GNOME with the
-AppIndicator extension). It is behind the `gui` feature; building with it
-produces both binaries, so the GUI finds `tunmux` next to it, otherwise on
+AppIndicator extension). It is the `tunmux-gui` workspace package; build it
+together with `tunmux` so the GUI finds the CLI next to it, otherwise on
 `PATH`:
 
 ```sh
-cargo build --release --locked --features gui
+cargo build --release --locked -p tunmux -p tunmux-gui
 target/release/tunmux-gui            # --hidden: start in the tray only
 ```
 
@@ -184,7 +184,7 @@ data, connection state, and saved WireGuard profiles also live under
 `credential_store = "keyring"` selects the optional native backend when compiled
 in: Secret Service on Linux (requires an unlocked desktop keyring and session
 D-Bus), or Keychain on macOS.
-See [src/config.rs](src/config.rs) for the complete configuration schema.
+See [crates/tunmux/src/config.rs](crates/tunmux/src/config.rs) for the complete configuration schema.
 
 ```sh
 tunmux -v status
@@ -267,7 +267,6 @@ Features are additive; use
 | `all-providers` | All five providers |
 | `proxy` | Linux network-namespace proxy support; not required for rootless local-proxy mode |
 | `keyring` | Optional credential storage through the keyring crate |
-| `gui` | The `tunmux-gui` desktop binary (egui window and system tray) |
 | `crypto-rustcrypto` | Pure Rust RSA encryption for AirVPN (default) |
 | `crypto-aws-lc` | AWS-LC RSA encryption for AirVPN; takes precedence when both crypto features are enabled |
 
@@ -301,18 +300,21 @@ AWS-LC alone does not remove the lockfile finding.
 
 ## Codebase and contributions
 
-The Rust 2021 package provides a library and CLI binary:
+The Cargo workspace keeps its packages under `crates/`: `crates/tunmux` is the
+library and `tunmux` CLI, `crates/tunmux-gui` the desktop app,
+`crates/tunmux-build-version` derives version strings from git, and `xtask/`
+holds the build and CI automation.
 
 | Location | Responsibility |
 | --- | --- |
-| [src/main.rs](src/main.rs), [src/cli.rs](src/cli.rs), [src/lib.rs](src/lib.rs) | Command entry point, Clap arguments, library exports |
-| `src/{proton,airvpn,mullvad,ivpn,wgconf}/` | Provider APIs, models, and command handlers |
-| [src/wireguard/](src/wireguard/) | Configuration, backends, connection state, health, and rootless proxy tunnel |
-| [src/shared/](src/shared/) | Credentials, hooks, persistence, and common connection operations |
-| `src/privileged*`, `src/userspace_helper*` | Privileged requests, embedded GotaTun helper, network setup and recovery |
-| [src/proxy/](src/proxy/), [src/netns.rs](src/netns.rs) | Linux namespace proxies |
-| [src/service.rs](src/service.rs), [src/automation.rs](src/automation.rs) | Service installation and automatic connections |
-| [tests/](tests/), [benches/](benches/), [scripts/](scripts/) | Integration tests, offline benchmarks, and validation tools |
+| [crates/tunmux/src/main.rs](crates/tunmux/src/main.rs), [crates/tunmux/src/cli.rs](crates/tunmux/src/cli.rs), [crates/tunmux/src/lib.rs](crates/tunmux/src/lib.rs) | Command entry point, Clap arguments, library exports |
+| `crates/tunmux/src/{proton,airvpn,mullvad,ivpn,wgconf}/` | Provider APIs, models, and command handlers |
+| [crates/tunmux/src/wireguard/](crates/tunmux/src/wireguard/) | Configuration, backends, connection state, health, and rootless proxy tunnel |
+| [crates/tunmux/src/shared/](crates/tunmux/src/shared/) | Credentials, hooks, persistence, and common connection operations |
+| `crates/tunmux/src/privileged*`, `crates/tunmux/src/userspace_helper*` | Privileged requests, embedded GotaTun helper, network setup and recovery |
+| [crates/tunmux/src/proxy/](crates/tunmux/src/proxy/), [crates/tunmux/src/netns.rs](crates/tunmux/src/netns.rs) | Linux namespace proxies |
+| [crates/tunmux/src/service.rs](crates/tunmux/src/service.rs), [crates/tunmux/src/automation.rs](crates/tunmux/src/automation.rs) | Service installation and automatic connections |
+| [crates/tunmux/tests/](crates/tunmux/tests/), [crates/tunmux/benches/](crates/tunmux/benches/), [scripts/](scripts/) | Integration tests, offline benchmarks, and validation tools |
 | [CaddyGlow/smoltcp](https://github.com/CaddyGlow/smoltcp) | Patched TCP/IP stack used with BoringTun for rootless proxies (Cargo git patch) |
 
 Keep changes focused, preserve platform and feature gates, and add behavior tests

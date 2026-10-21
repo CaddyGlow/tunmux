@@ -10,14 +10,9 @@ RUN apt-get update \
 WORKDIR /app
 
 COPY Cargo.toml Cargo.lock rust-toolchain.toml ./
-COPY src ./src
-COPY launchd ./launchd
-COPY systemd ./systemd
-COPY benches ./benches
-COPY tests ./tests
+COPY crates ./crates
 COPY LICENSE README.md ./
 COPY xtask ./xtask
-COPY tunmux-build-version ./tunmux-build-version
 
 # Buildx runs this stage per platform, so uname -m names the target arch.
 RUN target="$(uname -m)-unknown-linux-musl" \
