@@ -31,8 +31,9 @@ use tokio::sync::{mpsc, Notify};
 use tracing::{debug, info, warn};
 
 use connection::{
-    add_dns_udp_query, add_virtual_connection, conn_has_runnable_work, mark_conn_active,
-    process_dns_udp_entries, top_up_active_conns, ConnEntry, DnsUdpEntry, VirtualTunnelIps,
+    add_dns_udp_query, add_virtual_connection, conn_has_runnable_work, expire_pending_connects,
+    mark_conn_active, next_pending_deadline, process_dns_udp_entries, top_up_active_conns,
+    ConnEntry, DnsUdpEntry, VirtualTunnelIps,
 };
 use device::VirtualDevice;
 use dns::parse_dns_servers;
@@ -53,6 +54,7 @@ const UDP_SEND_BURST_MAX: usize = 192;
 const ACTIVE_CONN_BATCH_MAX: usize = 384;
 const ACTIVE_CONN_TOPUP_TARGET: usize = 768;
 const ACTIVE_CONN_SWEEP_BATCH_MAX: usize = 384;
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 const DNS_CACHE_TTL: Duration = Duration::from_secs(15);
 const DNS_TUNNEL_QUERY_TTL: Duration = Duration::from_secs(5);
 const DNS_UDP_PACKET_CAP: usize = 2048;
@@ -376,6 +378,7 @@ pub async fn run_local_proxy(
         }
         flush_udp_writes(udp.as_ref(), &mut wg_pending_tx, &mut perf);
         process_dns_udp_entries(&mut sockets, &mut dns_udp_entries, now_std);
+        expire_pending_connects(&mut conns, &mut sockets, &mut active_conns, now_std);
 
         if active_conns.len() < ACTIVE_CONN_TOPUP_TARGET {
             top_up_active_conns(
@@ -532,11 +535,8 @@ pub async fn run_local_proxy(
             }
         }
 
-        let has_pending_work = !device.inbound.is_empty()
-            || !device.outbound.is_empty()
-            || !active_conns.is_empty()
-            || conns.iter().any(|entry| entry.connected_tx.is_some())
-            || !dns_udp_entries.is_empty();
+        let has_pending_work =
+            !device.inbound.is_empty() || !device.outbound.is_empty() || !active_conns.is_empty();
         perf.observe_loop(active_conns.len(), wg_pending_tx.len());
         perf.maybe_log_and_reset(conns.len());
         if has_pending_work {
@@ -549,8 +549,11 @@ pub async fn run_local_proxy(
             .map(|d| Duration::from_micros(d.total_micros()))
             .unwrap_or(WG_TIMER_TICK_MAX);
 
-        let timer_wait = wg_timer_deadline.saturating_duration_since(Instant::now());
-        let wait_for = delay.min(timer_wait);
+        let wake_at = next_pending_deadline(&conns, &dns_udp_entries)
+            .map_or(wg_timer_deadline, |deadline| {
+                deadline.min(wg_timer_deadline)
+            });
+        let wait_for = delay.min(wake_at.saturating_duration_since(Instant::now()));
 
         let wait_started = Instant::now();
         let wake_reason = tokio::select! {

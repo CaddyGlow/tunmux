@@ -4,7 +4,9 @@ use std::time::Instant;
 
 use bytes::Bytes;
 use smoltcp::iface::{Interface, SocketSet};
-use smoltcp::socket::tcp::{Socket as TcpSocket, SocketBuffer as TcpSocketBuffer};
+use smoltcp::socket::tcp::{
+    Socket as TcpSocket, SocketBuffer as TcpSocketBuffer, State as TcpState,
+};
 use smoltcp::socket::udp::{
     PacketBuffer as UdpPacketBuffer, PacketMetadata as UdpPacketMetadata, Socket as SmolUdpSocket,
 };
@@ -13,8 +15,8 @@ use tokio::sync::oneshot;
 
 use super::queue::{ByteQueue, ConnRequest, DnsUdpRequest};
 use super::{
-    CLIENT_PENDING_MAX_BYTES, DNS_TUNNEL_QUERY_TTL, DNS_UDP_PACKET_CAP, LOCAL_PORT_END,
-    LOCAL_PORT_START, REMOTE_PENDING_MAX_BYTES, TCP_SOCKET_BUF,
+    CLIENT_PENDING_MAX_BYTES, CONNECT_TIMEOUT, DNS_TUNNEL_QUERY_TTL, DNS_UDP_PACKET_CAP,
+    LOCAL_PORT_END, LOCAL_PORT_START, REMOTE_PENDING_MAX_BYTES, TCP_SOCKET_BUF,
 };
 
 pub(crate) struct ConnEntry {
@@ -23,6 +25,7 @@ pub(crate) struct ConnEntry {
     pub(crate) from_client_rx: Arc<ByteQueue>,
     /// Present until the virtual TCP handshake completes.
     pub(crate) connected_tx: Option<oneshot::Sender<Result<(), String>>>,
+    pub(crate) connect_deadline: Instant,
     pub(crate) pending_to_remote: VecDeque<Bytes>,
     pub(crate) pending_to_client: VecDeque<Bytes>,
     pub(crate) pending_remote_bytes: usize,
@@ -42,8 +45,14 @@ pub(crate) struct VirtualTunnelIps {
     pub(crate) ipv6: Option<std::net::Ipv6Addr>,
 }
 
+/// A handshake still in flight needs no visit: its reply arrives over UDP and
+/// wakes the loop, and its deadline bounds the idle wait.
+fn connect_in_flight(sock: &TcpSocket<'_>) -> bool {
+    matches!(sock.state(), TcpState::SynSent | TcpState::SynReceived)
+}
+
 pub(crate) fn conn_has_runnable_work(entry: &ConnEntry, sock: &TcpSocket<'_>) -> bool {
-    entry.connected_tx.is_some()
+    (entry.connected_tx.is_some() && !connect_in_flight(sock))
         || (!entry.from_client_rx.is_empty()
             && entry.pending_remote_bytes < REMOTE_PENDING_MAX_BYTES)
         || (!entry.pending_to_remote.is_empty() && sock.can_send())
@@ -140,6 +149,7 @@ pub(crate) fn add_virtual_connection(
                 to_client_tx: req.to_client_tx,
                 from_client_rx: req.from_client_rx,
                 connected_tx: Some(req.connected_tx),
+                connect_deadline: Instant::now() + CONNECT_TIMEOUT,
                 pending_to_remote: VecDeque::new(),
                 pending_to_client: VecDeque::new(),
                 pending_remote_bytes: 0,
@@ -153,6 +163,47 @@ pub(crate) fn add_virtual_connection(
             let _ = req.connected_tx.send(Err(format!("connect: {}", e)));
         }
     }
+}
+
+/// Fail connects whose handshake outlived `CONNECT_TIMEOUT` and queue them for
+/// removal, so a silent destination cannot pin an entry forever.
+pub(crate) fn expire_pending_connects(
+    conns: &mut [ConnEntry],
+    sockets: &mut SocketSet<'_>,
+    active_conns: &mut VecDeque<usize>,
+    now: Instant,
+) {
+    for idx in 0..conns.len() {
+        let entry = &mut conns[idx];
+        if entry.connected_tx.is_none() || now < entry.connect_deadline {
+            continue;
+        }
+        let sock = sockets.get_mut::<TcpSocket>(entry.handle);
+        if !connect_in_flight(sock) {
+            continue;
+        }
+        if let Some(tx) = entry.connected_tx.take() {
+            let _ = tx.send(Err("connection timed out".into()));
+        }
+        sock.abort();
+        mark_conn_active(conns, active_conns, idx);
+    }
+}
+
+/// Earliest connect or tunnel DNS deadline still pending, if any.
+pub(crate) fn next_pending_deadline(
+    conns: &[ConnEntry],
+    dns_udp_entries: &[DnsUdpEntry],
+) -> Option<Instant> {
+    let connects = conns
+        .iter()
+        .filter(|entry| entry.connected_tx.is_some())
+        .map(|entry| entry.connect_deadline);
+    let dns = dns_udp_entries
+        .iter()
+        .filter(|entry| entry.response_tx.is_some())
+        .map(|entry| entry.deadline);
+    connects.chain(dns).min()
 }
 
 pub(crate) fn add_dns_udp_query(
@@ -252,5 +303,149 @@ pub(crate) fn process_dns_udp_entries(
             let entry = dns_udp_entries.remove(idx);
             sockets.remove(entry.handle);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::net::Ipv4Addr;
+    use std::time::Duration;
+
+    use smoltcp::iface::Config;
+    use tokio::sync::Notify;
+
+    use super::super::device::VirtualDevice;
+    use super::super::CLIENT_CHANNEL_CAP;
+    use super::*;
+
+    struct Harness {
+        iface: Interface,
+        sockets: SocketSet<'static>,
+        conns: Vec<ConnEntry>,
+        active_conns: VecDeque<usize>,
+        next_port: u16,
+    }
+
+    impl Harness {
+        fn new() -> Self {
+            let mut device = VirtualDevice::new();
+            let mut iface = Interface::new(
+                Config::new(smoltcp::wire::HardwareAddress::Ip),
+                &mut device,
+                smoltcp::time::Instant::from_millis(0),
+            );
+            iface.update_ip_addrs(|addrs| {
+                let _ = addrs.push("10.0.0.2/32".parse().expect("valid cidr"));
+            });
+            Self {
+                iface,
+                sockets: SocketSet::new(vec![]),
+                conns: Vec::new(),
+                active_conns: VecDeque::new(),
+                next_port: LOCAL_PORT_START,
+            }
+        }
+
+        fn connect(&mut self) -> oneshot::Receiver<Result<(), String>> {
+            let notify = Arc::new(Notify::new());
+            let (connected_tx, connected_rx) = oneshot::channel();
+            let req = ConnRequest {
+                target_ip: IpAddress::Ipv4(Ipv4Addr::new(10, 255, 255, 1)),
+                target_port: 80,
+                to_client_tx: Arc::new(ByteQueue::new(CLIENT_CHANNEL_CAP, notify.clone())),
+                from_client_rx: Arc::new(ByteQueue::new(CLIENT_CHANNEL_CAP, notify)),
+                connected_tx,
+            };
+            let ips = VirtualTunnelIps {
+                ipv4: Ipv4Addr::new(10, 0, 0, 2),
+                ipv6: None,
+            };
+            add_virtual_connection(
+                req,
+                &mut self.next_port,
+                ips,
+                &mut self.iface,
+                &mut self.sockets,
+                &mut self.conns,
+                &mut self.active_conns,
+            );
+            self.active_conns.clear();
+            for entry in &mut self.conns {
+                entry.active = false;
+            }
+            connected_rx
+        }
+
+        fn sock(&self, idx: usize) -> &TcpSocket<'static> {
+            self.sockets.get::<TcpSocket>(self.conns[idx].handle)
+        }
+    }
+
+    #[test]
+    fn test_connect_in_flight_is_not_runnable_work() {
+        let mut h = Harness::new();
+        let _rx = h.connect();
+        assert_eq!(h.sock(0).state(), TcpState::SynSent);
+        assert!(!conn_has_runnable_work(&h.conns[0], h.sock(0)));
+    }
+
+    #[test]
+    fn test_expire_pending_connects_fails_stalled_handshake_at_deadline() {
+        let mut h = Harness::new();
+        let mut rx = h.connect();
+        let past_deadline = h.conns[0].connect_deadline + Duration::from_millis(1);
+
+        expire_pending_connects(
+            &mut h.conns,
+            &mut h.sockets,
+            &mut h.active_conns,
+            past_deadline,
+        );
+
+        assert_eq!(
+            rx.try_recv().expect("connect result sent"),
+            Err("connection timed out".to_string())
+        );
+        assert!(!h.sock(0).is_open());
+        assert_eq!(h.active_conns, VecDeque::from([0]));
+        assert_eq!(next_pending_deadline(&h.conns, &[]), None);
+    }
+
+    #[test]
+    fn test_expire_pending_connects_keeps_handshake_before_deadline() {
+        let mut h = Harness::new();
+        let mut rx = h.connect();
+        let before_deadline = h.conns[0].connect_deadline - Duration::from_millis(1);
+
+        expire_pending_connects(
+            &mut h.conns,
+            &mut h.sockets,
+            &mut h.active_conns,
+            before_deadline,
+        );
+
+        assert!(rx.try_recv().is_err());
+        assert_eq!(h.sock(0).state(), TcpState::SynSent);
+        assert!(h.active_conns.is_empty());
+    }
+
+    #[test]
+    fn test_next_pending_deadline_picks_earliest_connect_or_dns() {
+        let mut h = Harness::new();
+        let _rx = h.connect();
+        let connect_deadline = h.conns[0].connect_deadline;
+        let (dns_tx, _dns_rx) = oneshot::channel();
+        let dns_deadline = connect_deadline - Duration::from_secs(1);
+        let dns = DnsUdpEntry {
+            handle: h.conns[0].handle,
+            response_tx: Some(dns_tx),
+            deadline: dns_deadline,
+        };
+
+        assert_eq!(next_pending_deadline(&h.conns, &[]), Some(connect_deadline));
+        assert_eq!(
+            next_pending_deadline(&h.conns, std::slice::from_ref(&dns)),
+            Some(dns_deadline)
+        );
     }
 }
