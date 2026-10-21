@@ -13,10 +13,10 @@ use smoltcp::socket::udp::{
 use smoltcp::wire::{IpAddress, IpListenEndpoint};
 use tokio::sync::oneshot;
 
-use super::queue::{ByteQueue, ConnRequest, DnsUdpRequest};
+use super::queue::{ByteQueue, ConnRequest, DnsUdpRequest, QueuePushError};
 use super::{
     CLIENT_PENDING_MAX_BYTES, CONNECT_TIMEOUT, DNS_TUNNEL_QUERY_TTL, DNS_UDP_PACKET_CAP,
-    LOCAL_PORT_END, LOCAL_PORT_START, REMOTE_PENDING_MAX_BYTES, TCP_SOCKET_BUF,
+    LOCAL_PORT_END, LOCAL_PORT_START, REMOTE_PENDING_MAX_BYTES, STREAM_BUF, TCP_SOCKET_BUF,
 };
 
 pub(crate) struct ConnEntry {
@@ -30,6 +30,8 @@ pub(crate) struct ConnEntry {
     pub(crate) pending_to_client: VecDeque<Bytes>,
     pub(crate) pending_remote_bytes: usize,
     pub(crate) pending_client_bytes: usize,
+    /// The remote's FIN has been passed on by closing `to_client_tx`.
+    pub(crate) remote_eof: bool,
     pub(crate) active: bool,
 }
 
@@ -51,13 +53,143 @@ fn connect_in_flight(sock: &TcpSocket<'_>) -> bool {
     matches!(sock.state(), TcpState::SynSent | TcpState::SynReceived)
 }
 
+/// The client half-closed and every byte it sent is queued on the socket, so
+/// our FIN can follow.
+fn client_eof_ready(entry: &ConnEntry, sock: &TcpSocket<'_>) -> bool {
+    entry.from_client_rx.is_closed()
+        && entry.from_client_rx.is_empty()
+        && entry.pending_to_remote.is_empty()
+        && sock.may_send()
+}
+
+/// The remote sent its FIN and the client has been handed every byte before it.
+fn remote_eof_ready(entry: &ConnEntry, sock: &TcpSocket<'_>) -> bool {
+    !entry.remote_eof
+        && entry.connected_tx.is_none()
+        && !sock.may_recv()
+        && entry.pending_to_client.is_empty()
+}
+
+/// Both directions are done, or the socket was reset. TIME-WAIT is not open
+/// but may still hold bytes the client has not read.
+fn conn_finished(entry: &ConnEntry, sock: &TcpSocket<'_>) -> bool {
+    !sock.is_open() && (entry.remote_eof || sock.state() == TcpState::Closed)
+}
+
 pub(crate) fn conn_has_runnable_work(entry: &ConnEntry, sock: &TcpSocket<'_>) -> bool {
     (entry.connected_tx.is_some() && !connect_in_flight(sock))
+        || conn_finished(entry, sock)
+        || client_eof_ready(entry, sock)
+        || remote_eof_ready(entry, sock)
         || (!entry.from_client_rx.is_empty()
             && entry.pending_remote_bytes < REMOTE_PENDING_MAX_BYTES)
         || (!entry.pending_to_remote.is_empty() && sock.can_send())
         || (!entry.pending_to_client.is_empty() && !entry.to_client_tx.is_full())
         || (sock.can_recv() && entry.pending_client_bytes < CLIENT_PENDING_MAX_BYTES)
+}
+
+pub(crate) enum ConnStep {
+    Remove,
+    Requeue,
+    Idle,
+}
+
+/// Move bytes between one virtual socket and its client queues, passing a FIN
+/// on in each direction independently so either side can half-close.
+pub(crate) fn service_conn(entry: &mut ConnEntry, sock: &mut TcpSocket<'_>) -> ConnStep {
+    if let Some(tx) = entry.connected_tx.take() {
+        if sock.may_send() {
+            let _ = tx.send(Ok(()));
+        } else if sock.state() == TcpState::Closed {
+            let _ = tx.send(Err("connection refused".into()));
+            return ConnStep::Remove;
+        } else {
+            entry.connected_tx = Some(tx);
+        }
+    }
+
+    if sock.can_recv() && entry.pending_client_bytes < CLIENT_PENDING_MAX_BYTES {
+        if let Ok(Some(chunk)) = sock.recv(|recv_buf| {
+            let n = recv_buf.len().min(STREAM_BUF);
+            if n == 0 {
+                (0, None)
+            } else {
+                (n, Some(Bytes::copy_from_slice(&recv_buf[..n])))
+            }
+        }) {
+            entry.pending_client_bytes += chunk.len();
+            entry.pending_to_client.push_back(chunk);
+        }
+    }
+
+    while entry.pending_remote_bytes < REMOTE_PENDING_MAX_BYTES {
+        let Some(data) = entry.from_client_rx.try_pop() else {
+            break;
+        };
+        entry.pending_remote_bytes += data.len();
+        entry.pending_to_remote.push_back(data);
+    }
+
+    while sock.can_send() {
+        let Some(front) = entry.pending_to_remote.front_mut() else {
+            break;
+        };
+        match sock.send_slice(front.as_ref()) {
+            Ok(sent) if sent == front.len() => {
+                let _ = entry.pending_to_remote.pop_front();
+                entry.pending_remote_bytes = entry.pending_remote_bytes.saturating_sub(sent);
+            }
+            Ok(sent) => {
+                *front = front.slice(sent..);
+                entry.pending_remote_bytes = entry.pending_remote_bytes.saturating_sub(sent);
+                break;
+            }
+            Err(_) => break,
+        }
+    }
+
+    if entry.from_client_rx.is_closed() && entry.connected_tx.is_some() {
+        sock.abort();
+        return ConnStep::Remove;
+    }
+    if client_eof_ready(entry, sock) {
+        sock.close();
+    }
+
+    while let Some(front) = entry.pending_to_client.pop_front() {
+        let front_len = front.len();
+        match entry.to_client_tx.try_push(front) {
+            Ok(()) => {
+                entry.pending_client_bytes = entry.pending_client_bytes.saturating_sub(front_len);
+            }
+            Err(QueuePushError::Full(front)) => {
+                entry.pending_to_client.push_front(front);
+                break;
+            }
+            Err(QueuePushError::Closed) => {
+                sock.close();
+                return ConnStep::Remove;
+            }
+        }
+    }
+
+    if remote_eof_ready(entry, sock) {
+        entry.remote_eof = true;
+        entry.to_client_tx.close();
+    }
+    if !entry.remote_eof && entry.to_client_tx.is_closed() {
+        sock.close();
+        return ConnStep::Remove;
+    }
+
+    if conn_finished(entry, sock) {
+        return ConnStep::Remove;
+    }
+    if conn_has_runnable_work(entry, sock) {
+        ConnStep::Requeue
+    } else {
+        ConnStep::Idle
+    }
 }
 
 pub(crate) fn mark_conn_active(
@@ -154,6 +286,7 @@ pub(crate) fn add_virtual_connection(
                 pending_to_client: VecDeque::new(),
                 pending_remote_bytes: 0,
                 pending_client_bytes: 0,
+                remote_eof: false,
                 active: false,
             });
             let new_idx = conns.len() - 1;
@@ -318,12 +451,16 @@ mod tests {
     use super::super::CLIENT_CHANNEL_CAP;
     use super::*;
 
+    const LOCAL_IP: Ipv4Addr = Ipv4Addr::new(10, 0, 0, 2);
+
     struct Harness {
+        device: VirtualDevice,
         iface: Interface,
         sockets: SocketSet<'static>,
         conns: Vec<ConnEntry>,
         active_conns: VecDeque<usize>,
         next_port: u16,
+        now_ms: i64,
     }
 
     impl Harness {
@@ -338,26 +475,32 @@ mod tests {
                 let _ = addrs.push("10.0.0.2/32".parse().expect("valid cidr"));
             });
             Self {
+                device,
                 iface,
                 sockets: SocketSet::new(vec![]),
                 conns: Vec::new(),
                 active_conns: VecDeque::new(),
                 next_port: LOCAL_PORT_START,
+                now_ms: 0,
             }
         }
 
         fn connect(&mut self) -> oneshot::Receiver<Result<(), String>> {
+            self.connect_to(Ipv4Addr::new(10, 255, 255, 1))
+        }
+
+        fn connect_to(&mut self, target: Ipv4Addr) -> oneshot::Receiver<Result<(), String>> {
             let notify = Arc::new(Notify::new());
             let (connected_tx, connected_rx) = oneshot::channel();
             let req = ConnRequest {
-                target_ip: IpAddress::Ipv4(Ipv4Addr::new(10, 255, 255, 1)),
+                target_ip: IpAddress::Ipv4(target),
                 target_port: 80,
                 to_client_tx: Arc::new(ByteQueue::new(CLIENT_CHANNEL_CAP, notify.clone())),
                 from_client_rx: Arc::new(ByteQueue::new(CLIENT_CHANNEL_CAP, notify)),
                 connected_tx,
             };
             let ips = VirtualTunnelIps {
-                ipv4: Ipv4Addr::new(10, 0, 0, 2),
+                ipv4: LOCAL_IP,
                 ipv6: None,
             };
             add_virtual_connection(
@@ -376,8 +519,71 @@ mod tests {
             connected_rx
         }
 
+        /// A peer on the interface's own address; packets loop back to it.
+        fn listen(&mut self) -> smoltcp::iface::SocketHandle {
+            let mut sock = TcpSocket::new(
+                TcpSocketBuffer::new(vec![0u8; 4096]),
+                TcpSocketBuffer::new(vec![0u8; 4096]),
+            );
+            sock.set_ack_delay(None);
+            sock.listen(80).expect("listen");
+            self.sockets.add(sock)
+        }
+
+        fn pump(&mut self) {
+            for _ in 0..8 {
+                self.now_ms += 1;
+                self.iface.poll(
+                    smoltcp::time::Instant::from_millis(self.now_ms),
+                    &mut self.device,
+                    &mut self.sockets,
+                );
+                if self.device.outbound.is_empty() {
+                    break;
+                }
+                let looped: Vec<_> = self.device.outbound.drain(..).collect();
+                self.device.inbound.extend(looped);
+            }
+        }
+
+        fn service(&mut self, idx: usize) -> ConnStep {
+            let entry = &mut self.conns[idx];
+            let sock = self.sockets.get_mut::<TcpSocket>(entry.handle);
+            service_conn(entry, sock)
+        }
+
         fn sock(&self, idx: usize) -> &TcpSocket<'static> {
             self.sockets.get::<TcpSocket>(self.conns[idx].handle)
+        }
+
+        fn server(&mut self, handle: smoltcp::iface::SocketHandle) -> &mut TcpSocket<'static> {
+            self.sockets.get_mut::<TcpSocket>(handle)
+        }
+
+        /// Connect to a loopback listener and complete the handshake.
+        fn established(&mut self) -> smoltcp::iface::SocketHandle {
+            let server = self.listen();
+            let mut rx = self.connect_to(LOCAL_IP);
+            self.pump();
+            assert!(!matches!(self.service(0), ConnStep::Remove));
+            assert_eq!(rx.try_recv().expect("connected"), Ok(()));
+            assert_eq!(self.server(server).state(), TcpState::Established);
+            server
+        }
+
+        fn server_read(&mut self, handle: smoltcp::iface::SocketHandle) -> Vec<u8> {
+            let mut out = vec![0u8; 4096];
+            let n = self.server(handle).recv_slice(&mut out).unwrap_or(0);
+            out.truncate(n);
+            out
+        }
+
+        fn client_read(&self, idx: usize) -> Vec<u8> {
+            let mut out = Vec::new();
+            while let Some(chunk) = self.conns[idx].to_client_tx.try_pop() {
+                out.extend_from_slice(&chunk);
+            }
+            out
         }
     }
 
@@ -447,5 +653,68 @@ mod tests {
             next_pending_deadline(&h.conns, std::slice::from_ref(&dns)),
             Some(dns_deadline)
         );
+    }
+
+    #[test]
+    fn test_client_half_close_still_delivers_reply() {
+        let mut h = Harness::new();
+        let server = h.established();
+        let from_client = h.conns[0].from_client_rx.clone();
+        assert!(from_client.try_push(Bytes::from_static(b"request")).is_ok());
+        from_client.close();
+
+        assert!(!matches!(h.service(0), ConnStep::Remove));
+        h.pump();
+        assert_eq!(h.server_read(server), b"request");
+        assert!(
+            !h.server(server).may_recv(),
+            "client FIN reached the server"
+        );
+        assert!(!h.conns[0].to_client_tx.is_closed());
+
+        h.server(server).send_slice(b"reply").expect("send");
+        h.server(server).close();
+        h.pump();
+        assert!(matches!(h.service(0), ConnStep::Remove));
+        assert_eq!(
+            h.client_read(0),
+            b"reply",
+            "queued reply outlives the entry"
+        );
+        assert!(h.conns[0].to_client_tx.is_closed());
+    }
+
+    #[test]
+    fn test_remote_half_close_keeps_client_sending() {
+        let mut h = Harness::new();
+        let server = h.established();
+        h.server(server).send_slice(b"banner").expect("send");
+        h.server(server).close();
+        h.pump();
+
+        assert!(!matches!(h.service(0), ConnStep::Remove));
+        assert_eq!(h.client_read(0), b"banner");
+        assert!(h.conns[0].to_client_tx.is_closed());
+        assert!(!conn_has_runnable_work(&h.conns[0], h.sock(0)));
+
+        let from_client = h.conns[0].from_client_rx.clone();
+        assert!(from_client.try_push(Bytes::from_static(b"late")).is_ok());
+        assert!(!matches!(h.service(0), ConnStep::Remove));
+        h.pump();
+        assert_eq!(h.server_read(server), b"late");
+
+        from_client.close();
+        assert!(conn_has_runnable_work(&h.conns[0], h.sock(0)));
+        assert!(!matches!(h.service(0), ConnStep::Remove));
+        h.pump();
+        assert!(matches!(h.service(0), ConnStep::Remove));
+    }
+
+    #[test]
+    fn test_client_abort_drops_connection() {
+        let mut h = Harness::new();
+        let _server = h.established();
+        h.conns[0].to_client_tx.close();
+        assert!(matches!(h.service(0), ConnStep::Remove));
     }
 }

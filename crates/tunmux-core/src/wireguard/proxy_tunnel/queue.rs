@@ -14,6 +14,7 @@ pub(crate) struct ByteQueue {
     queue: ArrayQueue<Bytes>,
     has_data_notify: Notify,
     has_space_notify: Notify,
+    closed_notify: Notify,
     loop_notify: Arc<Notify>,
     closed: AtomicBool,
 }
@@ -24,6 +25,7 @@ impl ByteQueue {
             queue: ArrayQueue::new(capacity),
             has_data_notify: Notify::new(),
             has_space_notify: Notify::new(),
+            closed_notify: Notify::new(),
             loop_notify,
             closed: AtomicBool::new(false),
         }
@@ -33,7 +35,17 @@ impl ByteQueue {
         self.closed.store(true, Ordering::Release);
         self.has_data_notify.notify_waiters();
         self.has_space_notify.notify_waiters();
+        self.closed_notify.notify_waiters();
         self.loop_notify.notify_waiters();
+    }
+
+    pub(crate) async fn closed(&self) {
+        let notified = self.closed_notify.notified();
+        tokio::pin!(notified);
+        notified.as_mut().enable();
+        if !self.is_closed() {
+            notified.await;
+        }
     }
 
     pub(crate) fn is_closed(&self) -> bool {

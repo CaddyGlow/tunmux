@@ -96,6 +96,7 @@ pub fn main(args: &[String]) -> Result<()> {
     match args.first().map(String::as_str) {
         Some("--serve-traffic") => return serve_traffic(args.get(1).context("missing address")?),
         Some("--socks-load") => return socks_load(&args[1..]),
+        Some("--socks-half-close") => return socks_half_close(&args[1..]),
         _ => {}
     }
     let mut opts = Options::parse(args)?;
@@ -493,6 +494,22 @@ fn benchmark(opts: &Options, rows: &mut Vec<Value>) -> Result<()> {
                         .context("expected exactly one userspace helper")?,
                 )
             };
+            let half_close = if proxy.is_some() {
+                let mut command = net(CLIENT, &[]);
+                command.arg(std::env::current_exe()?).args([
+                    "bench-wg",
+                    "--socks-half-close",
+                    &format!("127.0.0.1:{SOCKS_PORT}"),
+                    &traffic_addr,
+                ]);
+                let check = Process::spawn(&mut command)?.finish(20);
+                if let Err(error) = &check {
+                    println!("{backend:11} half-close check failed: {error:#}");
+                }
+                Some(check.is_ok())
+            } else {
+                None
+            };
             let idle = if proxy.is_some() {
                 Value::Null
             } else {
@@ -539,7 +556,7 @@ fn benchmark(opts: &Options, rows: &mut Vec<Value>) -> Result<()> {
                     .map(|p| p.finish(15).and_then(|out| ping_result(&out)))
                     .transpose()?;
                 println!("{backend:11} {direction:8} round={} {mbps:.1} Mbps host_cpu={host_cpu:.1}% helper_cpu={helper_cpu:?}", round + 1);
-                rows.push(json!({"backend": backend, "round": round + 1, "direction": direction, "mbps": mbps, "host_busy_cpu_pct": host_cpu, "helper_cpu_pct": helper_cpu, "idle_ping": idle, "loaded_ping": loaded, "net_counters": net_counters, "raw": raw}));
+                rows.push(json!({"backend": backend, "round": round + 1, "direction": direction, "mbps": mbps, "host_busy_cpu_pct": host_cpu, "helper_cpu_pct": helper_cpu, "half_close_ok": half_close, "idle_ping": idle, "loaded_ping": loaded, "net_counters": net_counters, "raw": raw}));
             }
             if let Some(mut process) = proxy {
                 let log = opts
@@ -791,6 +808,15 @@ fn serve_traffic(addr: &str) -> Result<()> {
                 report.extend(micros.to_be_bytes());
                 stream.write_all(&report)?;
                 while stream.read(&mut buf)? > 0 {}
+            } else if mode[0] == b'e' {
+                let mut total = 0u64;
+                loop {
+                    match stream.read(&mut buf)? {
+                        0 => break,
+                        n => total += n as u64,
+                    }
+                }
+                stream.write_all(&total.to_be_bytes())?;
             } else {
                 loop {
                     stream.write_all(&buf)?;
@@ -862,6 +888,35 @@ fn socks_stream(
         }
     }
     Ok((total, start.elapsed().as_secs_f64()))
+}
+
+/// Send a payload, close the sending side, and expect the server's byte count
+/// back: the reply only arrives if the proxy keeps the other direction open.
+fn socks_half_close(args: &[String]) -> Result<()> {
+    let [proxy, target] = args else {
+        bail!("usage: --socks-half-close PROXY TARGET");
+    };
+    let mut stream = socks_connect(proxy.parse()?, target.parse()?)?;
+    stream.set_read_timeout(Some(Duration::from_secs(10)))?;
+    let payload = vec![7u8; 3 * CHUNK + 5];
+    stream.write_all(&[b'e', 0, 0, 0, 0])?;
+    stream.write_all(&payload)?;
+    stream.shutdown(Shutdown::Write)?;
+    let mut reply = [0u8; 8];
+    stream
+        .read_exact(&mut reply)
+        .context("no reply after half-close")?;
+    let echoed = u64::from_be_bytes(reply);
+    ensure!(
+        echoed == payload.len() as u64,
+        "server counted {echoed} of {} bytes",
+        payload.len()
+    );
+    ensure!(
+        stream.read(&mut reply)? == 0,
+        "expected EOF after the reply"
+    );
+    Ok(())
 }
 
 fn socks_load(args: &[String]) -> Result<()> {

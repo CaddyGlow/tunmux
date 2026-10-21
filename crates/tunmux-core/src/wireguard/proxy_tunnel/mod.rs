@@ -23,7 +23,6 @@ use std::time::{Duration, Instant};
 use anyhow::{anyhow, Context};
 use boringtun::noise::{Tunn, TunnResult};
 use boringtun::x25519::{PublicKey, StaticSecret};
-use bytes::Bytes;
 use serde::{Deserialize, Serialize};
 use smoltcp::iface::{Config, Interface, SocketSet};
 use smoltcp::socket::tcp::Socket as TcpSocket;
@@ -32,14 +31,14 @@ use tokio::sync::{mpsc, Notify};
 use tracing::{debug, info, warn};
 
 use connection::{
-    add_dns_udp_query, add_virtual_connection, conn_has_runnable_work, expire_pending_connects,
-    mark_conn_active, next_pending_deadline, process_dns_udp_entries, top_up_active_conns,
-    ConnEntry, DnsUdpEntry, VirtualTunnelIps,
+    add_dns_udp_query, add_virtual_connection, expire_pending_connects, mark_conn_active,
+    next_pending_deadline, process_dns_udp_entries, service_conn, top_up_active_conns, ConnEntry,
+    ConnStep, DnsUdpEntry, VirtualTunnelIps,
 };
 use device::{Packet, VirtualDevice};
 use dns::parse_dns_servers;
 use perf::{DataplanePerf, IdleWakeReason};
-use queue::{ConnRequest, DnsUdpRequest, QueuePushError};
+use queue::{ConnRequest, DnsUdpRequest};
 use udp_io::{UdpRx, UdpTx};
 
 const UDP_BUF: usize = 65536;
@@ -400,112 +399,16 @@ pub async fn run_local_proxy(
             conns[i].active = false;
             perf.conn_visits = perf.conn_visits.saturating_add(1);
 
-            let mut requeue = false;
-            let mut remove_current = false;
             let entry = &mut conns[i];
             let sock = sockets.get_mut::<TcpSocket>(entry.handle);
-
-            if let Some(tx) = entry.connected_tx.take() {
-                if sock.may_send() {
-                    let _ = tx.send(Ok(()));
-                } else if sock.state() == smoltcp::socket::tcp::State::Closed {
-                    let _ = tx.send(Err("connection refused".into()));
-                    remove_current = true;
-                } else {
-                    entry.connected_tx = Some(tx);
+            let requeue = match service_conn(entry, sock) {
+                ConnStep::Remove => {
+                    remove.push(i);
+                    continue;
                 }
-            }
-
-            if !remove_current
-                && sock.can_recv()
-                && entry.pending_client_bytes < CLIENT_PENDING_MAX_BYTES
-            {
-                if let Ok(Some(chunk)) = sock.recv(|recv_buf| {
-                    let n = recv_buf.len().min(STREAM_BUF);
-                    if n == 0 {
-                        (0, None)
-                    } else {
-                        (n, Some(Bytes::copy_from_slice(&recv_buf[..n])))
-                    }
-                }) {
-                    entry.pending_client_bytes += chunk.len();
-                    entry.pending_to_client.push_back(chunk);
-                }
-            }
-
-            while !remove_current && entry.pending_remote_bytes < REMOTE_PENDING_MAX_BYTES {
-                let Some(data) = entry.from_client_rx.try_pop() else {
-                    break;
-                };
-                entry.pending_remote_bytes += data.len();
-                entry.pending_to_remote.push_back(data);
-            }
-            if !remove_current
-                && entry.from_client_rx.is_closed()
-                && entry.pending_to_remote.is_empty()
-            {
-                sock.close();
-                remove_current = true;
-            }
-
-            while !remove_current && sock.can_send() {
-                let Some(front) = entry.pending_to_remote.front_mut() else {
-                    break;
-                };
-                match sock.send_slice(front.as_ref()) {
-                    Ok(sent) => {
-                        if sent == front.len() {
-                            let sent_len = front.len();
-                            let _ = entry.pending_to_remote.pop_front();
-                            entry.pending_remote_bytes =
-                                entry.pending_remote_bytes.saturating_sub(sent_len);
-                        } else {
-                            let remaining = front.slice(sent..);
-                            *front = remaining;
-                            entry.pending_remote_bytes =
-                                entry.pending_remote_bytes.saturating_sub(sent);
-                            break;
-                        }
-                    }
-                    Err(_) => break,
-                }
-            }
-
-            while !remove_current {
-                let Some(front) = entry.pending_to_client.pop_front() else {
-                    break;
-                };
-                let front_len = front.len();
-                match entry.to_client_tx.try_push(front) {
-                    Ok(()) => {
-                        entry.pending_client_bytes =
-                            entry.pending_client_bytes.saturating_sub(front_len);
-                    }
-                    Err(QueuePushError::Full(front)) => {
-                        entry.pending_to_client.push_front(front);
-                        break;
-                    }
-                    Err(QueuePushError::Closed) => {
-                        sock.close();
-                        remove_current = true;
-                        break;
-                    }
-                }
-            }
-
-            if !remove_current && entry.to_client_tx.is_closed() {
-                sock.close();
-                remove_current = true;
-            }
-
-            if remove_current || !sock.is_open() {
-                remove.push(i);
-                continue;
-            }
-
-            if conn_has_runnable_work(entry, sock) {
-                requeue = true;
-            }
+                ConnStep::Requeue => true,
+                ConnStep::Idle => false,
+            };
 
             if requeue {
                 perf.conn_requeues = perf.conn_requeues.saturating_add(1);
@@ -518,8 +421,8 @@ pub async fn run_local_proxy(
         for &i in remove.iter().rev() {
             if i < conns.len() {
                 let e = conns.remove(i);
-                e.to_client_tx.close();
                 e.from_client_rx.close();
+                e.to_client_tx.close();
                 sockets.remove(e.handle);
             }
         }

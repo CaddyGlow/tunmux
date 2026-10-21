@@ -353,8 +353,9 @@ For Linux dataplane comparisons, run `cargo xtask bench-wg --bin /path/to/releas
 This compares kernel WireGuard, GotaTun, and the rootless local proxy with local
 peers, rotating backend order and recording throughput, idle/loaded latency, CPU
 usage, UDP drop and TCP retransmit counters, and raw iperf JSON. Local-proxy
-traffic goes through its SOCKS5 port using a built-in generator, and each round's
-daemon log is saved next to the JSON. `--help` lists duration, repeat, stream,
+traffic goes through its SOCKS5 port using a built-in generator, each round first
+checks that a client's half-close still gets the reply, and each round's daemon log
+is saved next to the JSON. `--help` lists duration, repeat, stream,
 MTU, added delay (`--delay-ms`), backend selection (`--backends`), and output
 options. It requires `ip`, `wg`, `iperf3`, `ping`, `mount`, `unshare`, and
 `/dev/net/tun` (plus `tc` with `--delay-ms`), and either unprivileged user
