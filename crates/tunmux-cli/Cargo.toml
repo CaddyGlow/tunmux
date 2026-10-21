@@ -1,0 +1,55 @@
+[package]
+name = "tunmux"
+version.workspace = true
+edition.workspace = true
+description = "Multi-provider WireGuard VPN CLI"
+license.workspace = true
+repository = "https://github.com/CaddyGlow/tunmux"
+readme = "../../README.md"
+
+[lib]
+name = "tunmux_cli"
+path = "src/lib.rs"
+
+[[bin]]
+name = "tunmux"
+path = "src/main.rs"
+
+[[bench]]
+name = "cli"
+harness = false
+
+[features]
+default = ["proxy", "all-providers", "crypto-rustcrypto"]
+all-providers = ["proton", "airvpn", "mullvad", "ivpn", "wgconf"]
+proton = ["tunmux-core/proton", "dep:rpassword"]
+airvpn = ["tunmux-core/airvpn", "dep:rpassword"]
+crypto-aws-lc = ["tunmux-core/crypto-aws-lc"]
+crypto-rustcrypto = ["tunmux-core/crypto-rustcrypto"]
+mullvad = ["tunmux-core/mullvad"]
+ivpn = ["tunmux-core/ivpn", "dep:rpassword"]
+wgconf = ["tunmux-core/wgconf"]
+proxy = ["tunmux-core/proxy"]
+keyring = ["tunmux-core/keyring"]
+
+[dependencies]
+tunmux-core = { path = "../tunmux-core", default-features = false }
+tunmux-build-version.workspace = true
+clap = { version = "4", features = ["derive"] }
+anyhow = "1"
+base64 = "0.23"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+tokio = { version = "1", features = ["full"] }
+tracing = "0.1"
+rand = "0.8"
+
+[target.'cfg(not(target_os = "android"))'.dependencies]
+# Password input (terminal only)
+rpassword = { version = "7", optional = true }
+nix = { version = "0.31", features = ["fs", "signal", "process"] }
+
+[dev-dependencies]
+criterion = { version = "0.5.1", default-features = false, features = ["cargo_bench_support"] }
+

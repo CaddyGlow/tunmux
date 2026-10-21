@@ -3,7 +3,7 @@
 use std::time::SystemTime;
 
 use egui::{Color32, RichText, Ui};
-use tunmux::api::{AirAction, SystemStatus, WgProfile};
+use tunmux_core::api::{AirAction, SystemStatus, WgProfile};
 
 use crate::app::{Action, LoginForm, Tool, TunmuxApp};
 use crate::model::{LoginState, Mode, Provider, TrayState};
@@ -180,7 +180,7 @@ impl TunmuxApp {
         };
         if submit && self.live.is_some() {
             self.login.error = None;
-            let credentials = tunmux::api::Credentials {
+            let credentials = tunmux_core::api::Credentials {
                 account: self.login.user.trim().to_string(),
                 password: self.login.secret.clone(),
                 two_factor: None,
@@ -224,7 +224,7 @@ impl TunmuxApp {
             // The library logs in again with the code; the password is kept
             // in the form until then.
             self.login.error = None;
-            let credentials = tunmux::api::Credentials {
+            let credentials = tunmux_core::api::Credentials {
                 account: self.login.user.trim().to_string(),
                 password: self.login.secret.clone(),
                 two_factor: Some(self.login.code.trim().to_string()),
@@ -639,7 +639,7 @@ impl TunmuxApp {
         }
         if self.settings.system.is_none() {
             self.settings.system = Some(if self.live.is_some() {
-                tunmux::api::system_status()
+                tunmux_core::api::system_status()
             } else {
                 SystemStatus {
                     helper_socket: "/var/run/tunmux/ctl.sock".into(),
@@ -717,7 +717,7 @@ impl TunmuxApp {
         });
         ui.weak(format!(
             "Backend and access log are saved to {}.",
-            tunmux::api::config_path().display()
+            tunmux_core::api::config_path().display()
         ));
 
         ui.add_space(6.0);

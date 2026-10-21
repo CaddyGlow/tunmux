@@ -5,7 +5,7 @@ use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
 
 use egui::{Align, Color32, Layout, RichText, Ui};
-use tunmux::api::{GeneralSettings, SystemStatus};
+use tunmux_core::api::{GeneralSettings, SystemStatus};
 
 use crate::live::Live;
 use crate::mock::{ConnectError, Store};
@@ -136,7 +136,7 @@ impl TunmuxApp {
             pending_replace: None,
             toasts: Vec::new(),
             settings: {
-                let config = tunmux::config::load_config();
+                let config = tunmux_core::config::load_config();
                 Settings {
                     prefs,
                     start_at_login: crate::prefs::start_at_login(),
@@ -263,12 +263,12 @@ impl TunmuxApp {
             Event::Login(p, result) => {
                 let p = Provider::from(p);
                 match result {
-                    Ok(tunmux::api::LoginOutcome::LoggedIn { .. }) => {
+                    Ok(tunmux_core::api::LoginOutcome::LoggedIn { .. }) => {
                         self.login = LoginForm::default();
                         self.servers_requested.remove(&p);
                         self.toast(format!("Logged in to {}", p.label()));
                     }
-                    Ok(tunmux::api::LoginOutcome::NeedsTwoFactor) => {
+                    Ok(tunmux_core::api::LoginOutcome::NeedsTwoFactor) => {
                         self.backend.set_two_factor(p);
                         self.login.error = None;
                     }

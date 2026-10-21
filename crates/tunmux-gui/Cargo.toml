@@ -7,7 +7,7 @@ license.workspace = true
 publish = false
 
 [dependencies]
-tunmux = { path = "../tunmux" }
+tunmux-core = { path = "../tunmux-core" }
 tunmux-build-version.workspace = true
 eframe = { version = "0.37", default-features = false, features = ["glow", "default_fonts", "wayland", "x11", "clipboard"] }
 egui = "0.37"

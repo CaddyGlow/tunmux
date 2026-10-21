@@ -161,7 +161,7 @@ fn clippy() -> Result<()> {
 }
 
 fn test() -> Result<()> {
-    run(&mut cargo(&["test", "--locked"]))?;
+    run(&mut cargo(&["test", "--locked", "--workspace"]))?;
     run(&mut cargo(&[
         "test",
         "--locked",
@@ -178,12 +178,19 @@ fn features(only: &[String]) -> Result<()> {
         step(&format!("features: {set}"));
         let features = if *set == "none" { "" } else { set };
         let base = ["--locked", "--no-default-features", "--features", features];
-        run(cargo(&["clippy", "--all-targets"])
+        // The CLI forwards each feature to the core; lint both packages.
+        for package in ["tunmux-core", "tunmux"] {
+            run(cargo(&["clippy", "-p", package, "--all-targets"])
+                .args(base)
+                .args(["--", "-D", "warnings"]))?;
+        }
+        run(cargo(&["test", "-p", "tunmux"])
             .args(base)
-            .args(["--", "-D", "warnings"]))?;
-        run(cargo(&["test"]).args(base).arg("cli::tests"))?;
+            .arg("cli::tests"))?;
         if set.starts_with("airvpn,") {
-            run(cargo(&["test"]).args(base).arg("airvpn::crypto::tests"))?;
+            run(cargo(&["test", "-p", "tunmux-core"])
+                .args(base)
+                .arg("airvpn::crypto::tests"))?;
         }
     }
     Ok(())

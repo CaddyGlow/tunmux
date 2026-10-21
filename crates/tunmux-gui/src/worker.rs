@@ -1,13 +1,13 @@
-//! Runs `tunmux::api` calls off the UI thread, one at a time, so a connect
+//! Runs `tunmux_core::api` calls off the UI thread, one at a time, so a connect
 //! and the disconnect that precedes a replace never race.
 
 use std::sync::mpsc::{self, Receiver, Sender};
 
-use tunmux::api::{
+use tunmux_core::api::{
     self, AccountInfo, AirAction, AirOverview, ConnectSpec, Credentials, GeneralSettings,
     LoginOutcome, ProtonPorts, ServerInfo, WgProfile,
 };
-use tunmux::config::Provider;
+use tunmux_core::config::Provider;
 
 use crate::live::Notify;
 
@@ -76,7 +76,7 @@ impl Worker {
                         return;
                     }
                 };
-                let mut config = tunmux::config::load_config();
+                let mut config = tunmux_core::config::load_config();
                 for job in job_rx {
                     for event in runtime.block_on(run(job, &mut config)) {
                         let _ = event_tx.send(event);
@@ -111,7 +111,7 @@ impl Worker {
     }
 }
 
-async fn run(job: Job, config: &mut tunmux::config::AppConfig) -> Vec<Event> {
+async fn run(job: Job, config: &mut tunmux_core::config::AppConfig) -> Vec<Event> {
     let text = |e: anyhow::Error| format!("{e:#}");
     match job {
         Job::Accounts => vec![Event::Accounts(api::accounts(config))],
@@ -210,7 +210,7 @@ async fn run(job: Job, config: &mut tunmux::config::AppConfig) -> Vec<Event> {
         ],
         Job::SaveGeneral(settings) => {
             let saved = api::save_general_settings(&settings).map_err(text);
-            *config = tunmux::config::load_config();
+            *config = tunmux_core::config::load_config();
             vec![
                 Event::Done(saved.map(|()| "Settings saved to config.toml".to_string())),
                 Event::General(GeneralSettings::from_config(config)),
@@ -219,7 +219,7 @@ async fn run(job: Job, config: &mut tunmux::config::AppConfig) -> Vec<Event> {
     }
 }
 
-fn proton(config: &tunmux::config::AppConfig) -> Event {
+fn proton(config: &tunmux_core::config::AppConfig) -> Event {
     Event::Proton(api::proton_ports(config).map_err(|e| format!("{e:#}")))
 }
 
@@ -230,7 +230,7 @@ fn wg() -> Event {
 async fn connect(
     p: Provider,
     spec: &ConnectSpec,
-    config: &tunmux::config::AppConfig,
+    config: &tunmux_core::config::AppConfig,
 ) -> Result<String, String> {
     let target = spec.server.clone().unwrap_or_else(|| p.label().to_string());
     api::connect(p, spec, config)

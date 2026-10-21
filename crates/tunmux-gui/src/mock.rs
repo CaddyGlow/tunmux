@@ -5,7 +5,7 @@
 
 use std::time::{Duration, Instant, SystemTime};
 
-use tunmux::api::{
+use tunmux_core::api::{
     AirAction, AirApiKey, AirDevice, AirOverview, AirPort, ProtonForward, ProtonPorts, WgProfile,
 };
 
@@ -58,7 +58,7 @@ impl Store {
         }
     }
 
-    pub fn set_accounts(&mut self, infos: Vec<tunmux::api::AccountInfo>) {
+    pub fn set_accounts(&mut self, infos: Vec<tunmux_core::api::AccountInfo>) {
         for info in infos {
             let provider = Provider::from(info.provider);
             let acc = self.account_mut(provider);
@@ -451,7 +451,7 @@ impl Store {
         }
     }
 
-    /// Sample-data version of `tunmux::api::airvpn_apply`.
+    /// Sample-data version of `tunmux_core::api::airvpn_apply`.
     pub fn air_apply(&mut self, action: &AirAction) {
         let Some(air) = &mut self.air else { return };
         match action {

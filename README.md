@@ -184,7 +184,7 @@ data, connection state, and saved WireGuard profiles also live under
 `credential_store = "keyring"` selects the optional native backend when compiled
 in: Secret Service on Linux (requires an unlocked desktop keyring and session
 D-Bus), or Keychain on macOS.
-See [crates/tunmux/src/config.rs](crates/tunmux/src/config.rs) for the complete configuration schema.
+See [crates/tunmux-core/src/config.rs](crates/tunmux-core/src/config.rs) for the complete configuration schema.
 
 ```sh
 tunmux -v status
@@ -258,11 +258,13 @@ Logs are in
 
 Default builds enable **`all-providers`, `proxy`, and `crypto-rustcrypto`**.
 Features are additive; use
-`--no-default-features` to build a smaller selection.
+`--no-default-features` to build a smaller selection. The `tunmux` CLI package
+and the `tunmux-core` library share these feature names; the CLI forwards each
+one to the library.
 
 | Cargo feature | Enables |
 | --- | --- |
-| `proton`, `airvpn`, `mullvad`, `ivpn` | The named provider, its CLI commands, and provider-specific dependencies |
+| `proton`, `airvpn`, `mullvad`, `ivpn` | The named provider, its CLI commands, and provider-specific dependencies (in the CLI, also password prompts) |
 | `wgconf` | Local WireGuard files and saved profiles |
 | `all-providers` | All five providers |
 | `proxy` | Linux network-namespace proxy support; not required for rootless local-proxy mode |
@@ -282,7 +284,8 @@ cargo build --locked --no-default-features --features airvpn,crypto-rustcrypto
 ```
 
 A build with `--no-default-features` alone retains shared infrastructure without
-provider commands. Library consumers using `default-features = false` must choose
+provider commands. Library consumers depend on `tunmux-core`, which has no
+clap or terminal prompts; with `default-features = false` they must choose
 providers explicitly. AirVPN requires one of the two crypto features. Android
 consumers can enable `all-providers,crypto-rustcrypto` without `proxy`.
 
@@ -300,21 +303,23 @@ AWS-LC alone does not remove the lockfile finding.
 
 ## Codebase and contributions
 
-The Cargo workspace keeps its packages under `crates/`: `crates/tunmux` is the
-library and `tunmux` CLI, `crates/tunmux-gui` the desktop app,
+The Cargo workspace keeps its packages under `crates/`: `crates/tunmux-core` is
+the library, `crates/tunmux-cli` the `tunmux` CLI package, `crates/tunmux-gui` the
+desktop app,
 `crates/tunmux-build-version` derives version strings from git, and `xtask/`
 holds the build and CI automation.
 
 | Location | Responsibility |
 | --- | --- |
-| [crates/tunmux/src/main.rs](crates/tunmux/src/main.rs), [crates/tunmux/src/cli.rs](crates/tunmux/src/cli.rs), [crates/tunmux/src/lib.rs](crates/tunmux/src/lib.rs) | Command entry point, Clap arguments, library exports |
-| `crates/tunmux/src/{proton,airvpn,mullvad,ivpn,wgconf}/` | Provider APIs, models, and command handlers |
-| [crates/tunmux/src/wireguard/](crates/tunmux/src/wireguard/) | Configuration, backends, connection state, health, and rootless proxy tunnel |
-| [crates/tunmux/src/shared/](crates/tunmux/src/shared/) | Credentials, hooks, persistence, and common connection operations |
-| `crates/tunmux/src/privileged*`, `crates/tunmux/src/userspace_helper*` | Privileged requests, embedded GotaTun helper, network setup and recovery |
-| [crates/tunmux/src/proxy/](crates/tunmux/src/proxy/), [crates/tunmux/src/netns.rs](crates/tunmux/src/netns.rs) | Linux namespace proxies |
-| [crates/tunmux/src/service.rs](crates/tunmux/src/service.rs), [crates/tunmux/src/automation.rs](crates/tunmux/src/automation.rs) | Service installation and automatic connections |
-| [crates/tunmux/tests/](crates/tunmux/tests/), [crates/tunmux/benches/](crates/tunmux/benches/), [scripts/](scripts/) | Integration tests, offline benchmarks, and validation tools |
+| [crates/tunmux-cli/src/main.rs](crates/tunmux-cli/src/main.rs), [crates/tunmux-cli/src/cli/](crates/tunmux-cli/src/cli/) | Command entry point, Clap arguments, provider subcommands, prompts and output, autoconnect controller |
+| [crates/tunmux-core/src/lib.rs](crates/tunmux-core/src/lib.rs), [crates/tunmux-core/src/api.rs](crates/tunmux-core/src/api.rs) | Library exports and the data-returning API used by the GUI |
+| `crates/tunmux-core/src/{proton,airvpn,mullvad,ivpn,wgconf}/` | Provider APIs, models, connect, disconnect and logout |
+| [crates/tunmux-core/src/wireguard/](crates/tunmux-core/src/wireguard/) | Configuration, backends, connection state, health, and rootless proxy tunnel |
+| [crates/tunmux-core/src/shared/](crates/tunmux-core/src/shared/) | Credentials, hooks, persistence, progress reporting, and common connection operations |
+| `crates/tunmux-core/src/privileged*`, `crates/tunmux-core/src/userspace_helper*` | Privileged requests, embedded GotaTun helper, network setup and recovery |
+| [crates/tunmux-core/src/proxy/](crates/tunmux-core/src/proxy/), [crates/tunmux-core/src/netns.rs](crates/tunmux-core/src/netns.rs) | Linux namespace proxies |
+| [crates/tunmux-core/src/service.rs](crates/tunmux-core/src/service.rs), [crates/tunmux-core/src/automation.rs](crates/tunmux-core/src/automation.rs) | Service installation and connection identity for automatic connections |
+| [crates/tunmux-cli/tests/](crates/tunmux-cli/tests/), [crates/tunmux-core/tests/](crates/tunmux-core/tests/), `crates/*/benches/`, [scripts/](scripts/) | Integration tests, offline benchmarks, and validation tools |
 | [CaddyGlow/smoltcp](https://github.com/CaddyGlow/smoltcp) | Patched TCP/IP stack used with BoringTun for rootless proxies (Cargo git patch) |
 
 Keep changes focused, preserve platform and feature gates, and add behavior tests

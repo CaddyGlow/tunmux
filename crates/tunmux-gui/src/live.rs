@@ -22,9 +22,9 @@ use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime};
 
-use tunmux::wireguard::backend::WgBackend;
-use tunmux::wireguard::connection::ConnectionState;
-use tunmux::wireguard::health::{self, HealthKind};
+use tunmux_core::wireguard::backend::WgBackend;
+use tunmux_core::wireguard::connection::ConnectionState;
+use tunmux_core::wireguard::health::{self, HealthKind};
 
 use crate::model::{ConnectionView, Health, Mode, Provider};
 
@@ -118,8 +118,8 @@ fn refresh(
             return Vec::new();
         }
     };
-    let dir = tunmux::config::connections_dir();
-    let helper_up = kind == Refresh::Full || tunmux::api::helper_process_running();
+    let dir = tunmux_core::config::connections_dir();
+    let helper_up = kind == Refresh::Full || tunmux_core::api::helper_process_running();
     let mut next = HashMap::new();
     for state in states {
         let name = state.instance_name.clone();
@@ -302,8 +302,8 @@ mod linux {
     }
 
     fn open_inotify() -> rustix::io::Result<OwnedFd> {
-        let dir = tunmux::config::connections_dir();
-        if let Err(error) = tunmux::config::ensure_connections_dir() {
+        let dir = tunmux_core::config::connections_dir();
+        if let Err(error) = tunmux_core::config::ensure_connections_dir() {
             tracing::warn!(%error, "gui_connections_dir_unavailable");
         }
         let fd = inotify::init(inotify::CreateFlags::CLOEXEC | inotify::CreateFlags::NONBLOCK)?;

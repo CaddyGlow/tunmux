@@ -1,4 +1,4 @@
-//! View types the GUI renders. They mirror the planned `tunmux::api` data
+//! View types the GUI renders. They mirror the planned `tunmux_core::api` data
 //! types so the mock backend can later be swapped for the real library.
 
 use std::time::SystemTime;
@@ -12,26 +12,26 @@ pub enum Provider {
     WgConf,
 }
 
-impl From<tunmux::config::Provider> for Provider {
-    fn from(p: tunmux::config::Provider) -> Self {
+impl From<tunmux_core::config::Provider> for Provider {
+    fn from(p: tunmux_core::config::Provider) -> Self {
         match p {
-            tunmux::config::Provider::Proton => Provider::Proton,
-            tunmux::config::Provider::AirVpn => Provider::AirVpn,
-            tunmux::config::Provider::Mullvad => Provider::Mullvad,
-            tunmux::config::Provider::Ivpn => Provider::Ivpn,
-            tunmux::config::Provider::Wgconf => Provider::WgConf,
+            tunmux_core::config::Provider::Proton => Provider::Proton,
+            tunmux_core::config::Provider::AirVpn => Provider::AirVpn,
+            tunmux_core::config::Provider::Mullvad => Provider::Mullvad,
+            tunmux_core::config::Provider::Ivpn => Provider::Ivpn,
+            tunmux_core::config::Provider::Wgconf => Provider::WgConf,
         }
     }
 }
 
-impl From<Provider> for tunmux::config::Provider {
+impl From<Provider> for tunmux_core::config::Provider {
     fn from(p: Provider) -> Self {
         match p {
-            Provider::Proton => tunmux::config::Provider::Proton,
-            Provider::AirVpn => tunmux::config::Provider::AirVpn,
-            Provider::Mullvad => tunmux::config::Provider::Mullvad,
-            Provider::Ivpn => tunmux::config::Provider::Ivpn,
-            Provider::WgConf => tunmux::config::Provider::Wgconf,
+            Provider::Proton => tunmux_core::config::Provider::Proton,
+            Provider::AirVpn => tunmux_core::config::Provider::AirVpn,
+            Provider::Mullvad => tunmux_core::config::Provider::Mullvad,
+            Provider::Ivpn => tunmux_core::config::Provider::Ivpn,
+            Provider::WgConf => tunmux_core::config::Provider::Wgconf,
         }
     }
 }
@@ -139,14 +139,14 @@ pub struct ConnectSpec {
 
 impl ConnectSpec {
     /// Library connect arguments for `server`.
-    pub fn to_api(&self, server: &str) -> tunmux::api::ConnectSpec {
-        tunmux::api::ConnectSpec {
+    pub fn to_api(&self, server: &str) -> tunmux_core::api::ConnectSpec {
+        tunmux_core::api::ConnectSpec {
             server: Some(server.to_string()),
             country: None,
             mode: match self.mode {
-                Mode::Direct => tunmux::api::ConnectMode::Direct,
-                Mode::NetnsProxy => tunmux::api::ConnectMode::NamespaceProxy,
-                Mode::LocalProxy => tunmux::api::ConnectMode::LocalProxy,
+                Mode::Direct => tunmux_core::api::ConnectMode::Direct,
+                Mode::NetnsProxy => tunmux_core::api::ConnectMode::NamespaceProxy,
+                Mode::LocalProxy => tunmux_core::api::ConnectMode::LocalProxy,
             },
             backend: (self.backend != Backend::Auto).then(|| self.backend.label().to_string()),
             disable_ipv6: self.disable_ipv6,
@@ -186,8 +186,8 @@ pub struct ServerView {
     pub ping_ms: Option<u32>,
 }
 
-impl From<tunmux::api::ServerInfo> for ServerView {
-    fn from(s: tunmux::api::ServerInfo) -> Self {
+impl From<tunmux_core::api::ServerInfo> for ServerView {
+    fn from(s: tunmux_core::api::ServerInfo) -> Self {
         Self {
             provider: s.provider.into(),
             name: s.name,
@@ -243,7 +243,7 @@ pub struct ConnectionView {
 
 impl ConnectionView {
     pub fn is_direct(&self) -> bool {
-        self.instance == tunmux::wireguard::connection::DIRECT_INSTANCE
+        self.instance == tunmux_core::wireguard::connection::DIRECT_INSTANCE
     }
 }
 

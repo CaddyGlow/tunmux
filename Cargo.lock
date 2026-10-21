@@ -5256,6 +5256,30 @@ dependencies = [
 name = "tunmux"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
+ "base64 0.23.1",
+ "clap",
+ "criterion",
+ "nix",
+ "rand 0.8.8",
+ "rpassword",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tokio",
+ "tracing",
+ "tunmux-build-version",
+ "tunmux-core",
+]
+
+[[package]]
+name = "tunmux-build-version"
+version = "0.1.0"
+
+[[package]]
+name = "tunmux-core"
+version = "0.1.0"
+dependencies = [
  "aes",
  "anyhow",
  "aws-lc-rs",
@@ -5264,7 +5288,6 @@ dependencies = [
  "boringtun",
  "bytes",
  "cbc",
- "clap",
  "cookie",
  "criterion",
  "crossbeam-queue",
@@ -5283,7 +5306,6 @@ dependencies = [
  "reqwest",
  "reqwest_cookie_store",
  "roxmltree",
- "rpassword",
  "rsa",
  "scraper",
  "serde",
@@ -5299,13 +5321,8 @@ dependencies = [
  "tracing-appender",
  "tracing-log",
  "tracing-subscriber",
- "tunmux-build-version",
  "x509-parser",
 ]
-
-[[package]]
-name = "tunmux-build-version"
-version = "0.1.0"
 
 [[package]]
 name = "tunmux-gui"
@@ -5321,8 +5338,8 @@ dependencies = [
  "tokio",
  "toml",
  "tracing",
- "tunmux",
  "tunmux-build-version",
+ "tunmux-core",
 ]
 
 [[package]]

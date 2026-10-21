@@ -7,12 +7,17 @@ Guidance for coding agents working in `tunmux`.
 - Language: Rust (edition 2021); use the toolchain pinned in `rust-toolchain.toml`.
 - Crate layout: Cargo workspace with packages under `crates/` and automation
   in `xtask/`.
-  `crates/tunmux` holds the library and CLI (`src/lib.rs`, `src/main.rs`),
-  `crates/tunmux-gui` the egui and tray front-end on the library API, and
+  `crates/tunmux-core` (package `tunmux-core`) is the library: no clap, no
+  terminal prompts. `crates/tunmux-cli` (package and binary `tunmux`) holds
+  `src/main.rs` and `src/cli/`: Clap types, provider subcommands with their
+  prompts and printed output, and the autoconnect controller.
+  `crates/tunmux-gui` is the egui and tray front-end on the library API, and
   `crates/tunmux-build-version` derives version strings from git. Root
-  commands default to `crates/tunmux`; pass `-p tunmux-gui` or `--workspace`
-  for the GUI.
-  Paths in sections 3 and 5 are relative to `crates/tunmux/`.
+  commands default to `crates/tunmux-cli`; pass `-p tunmux-core`,
+  `-p tunmux-gui` or `--workspace` for the others.
+  Paths in sections 3 and 5 are relative to `crates/tunmux-core/` unless they
+  start with `src/cli/`, `src/main.rs` or `tests/automation_cli.rs`, which are
+  in `crates/tunmux-cli/`.
 - Domain: multi-provider VPN CLI (`proton`, `airvpn`, `mullvad`, `ivpn`, `wgconf`).
 - Platforms:
   - Linux: direct, namespace proxy, rootless local-proxy, and systemd service installation.
@@ -20,6 +25,7 @@ Guidance for coding agents working in `tunmux`.
     and login-agent autoconnect.
   - Android: shared-library support; app and JNI adapter live in `../tunmux-android`.
 - Default Cargo features: `all-providers`, `proxy`, and `crypto-rustcrypto`.
+  The CLI declares the same features and forwards them to `tunmux-core`.
   AirVPN needs `crypto-rustcrypto` or `crypto-aws-lc`; AWS-LC wins if both are enabled.
   Each provider is independently
   gated; `keyring` is optional. `proxy` enables Linux namespace proxies, not rootless
@@ -66,16 +72,18 @@ Guidance for coding agents working in `tunmux`.
 
 ### Tests
 
-- Run full test suite: `cargo test --locked`
-- Run full test suite (dev quick): `cargo test`
+- Run full test suite: `cargo test --locked --workspace`
+- Run full test suite (dev quick): `cargo test --workspace`
+- Bare `cargo test` covers only the default member, `tunmux` (the CLI); library
+  tests need `-p tunmux-core`.
 - Run a single test by name:
-  - `cargo test test_select_relay_by_name`
+  - `cargo test -p tunmux-core test_select_relay_by_name`
 - Run a single test by full path filter:
-  - `cargo test mullvad::handlers::tests::test_select_relay_by_name`
+  - `cargo test -p tunmux-core mullvad::handlers::tests::test_select_relay_by_name`
 - Run one async tokio test:
-  - `cargo test test_session_new_with_confirmation_and_manifest_fetch`
+  - `cargo test -p tunmux-core test_session_new_with_confirmation_and_manifest_fetch`
 - Show test output:
-  - `cargo test test_select_host_by_hostname -- --nocapture`
+  - `cargo test -p tunmux-core test_select_host_by_hostname -- --nocapture`
 
 ### Repo checks (`cargo xtask ci`)
 
@@ -84,13 +92,15 @@ Guidance for coding agents working in `tunmux`.
 - `cargo xtask ci` runs `fmt`, `clippy` (workspace, all targets and features,
   warnings denied), `test` (default and all features), `features`, `markdown` and
   `audit`. Name steps to run a subset; `docker` and `all` include the image builds.
-- `features` runs Clippy and `cli::tests` per `--no-default-features` selection:
+- `features` runs Clippy on `tunmux-core` and `tunmux`, and `cli::tests`, per
+  `--no-default-features` selection:
   none, each provider, both AirVPN crypto backends, `proxy`, and `proxy,wgconf`.
   Limit it with `--feature-set <name>`; the list is in `FEATURE_SETS`.
 - `--quick` (pre-commit hook) runs fmt and default-feature Clippy. The pre-push
   hook runs `fmt clippy test markdown`. Enable hooks with
   `git config core.hooksPath .githooks`.
-- Offline CPU benchmarks: `cargo bench --locked --bench offline`.
+- Offline CPU benchmarks: `cargo bench --locked -p tunmux-core --bench offline`;
+  CLI parsing: `cargo bench --locked --bench cli`.
 
 ### Android build (when needed)
 
@@ -98,17 +108,28 @@ Guidance for coding agents working in `tunmux`.
 - Shared-library check (Android SDK/NDK and cargo-ndk required):
 
   ```sh
-  cargo ndk -t arm64-v8a -t armeabi-v7a -t x86_64 check --locked --lib \
-    --no-default-features --features all-providers,crypto-rustcrypto
+  cargo ndk -t arm64-v8a -t armeabi-v7a -t x86_64 check --locked \
+    -p tunmux-core --lib --no-default-features \
+    --features all-providers,crypto-rustcrypto
   ```
 
-- App builds and APK release workflows live in `../tunmux-android`.
+- App builds and APK release workflows live in `../tunmux-android`. It pins this
+  repository by git rev; the next bump must depend on
+  `tunmux-core = { git = ..., rev = ..., package = "tunmux-core" }` and use
+  `tunmux_core::` paths.
 - CI repeats the Android library check with `crypto-aws-lc`.
 - Follow that repository's instructions for app builds.
 
 ## 3) Source Layout and Architectural Conventions
 
 - Keep modules fairly flat; avoid unnecessary deep nesting.
+- `tunmux-core` stays free of clap and terminal input. Core code reports progress
+  lines with `progress!` (`src/shared/progress.rs`); the CLI installs a stdout
+  reporter and the GUI none. Argument parsing, prompts and printed tables belong
+  in the CLI's `src/cli/commands/<provider>.rs`.
+- The CLI must keep accepting every argv form core spawns: `privileged --serve`,
+  `proxy-daemon`, `local-proxy-daemon`, `proton ports daemon`, `--log-filter`,
+  and autoconnect re-execs with `--if-missing`.
 - Provider modules live under:
   - `src/proton/`
   - `src/airvpn/`

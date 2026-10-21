@@ -33,7 +33,7 @@ impl Default for Prefs {
 }
 
 fn path() -> PathBuf {
-    tunmux::config::app_config_dir().join("gui.toml")
+    tunmux_core::config::app_config_dir().join("gui.toml")
 }
 
 impl Prefs {

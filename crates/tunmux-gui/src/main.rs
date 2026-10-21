@@ -35,12 +35,12 @@ fn main() -> eframe::Result {
     }
     let prefs = prefs::Prefs::load();
     if let Some(filter) = prefs.log_filter() {
-        if let Err(e) = tunmux::logging::configure(false, Some(&filter)) {
+        if let Err(e) = tunmux_core::logging::configure(false, Some(&filter)) {
             eprintln!("tunmux-gui: log level {:?} ignored: {e}", prefs.log_level);
         }
     }
     // Library code logs through `tracing`; keep the guard to flush on exit.
-    let _logging = tunmux::logging::init_terminal(false)
+    let _logging = tunmux_core::logging::init_terminal(false)
         .inspect_err(|e| eprintln!("tunmux-gui: logging disabled: {e}"))
         .ok();
     if let Some(arg) = args
@@ -56,7 +56,7 @@ fn main() -> eframe::Result {
     let hidden = args.iter().any(|a| a == "--hidden");
     let cli = (!mock).then(find_cli).flatten();
     if let Some(path) = &cli {
-        tunmux::shared::executable::set_cli_executable(path.clone());
+        tunmux_core::shared::executable::set_cli_executable(path.clone());
     }
 
     let window_ctx: WindowCtx = Arc::default();

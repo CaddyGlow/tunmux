@@ -1,6 +1,6 @@
 [workspace]
 members = ["crates/*", "xtask"]
-default-members = ["crates/tunmux"]
+default-members = ["crates/tunmux-cli"]
 resolver = "2"
 
 [workspace.package]
