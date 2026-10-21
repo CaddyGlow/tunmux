@@ -48,7 +48,6 @@ jobs:
     uses: ./.github/workflows/manual-build.yml
     with:
       ref: ${{ github.ref }}
-      version: ${{ github.ref_name }}
 
   release:
     name: Publish GitHub Release

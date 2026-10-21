@@ -7,20 +7,12 @@ on:
         description: Git ref to build (branch, tag, or SHA)
         required: true
         type: string
-      version:
-        description: Version label for packaged artifacts
-        required: true
-        type: string
   workflow_dispatch:
     inputs:
       ref:
         description: Git ref to build (branch, tag, or SHA)
         required: true
         default: main
-        type: string
-      version:
-        description: Version label for packaged artifacts (for example v1.2.3-special)
-        required: true
         type: string
 
 env:
@@ -60,20 +52,16 @@ jobs:
         uses: Swatinem/rust-cache@v2
 
       - name: Build native target
-        env:
-          TUNMUX_GIT_TAG: ${{ inputs.version }}
         run: cargo build --release --locked --target ${{ matrix.target }}
 
       - name: Package artifact
         shell: bash
         env:
-          RELEASE_VERSION: ${{ inputs.version }}
           RELEASE_TARGET: ${{ matrix.target }}
         run: |
           set -euo pipefail
-          version="$RELEASE_VERSION"
-          [[ "$version" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]] || exit 1
-          asset_dir="${APP_NAME}-${version}-${RELEASE_TARGET}"
+          eval "$(cargo xtask version)"
+          asset_dir="${APP_NAME}-${label}-${RELEASE_TARGET}"
           mkdir -p dist "${asset_dir}"
           cp "target/${RELEASE_TARGET}/release/${APP_NAME}" LICENSE README.md "${asset_dir}/"
           tar -czf "dist/${asset_dir}.tar.gz" "${asset_dir}"
@@ -88,21 +76,21 @@ jobs:
       - name: Smoke-test packaged binary
         shell: bash
         env:
-          RELEASE_VERSION: ${{ inputs.version }}
           RELEASE_TARGET: ${{ matrix.target }}
         run: |
           set -euo pipefail
-          asset_dir="${APP_NAME}-${RELEASE_VERSION}-${RELEASE_TARGET}"
+          eval "$(cargo xtask version)"
+          asset_dir="${APP_NAME}-${label}-${RELEASE_TARGET}"
           mkdir -p smoke
           tar -xzf "dist/${asset_dir}.tar.gz" -C smoke
           test -s "smoke/${asset_dir}/LICENSE"
           test -s "smoke/${asset_dir}/README.md"
-          "smoke/${asset_dir}/${APP_NAME}" --version | grep -Fx "tunmux ${RELEASE_VERSION}"
+          "smoke/${asset_dir}/${APP_NAME}" --version | grep -Fx "tunmux ${long}"
           "smoke/${asset_dir}/${APP_NAME}" --help
 
       - name: Upload packaged artifact
         uses: actions/upload-artifact@v4
         with:
-          name: ${{ matrix.target }}-${{ inputs.version }}
+          name: ${{ matrix.target }}
           path: dist/*
           if-no-files-found: error

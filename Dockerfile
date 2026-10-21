@@ -1,11 +1,8 @@
 FROM rust:1-bookworm AS builder
 
-ARG TUNMUX_GIT_TAG=dev
-ENV TUNMUX_GIT_TAG=${TUNMUX_GIT_TAG}
-
 WORKDIR /app
 
-COPY Cargo.toml Cargo.lock rust-toolchain.toml build.rs ./
+COPY Cargo.toml Cargo.lock rust-toolchain.toml ./
 COPY src ./src
 COPY launchd ./launchd
 COPY systemd ./systemd
@@ -13,6 +10,7 @@ COPY benches ./benches
 COPY tests ./tests
 COPY LICENSE README.md ./
 COPY xtask ./xtask
+COPY tunmux-build-version ./tunmux-build-version
 
 RUN cargo build --release --locked
 

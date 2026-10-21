@@ -78,7 +78,7 @@ pub struct ConnectOptions {
 #[command(
     name = "tunmux",
     about = "Multi-provider VPN CLI",
-    version = env!("TUNMUX_BUILD_VERSION")
+    version = tunmux_build_version::LONG_VERSION
 )]
 pub struct Cli {
     #[command(subcommand)]

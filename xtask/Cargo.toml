@@ -1,11 +1,12 @@
 [package]
 name = "xtask"
-version = "0.0.0"
-edition = "2021"
+version.workspace = true
+edition.workspace = true
 publish = false
 description = "Release build automation for tunmux"
 
 [dependencies]
+tunmux-build-version = { path = "../tunmux-build-version" }
 anyhow = "1"
 serde_json = "1"
 sha2 = "0.10"

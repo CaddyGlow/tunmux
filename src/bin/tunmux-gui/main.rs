@@ -28,6 +28,11 @@ use tray::TrayAction;
 type WindowCtx = Arc<Mutex<Option<egui::Context>>>;
 
 fn main() -> eframe::Result {
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    if args.iter().any(|a| a == "--version" || a == "-V") {
+        println!("tunmux-gui {}", tunmux_build_version::LONG_VERSION);
+        return Ok(());
+    }
     let prefs = prefs::Prefs::load();
     if let Some(filter) = prefs.log_filter() {
         if let Err(e) = tunmux::logging::configure(false, Some(&filter)) {
@@ -38,14 +43,13 @@ fn main() -> eframe::Result {
     let _logging = tunmux::logging::init_terminal(false)
         .inspect_err(|e| eprintln!("tunmux-gui: logging disabled: {e}"))
         .ok();
-    let args: Vec<String> = std::env::args().skip(1).collect();
     if let Some(arg) = args
         .iter()
         .find(|a| !["--mock", "--hidden"].contains(&a.as_str()))
     {
         // Also stops a helper re-exec aimed at the wrong binary from
         // opening a second window.
-        eprintln!("tunmux-gui: unknown argument {arg:?}; options: --mock, --hidden");
+        eprintln!("tunmux-gui: unknown argument {arg:?}; options: --mock, --hidden, --version");
         std::process::exit(2);
     }
     let mock = args.iter().any(|a| a == "--mock");

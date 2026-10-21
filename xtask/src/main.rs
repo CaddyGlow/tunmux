@@ -77,7 +77,6 @@ const FLATPAK_ARCHES: &[&str] = &["x86_64", "aarch64"];
 
 struct Options {
     selectors: Vec<String>,
-    version: Option<String>,
     out_dir: PathBuf,
     cargo_args: Vec<String>,
     keep_going: bool,
@@ -115,6 +114,12 @@ fn main() -> ExitCode {
             print_targets();
             Ok(())
         }
+        Some("version") => {
+            // Shell assignments for the release workflow: `eval "$(cargo xtask version)"`.
+            println!("long='{}'", tunmux_build_version::LONG_VERSION);
+            println!("label='{}'", tunmux_build_version::DIST_LABEL);
+            Ok(())
+        }
         None | Some("help" | "-h" | "--help") => {
             print_help();
             Ok(())
@@ -140,6 +145,7 @@ Commands:
   dist [SELECTOR...] [OPTIONS]   Build and package release artifacts into dist/
   ci [STEP...] [OPTIONS]         Run repository checks (`cargo xtask ci --help`)
   targets                        List known targets and selector groups
+  version                        Print `long=` and `label=` shell assignments
   help                           Show this message
 
 Selectors (default: all):
@@ -151,7 +157,6 @@ Selectors (default: all):
   <triple>            a single Rust target triple
 
 Options:
-  --version <label>        version label (default: git describe, else dev)
   --out <dir>              output directory (default: dist)
   --features <list>        forwarded to cargo
   --no-default-features    forwarded to cargo
@@ -162,7 +167,10 @@ Options:
 Toolchain: run inside the project's Nix dev shell. Linux targets use
 cargo-zigbuild; macOS targets also need clang, lld and SDKROOT pointing at a
 MacOSX SDK (native cargo is used on a macOS host); Windows uses cargo-xwin.
-Targets whose Rust standard library is missing are skipped under `all`."
+Targets whose Rust standard library is missing are skipped under `all`.
+
+Archive names carry the package version for a clean checkout of its tag
+`v<version>`, else the version plus the commit (`0.1.0-88a8b70[-dirty]`)."
     );
 }
 
@@ -192,7 +200,6 @@ fn print_targets() {
 fn parse_options(args: &[String]) -> Result<Options> {
     let mut opts = Options {
         selectors: Vec::new(),
-        version: None,
         out_dir: PathBuf::from("dist"),
         cargo_args: Vec::new(),
         keep_going: false,
@@ -206,7 +213,6 @@ fn parse_options(args: &[String]) -> Result<Options> {
                 .ok_or_else(|| format!("{flag} needs a value"))
         };
         match arg.as_str() {
-            "--version" => opts.version = Some(value("--version")?),
             "--out" => opts.out_dir = PathBuf::from(value("--out")?),
             "--features" => {
                 let features = value("--features")?;
@@ -275,11 +281,6 @@ fn resolve_jobs(selectors: &[String]) -> Result<Vec<(Job<'static>, bool)>> {
 fn dist(opts: &Options) -> Result<()> {
     let root = workspace_root()?;
     env::set_current_dir(&root).map_err(|e| format!("cannot enter {}: {e}", root.display()))?;
-    let version = match &opts.version {
-        Some(v) => v.clone(),
-        None => default_version(),
-    };
-    validate_version(&version)?;
     let jobs = resolve_jobs(&opts.selectors)?;
     let sysroot = rust_sysroot()?;
     let target_dir = cargo_target_dir()?;
@@ -288,7 +289,6 @@ fn dist(opts: &Options) -> Result<()> {
 
     let ctx = Context {
         opts,
-        version: &version,
         target_dir: &target_dir,
     };
     let mut built = Vec::new();
@@ -310,7 +310,10 @@ fn dist(opts: &Options) -> Result<()> {
             }
             continue;
         }
-        eprintln!("xtask: building {name} ({version})");
+        eprintln!(
+            "xtask: building {name} ({})",
+            tunmux_build_version::LONG_VERSION
+        );
         let result = match job {
             Job::Binary(target) => ctx.package_binary(target),
             Job::Flatpak(arch) => ctx.flatpak(arch),
@@ -346,7 +349,6 @@ fn dist(opts: &Options) -> Result<()> {
 
 struct Context<'a> {
     opts: &'a Options,
-    version: &'a str,
     target_dir: &'a Path,
 }
 
@@ -398,8 +400,7 @@ impl Context<'_> {
             "--bin",
             APP_NAME,
         ])
-        .args(&self.opts.cargo_args)
-        .env("TUNMUX_GIT_TAG", self.version);
+        .args(&self.opts.cargo_args);
         run(&mut cmd)?;
         let binary = self
             .target_dir
@@ -440,7 +441,11 @@ impl Context<'_> {
 
     fn package_binary(&self, target: &Target) -> Result<PathBuf> {
         let binary = self.build(target)?;
-        let name = format!("{APP_NAME}-{}-{}", self.version, target.triple);
+        let name = format!(
+            "{APP_NAME}-{}-{}",
+            tunmux_build_version::DIST_LABEL,
+            target.triple
+        );
         let stage = self.opts.out_dir.join(&name);
         if stage.exists() {
             fs::remove_dir_all(&stage)
@@ -452,7 +457,7 @@ impl Context<'_> {
         copy(Path::new("LICENSE"), &stage.join("LICENSE"))?;
         copy(Path::new("README.md"), &stage.join("README.md"))?;
         check_linkage(target.triple, &stage.join(self.binary_name(target)))?;
-        smoke_test(target, &stage.join(self.binary_name(target)), self.version)?;
+        smoke_test(target, &stage.join(self.binary_name(target)))?;
 
         let archive = if target.builder == Builder::Xwin {
             let archive = format!("{name}.zip");
@@ -525,7 +530,10 @@ impl Context<'_> {
             )
         })?;
 
-        let bundle = format!("{APP_NAME}-{}-{arch}.flatpak", self.version);
+        let bundle = format!(
+            "{APP_NAME}-{}-{arch}.flatpak",
+            tunmux_build_version::DIST_LABEL
+        );
         let bundle_path = self.opts.out_dir.join(&bundle);
         run(Command::new("flatpak")
             .arg("build-bundle")
@@ -632,7 +640,7 @@ fn parse_version(text: &str) -> Option<Vec<u32>> {
     (!parts.is_empty()).then_some(parts)
 }
 
-fn smoke_test(target: &Target, binary: &Path, version: &str) -> Result<()> {
+fn smoke_test(target: &Target, binary: &Path) -> Result<()> {
     let host_os = if cfg!(target_os = "macos") {
         "apple-darwin"
     } else if cfg!(target_os = "linux") {
@@ -649,7 +657,7 @@ fn smoke_test(target: &Target, binary: &Path, version: &str) -> Result<()> {
         .output()
         .map_err(|e| format!("cannot run {}: {e}", binary.display()))?;
     let stdout = String::from_utf8_lossy(&output.stdout);
-    let expected = format!("{APP_NAME} {version}");
+    let expected = format!("{APP_NAME} {}", tunmux_build_version::LONG_VERSION);
     if !output.status.success() || stdout.trim() != expected {
         return Err(format!(
             "smoke test failed: expected `{expected}`, got `{}`",
@@ -781,26 +789,5 @@ fn unwrapped_clang() -> String {
     match orig {
         Some(dir) => format!("{}/bin/clang", dir.trim()),
         None => "clang".to_string(),
-    }
-}
-
-fn default_version() -> String {
-    if let Ok(tag) = env::var("TUNMUX_GIT_TAG") {
-        if !tag.trim().is_empty() {
-            return tag.trim().to_string();
-        }
-    }
-    capture(Command::new("git").args(["describe", "--tags", "--always", "--dirty"]))
-        .unwrap_or_else(|_| "dev".to_string())
-}
-
-fn validate_version(version: &str) -> Result<()> {
-    let mut chars = version.chars();
-    let valid_start = chars.next().is_some_and(|c| c.is_ascii_alphanumeric());
-    let valid_rest = chars.all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'));
-    if valid_start && valid_rest {
-        Ok(())
-    } else {
-        Err(format!("invalid version label `{version}`"))
     }
 }

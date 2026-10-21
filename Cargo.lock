@@ -5258,6 +5258,7 @@ version = "0.1.0"
 dependencies = [
  "aes",
  "anyhow",
+ "arboard",
  "aws-lc-rs",
  "base64 0.23.1",
  "bcrypt",
@@ -5272,9 +5273,12 @@ dependencies = [
  "daemonize2",
  "dbus-secret-service",
  "ed25519-dalek",
+ "eframe",
+ "egui",
  "gotatun",
  "hickory-resolver",
  "keyring",
+ "ksni",
  "log",
  "nix",
  "num-bigint",
@@ -5285,6 +5289,7 @@ dependencies = [
  "roxmltree",
  "rpassword",
  "rsa",
+ "rustix 1.1.5",
  "scraper",
  "serde",
  "serde_json",
@@ -5299,25 +5304,13 @@ dependencies = [
  "tracing-appender",
  "tracing-log",
  "tracing-subscriber",
+ "tunmux-build-version",
  "x509-parser",
 ]
 
 [[package]]
-name = "tunmux-gui"
+name = "tunmux-build-version"
 version = "0.1.0"
-dependencies = [
- "anyhow",
- "arboard",
- "eframe",
- "egui",
- "ksni",
- "rustix 1.1.5",
- "serde",
- "tokio",
- "toml",
- "tracing",
- "tunmux",
-]
 
 [[package]]
 name = "type-map"
@@ -6178,13 +6171,14 @@ checksum = "e450f9b2ed1dff33c94c12589a87338689467b9c4f5d8a5710bd09a847d2c8a7"
 
 [[package]]
 name = "xtask"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "anyhow",
  "nix",
  "serde_json",
  "sha2",
  "tempfile",
+ "tunmux-build-version",
 ]
 
 [[package]]

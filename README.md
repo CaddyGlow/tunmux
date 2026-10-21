@@ -139,11 +139,12 @@ Useful connection options:
 
 `tunmux-gui` is a window and system tray for the same accounts and connections.
 On Linux the tray uses StatusNotifierItem (KDE, waybar, GNOME with the
-AppIndicator extension). Build both binaries so the GUI can find `tunmux` next
-to it, otherwise on `PATH`:
+AppIndicator extension). It is behind the `gui` feature; building with it
+produces both binaries, so the GUI finds `tunmux` next to it, otherwise on
+`PATH`:
 
 ```sh
-cargo build --release --locked -p tunmux -p tunmux-gui
+cargo build --release --locked --features gui
 target/release/tunmux-gui            # --hidden: start in the tray only
 ```
 
@@ -266,6 +267,7 @@ Features are additive; use
 | `all-providers` | All five providers |
 | `proxy` | Linux network-namespace proxy support; not required for rootless local-proxy mode |
 | `keyring` | Optional credential storage through the keyring crate |
+| `gui` | The `tunmux-gui` desktop binary (egui window and system tray) |
 | `crypto-rustcrypto` | Pure Rust RSA encryption for AirVPN (default) |
 | `crypto-aws-lc` | AWS-LC RSA encryption for AirVPN; takes precedence when both crypto features are enabled |
 

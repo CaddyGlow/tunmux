@@ -1,16 +1,20 @@
 [workspace]
-members = [".", "xtask", "tunmux-gui"]
+members = [".", "xtask", "tunmux-build-version"]
 resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
 
 [package]
 name = "tunmux"
-version = "0.1.0"
-edition = "2021"
+version.workspace = true
+edition.workspace = true
 description = "Multi-provider WireGuard VPN CLI and library"
-license = "MIT"
+license.workspace = true
 repository = "https://github.com/CaddyGlow/tunmux"
 readme = "README.md"
-build = "build.rs"
 
 [lib]
 name = "tunmux"
@@ -19,6 +23,11 @@ path = "src/lib.rs"
 [[bin]]
 name = "tunmux"
 path = "src/main.rs"
+
+[[bin]]
+name = "tunmux-gui"
+path = "src/bin/tunmux-gui/main.rs"
+required-features = ["gui"]
 
 [[bench]]
 name = "offline"
@@ -36,10 +45,13 @@ ivpn = ["dep:rpassword", "dep:ed25519-dalek", "dep:curve25519-dalek", "reqwest/c
 wgconf = []
 proxy = []
 keyring = ["dep:keyring", "dep:dbus-secret-service"]
+# Tray and egui front-end, the tunmux-gui binary.
+gui = ["dep:eframe", "dep:egui", "dep:arboard", "dep:ksni", "dep:rustix"]
 
 [dependencies]
 # CLI
 clap = { version = "4", features = ["derive"] }
+tunmux-build-version = { path = "tunmux-build-version" }
 
 # Async
 tokio = { version = "1", features = ["full"] }
@@ -102,6 +114,11 @@ anyhow = "1"
 # Keyring (optional)
 keyring = { version = "3", optional = true, features = ["apple-native", "sync-secret-service"] }
 
+# GUI (tunmux-gui)
+eframe = { version = "0.37", default-features = false, features = ["glow", "default_fonts", "wayland", "x11", "clipboard"], optional = true }
+egui = { version = "0.37", optional = true }
+arboard = { version = "3.7", default-features = false, features = ["wayland-data-control"], optional = true }
+
 # Userspace WireGuard crypto + virtual TCP/IP stack for local-proxy mode
 boringtun = "0.7"
 smoltcp = { version = "0.14", default-features = false, features = [
@@ -117,6 +134,8 @@ smoltcp = { version = "0.14", default-features = false, features = [
 # keyring's umbrella crypto features also pull unused backends into Cargo.lock.
 [target.'cfg(target_os = "linux")'.dependencies]
 dbus-secret-service = { version = "4.1", optional = true, features = ["crypto-rust", "vendored"] }
+ksni = { version = "0.3", features = ["blocking"], optional = true }
+rustix = { version = "1.1", features = ["event", "fs", "net", "process", "std"], optional = true }
 
 [target.'cfg(not(target_os = "android"))'.dependencies]
 # Password input (terminal only)
