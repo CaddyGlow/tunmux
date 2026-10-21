@@ -2,7 +2,7 @@
 //! tunmux library. Connections take a moment to come up so the transient
 //! states are visible.
 
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use crate::model::{
     AccountView, Backend, ConnectSpec, ConnectionView, Health, LoginState, Mode, Provider,
@@ -123,7 +123,7 @@ impl MockBackend {
         }
         for c in &mut me.connections {
             c.health = Health::Active;
-            c.since = Instant::now() - Duration::from_secs(4333);
+            c.since = SystemTime::now() - Duration::from_secs(4333);
         }
         me
     }
@@ -171,13 +171,14 @@ impl MockBackend {
         let dt = now.duration_since(self.last_tick).as_secs_f64();
         self.last_tick = now;
         for c in &mut self.connections {
-            if c.health == Health::Connecting && now.duration_since(c.since) >= CONNECT_DELAY {
+            let age = c.since.elapsed().unwrap_or_default();
+            if c.health == Health::Connecting && age >= CONNECT_DELAY {
                 c.health = Health::Active;
-                c.since = now;
+                c.since = SystemTime::now();
             }
             if c.health == Health::Active {
-                c.rx_bytes += (dt * 380_000.0) as u64;
-                c.tx_bytes += (dt * 42_000.0) as u64;
+                c.rx_bytes = Some(c.rx_bytes.unwrap_or(0) + (dt * 380_000.0) as u64);
+                c.tx_bytes = Some(c.tx_bytes.unwrap_or(0) + (dt * 42_000.0) as u64);
             }
         }
     }
@@ -236,24 +237,25 @@ impl MockBackend {
             instance: instance.clone(),
             provider: server.provider,
             server: server.name.clone(),
-            country_code: server.country_code,
-            city: server.city,
+            country_code: server.country_code.into(),
+            city: server.city.into(),
             mode: spec.mode,
             backend: if spec.mode == Mode::LocalProxy {
-                Backend::Userspace
+                "local-proxy"
             } else if spec.backend == Backend::Auto {
-                Backend::Kernel
+                Backend::Kernel.label()
             } else {
-                spec.backend
-            },
+                spec.backend.label()
+            }
+            .into(),
             virtual_ip: format!("10.{}.0.{}", 64 + n, n),
             socks_port,
             http_port,
             health: Health::Connecting,
             health_reason: None,
-            since: Instant::now(),
-            rx_bytes: 0,
-            tx_bytes: 0,
+            since: SystemTime::now(),
+            rx_bytes: None,
+            tx_bytes: None,
         });
         // Direct first, then proxies in connect order.
         self.connections.sort_by_key(|c| !c.is_direct());
@@ -298,7 +300,7 @@ impl MockBackend {
         if let Some(c) = self.connections.iter_mut().find(|c| c.instance == instance) {
             c.health = Health::Connecting;
             c.health_reason = None;
-            c.since = Instant::now();
+            c.since = SystemTime::now();
         }
     }
 

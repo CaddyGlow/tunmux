@@ -1,10 +1,33 @@
-//! Tray menu model. The same item list will feed the real tray (tray-icon or
-//! ksni); for now it is rendered as a preview popup inside the window.
+//! Tray menu model, shared by the system tray (`systray`) and the preview
+//! popup inside the window.
 
 use egui::{Color32, Pos2, Sense, Stroke, Ui, Vec2};
 
-use crate::mock::MockBackend;
-use crate::model::{ConnectionView, Provider, TrayState};
+use crate::model::{ConnectionView, Health, Mode, Provider, TrayState};
+
+/// Everything the tray menu shows.
+#[derive(Debug, Clone, Default)]
+pub struct TrayModel {
+    pub conns: Vec<ConnectionView>,
+    /// Logged-in providers offered under "Quick connect".
+    pub quick: Vec<Provider>,
+    pub recent: Vec<(Provider, String, Mode)>,
+}
+
+impl TrayModel {
+    /// Changes that alter the menu or icon; traffic and uptime are ignored.
+    pub fn signature(&self) -> String {
+        let mut s = String::new();
+        for c in &self.conns {
+            s += &format!(
+                "{}|{}|{:?}|{:?}|{:?};",
+                c.instance, c.server, c.health, c.socks_port, c.http_port
+            );
+        }
+        s += &format!("{:?}{:?}", self.quick, self.recent);
+        s
+    }
+}
 
 #[derive(Debug, Clone)]
 pub enum TrayAction {
@@ -29,7 +52,7 @@ pub fn tooltip(conns: &[ConnectionView]) -> String {
     let proxies = conns.iter().filter(|c| !c.is_direct()).count();
     let mut s = String::from("tunmux - ");
     match direct {
-        Some(c) => s += &format!("{} {} ({})", c.provider.label(), c.server, c.country_code),
+        Some(c) => s += &format!("{} {}", c.provider.label(), place(c)),
         None if proxies == 0 => s += "disconnected",
         None => s += "no direct tunnel",
     }
@@ -39,18 +62,26 @@ pub fn tooltip(conns: &[ConnectionView]) -> String {
     s
 }
 
-pub fn build_menu(backend: &MockBackend) -> Vec<TrayItem> {
-    let conns = &backend.connections;
+/// "Hydrus (CH)" or just the server name when the country is unknown.
+pub fn place(c: &ConnectionView) -> String {
+    if c.country_code.is_empty() {
+        c.server.clone()
+    } else {
+        format!("{} ({})", c.server, c.country_code)
+    }
+}
+
+pub fn build_menu(model: &TrayModel) -> Vec<TrayItem> {
+    let conns = &model.conns;
     let mut items = Vec::new();
 
     match conns.iter().find(|c| c.is_direct()) {
         Some(c) => {
             items.push(TrayItem::Label(format!(
-                "{}: {} {} ({})",
+                "{}: {} {}",
                 TrayState::from_connections(std::slice::from_ref(c)).label(),
                 c.provider.label(),
-                c.server,
-                c.country_code
+                place(c)
             )));
             items.push(TrayItem::Action(
                 "Disconnect direct".into(),
@@ -68,7 +99,15 @@ pub fn build_menu(backend: &MockBackend) -> Vec<TrayItem> {
             let socks = c.socks_port.unwrap_or_default();
             let http = c.http_port.unwrap_or_default();
             items.push(TrayItem::Submenu(
-                format!("{}  SOCKS :{socks}  HTTP :{http}", c.instance),
+                format!(
+                    "{}  SOCKS :{socks}  HTTP :{http}{}",
+                    c.instance,
+                    match c.health {
+                        Health::Inactive => "  (inactive)",
+                        Health::Connecting => "  (connecting)",
+                        Health::Active | Health::Unknown => "",
+                    }
+                ),
                 vec![
                     TrayItem::Action(
                         "Copy SOCKS address".into(),
@@ -83,22 +122,24 @@ pub fn build_menu(backend: &MockBackend) -> Vec<TrayItem> {
         }
     }
 
-    items.push(TrayItem::Separator);
-    let quick: Vec<_> = Provider::ALL
-        .into_iter()
-        .filter(|p| p.needs_account() && backend.is_logged_in(*p))
-        .map(|p| {
-            TrayItem::Action(
-                format!("{} - fastest", p.label()),
-                TrayAction::QuickConnect(p),
-            )
-        })
-        .collect();
-    if !quick.is_empty() {
+    if !model.quick.is_empty() || !model.recent.is_empty() {
+        items.push(TrayItem::Separator);
+    }
+    if !model.quick.is_empty() {
+        let quick = model
+            .quick
+            .iter()
+            .map(|p| {
+                TrayItem::Action(
+                    format!("{} - fastest", p.label()),
+                    TrayAction::QuickConnect(*p),
+                )
+            })
+            .collect();
         items.push(TrayItem::Submenu("Quick connect".into(), quick));
     }
-    if !backend.recent.is_empty() {
-        let recent = backend
+    if !model.recent.is_empty() {
+        let recent = model
             .recent
             .iter()
             .enumerate()
@@ -201,4 +242,61 @@ pub fn paint_icon(ui: &mut Ui, state: TrayState, size: f32) -> egui::Response {
         }
     }
     response
+}
+
+/// Render the tray icon as ARGB32 pixels (network byte order), using the
+/// same shapes as `paint_icon`, with 4x4 supersampling.
+pub fn icon_argb(state: TrayState, size: usize) -> Vec<u8> {
+    let color = state_color(state);
+    let faint = color.gamma_multiply(0.35);
+    let s = size as f32;
+    let (c, r, w) = (s / 2.0, s * 0.42, s * 0.1);
+    let sample = |x: f32, y: f32| -> Option<Color32> {
+        let d = ((x - c).powi(2) + (y - c).powi(2)).sqrt();
+        let ring = (d - (r - w / 2.0)).abs() <= w / 2.0;
+        match state {
+            TrayState::Disconnected | TrayState::Connecting => ring.then_some(color),
+            TrayState::Direct => (d <= r).then_some(color),
+            TrayState::ProxiesOnly => (ring || d <= r * 0.45).then_some(color),
+            TrayState::Degraded => {
+                let bar = (x - c).abs() <= s * 0.06 && y >= c - r * 0.55 && y <= c + r * 0.15;
+                let dot = ((x - c).powi(2) + (y - (c + r * 0.5)).powi(2)).sqrt() <= s * 0.07;
+                if bar || dot {
+                    Some(Color32::WHITE)
+                } else {
+                    (d <= r).then_some(faint)
+                }
+            }
+        }
+    };
+    let mut out = Vec::with_capacity(size * size * 4);
+    for py in 0..size {
+        for px in 0..size {
+            let (mut a, mut rr, mut gg, mut bb) = (0.0f32, 0.0f32, 0.0f32, 0.0f32);
+            for sy in 0..4 {
+                for sx in 0..4 {
+                    let x = px as f32 + (sx as f32 + 0.5) / 4.0;
+                    let y = py as f32 + (sy as f32 + 0.5) / 4.0;
+                    if let Some(col) = sample(x, y) {
+                        let ca = col.a() as f32 / 255.0;
+                        a += ca;
+                        rr += col.r() as f32;
+                        gg += col.g() as f32;
+                        bb += col.b() as f32;
+                    }
+                }
+            }
+            // Color32 is premultiplied; average then un-premultiply.
+            let alpha = a / 16.0;
+            let un = |v: f32| {
+                if alpha > 0.0 {
+                    (v / 16.0 / alpha).min(255.0) as u8
+                } else {
+                    0
+                }
+            };
+            out.extend_from_slice(&[(alpha * 255.0) as u8, un(rr), un(gg), un(bb)]);
+        }
+    }
+    out
 }

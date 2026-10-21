@@ -1,7 +1,7 @@
 //! View types the GUI renders. They mirror the planned `tunmux::api` data
 //! types so the mock backend can later be swapped for the real library.
 
-use std::time::Instant;
+use std::time::SystemTime;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Provider {
@@ -13,6 +13,18 @@ pub enum Provider {
 }
 
 impl Provider {
+    /// Map the provider directory name saved in `ConnectionState::provider`.
+    pub fn from_dir_name(name: &str) -> Option<Self> {
+        Some(match name {
+            "proton" => Provider::Proton,
+            "airvpn" => Provider::AirVpn,
+            "mullvad" => Provider::Mullvad,
+            "ivpn" => Provider::Ivpn,
+            "wgconf" => Provider::WgConf,
+            _ => return None,
+        })
+    }
+
     pub const ALL: [Provider; 5] = [
         Provider::Proton,
         Provider::AirVpn,
@@ -152,23 +164,24 @@ pub struct ConnectionView {
     pub instance: String,
     pub provider: Provider,
     pub server: String,
-    pub country_code: &'static str,
-    pub city: &'static str,
+    pub country_code: String,
+    pub city: String,
     pub mode: Mode,
-    pub backend: Backend,
+    pub backend: String,
     pub virtual_ip: String,
     pub socks_port: Option<u16>,
     pub http_port: Option<u16>,
     pub health: Health,
     pub health_reason: Option<String>,
-    pub since: Instant,
-    pub rx_bytes: u64,
-    pub tx_bytes: u64,
+    pub since: SystemTime,
+    /// Traffic counters, when the source can report them.
+    pub rx_bytes: Option<u64>,
+    pub tx_bytes: Option<u64>,
 }
 
 impl ConnectionView {
     pub fn is_direct(&self) -> bool {
-        self.instance == "_direct"
+        self.instance == tunmux::wireguard::connection::DIRECT_INSTANCE
     }
 }
 
@@ -214,10 +227,9 @@ impl TrayState {
         if conns.is_empty() {
             return TrayState::Disconnected;
         }
-        if conns
-            .iter()
-            .any(|c| matches!(c.health, Health::Inactive | Health::Unknown))
-        {
+        // Unknown is not evidence of failure (netns proxies are always
+        // unknown), so only an observed inactive tunnel degrades the icon.
+        if conns.iter().any(|c| c.health == Health::Inactive) {
             return TrayState::Degraded;
         }
         if conns.iter().any(|c| c.health == Health::Connecting) {

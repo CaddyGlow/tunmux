@@ -6,11 +6,12 @@ use std::time::{Duration, Instant};
 
 use egui::{Align, Color32, Layout, RichText, Ui};
 
+use crate::live::Live;
 use crate::mock::{ConnectError, MockBackend};
 use crate::model::{
     Backend, ConnectSpec, ConnectionView, Health, Mode, Provider, ServerView, SortKey, TrayState,
 };
-use crate::tray::{self, TrayAction};
+use crate::tray::{self, TrayAction, TrayModel};
 
 const TOAST_TTL: Duration = Duration::from_secs(4);
 
@@ -70,10 +71,18 @@ pub struct TunmuxApp {
     toasts: Vec<Toast>,
     pub settings: Settings,
     pub actions: Vec<Action>,
+    /// Real connection status; `None` runs everything on mock data.
+    pub live: Option<Live>,
+    #[cfg(target_os = "linux")]
+    pub systray: Option<crate::systray::Handle>,
+    tray_signature: String,
+    clipboard: Option<arboard::Clipboard>,
+    /// Set by the tray "Quit" item.
+    pub quit: bool,
 }
 
 impl TunmuxApp {
-    pub fn new() -> Self {
+    pub fn new(live: Option<Live>) -> Self {
         let mut favorites = HashSet::new();
         favorites.insert((Provider::AirVpn, "Hydrus".to_string()));
         Self {
@@ -106,7 +115,95 @@ impl TunmuxApp {
                 service_installed: false,
             },
             actions: Vec::new(),
+            live,
+            #[cfg(target_os = "linux")]
+            systray: None,
+            tray_signature: String::new(),
+            clipboard: None,
+            quit: false,
         }
+    }
+
+    pub fn connections(&self) -> Vec<ConnectionView> {
+        match &self.live {
+            Some(live) => live.snapshot().connections,
+            None => self.backend.connections.clone(),
+        }
+    }
+
+    fn corrupt_states(&self) -> Vec<String> {
+        match &self.live {
+            Some(live) => live.snapshot().corrupt,
+            None => self.backend.corrupt_states.clone(),
+        }
+    }
+
+    pub fn tray_model(&self) -> TrayModel {
+        match &self.live {
+            // Connecting from the GUI is not wired to the library yet.
+            Some(live) => TrayModel {
+                conns: live.snapshot().connections,
+                ..TrayModel::default()
+            },
+            None => TrayModel {
+                conns: self.backend.connections.clone(),
+                quick: Provider::ALL
+                    .into_iter()
+                    .filter(|p| p.needs_account() && self.backend.is_logged_in(*p))
+                    .collect(),
+                recent: self.backend.recent.clone(),
+            },
+        }
+    }
+
+    /// Push menu changes to the system tray. In live mode the status thread
+    /// also does this, so the tray stays current with the window closed.
+    pub fn sync_tray(&mut self) {
+        let model = self.tray_model();
+        let signature = model.signature();
+        if signature == self.tray_signature {
+            return;
+        }
+        self.tray_signature = signature;
+        #[cfg(target_os = "linux")]
+        if let Some(handle) = &self.systray {
+            handle.update(|t| t.model = model);
+        }
+    }
+
+    /// Per-frame bookkeeping that also runs while the window is hidden.
+    pub fn tick(&mut self) {
+        if self.live.is_none() {
+            self.backend.tick();
+        }
+        let messages = self
+            .live
+            .as_ref()
+            .map(Live::take_messages)
+            .unwrap_or_default();
+        for message in messages {
+            match message {
+                Ok(text) => self.toast(text),
+                Err(text) => self.toast_error(text),
+            }
+        }
+        self.sync_tray();
+    }
+
+    fn copy(&mut self, ctx: Option<&egui::Context>, text: String) -> Result<(), String> {
+        if let Some(ctx) = ctx {
+            ctx.copy_text(text);
+            return Ok(());
+        }
+        // No window: keep one clipboard owner alive so the text stays served.
+        if self.clipboard.is_none() {
+            self.clipboard = Some(arboard::Clipboard::new().map_err(|e| e.to_string())?);
+        }
+        self.clipboard
+            .as_mut()
+            .expect("clipboard initialised above")
+            .set_text(text)
+            .map_err(|e| e.to_string())
     }
 
     pub fn toast(&mut self, text: impl Into<String>) {
@@ -125,22 +222,28 @@ impl TunmuxApp {
         });
     }
 
-    fn apply_actions(&mut self, ctx: &egui::Context) {
+    pub fn apply_actions(&mut self, ctx: Option<&egui::Context>) {
         for action in std::mem::take(&mut self.actions) {
             match action {
                 Action::Connect(server, replace) => self.connect(server, replace),
-                Action::Disconnect(instance) => {
-                    self.backend.disconnect(&instance);
-                    self.toast(format!("Disconnected {instance}"));
-                }
+                Action::Disconnect(instance) => match &self.live {
+                    Some(live) => {
+                        live.disconnect(Some(&instance));
+                        self.toast(format!("Disconnecting {instance}"));
+                    }
+                    None => {
+                        self.backend.disconnect(&instance);
+                        self.toast(format!("Disconnected {instance}"));
+                    }
+                },
                 Action::Recover(instance) => {
                     self.backend.recover(&instance);
                     self.toast(format!("Recovering {instance}"));
                 }
-                Action::Copy(text, what) => {
-                    ctx.copy_text(text);
-                    self.toast(format!("Copied {what}"));
-                }
+                Action::Copy(text, what) => match self.copy(ctx, text) {
+                    Ok(()) => self.toast(format!("Copied {what}")),
+                    Err(e) => self.toast_error(format!("Cannot copy {what}: {e}")),
+                },
                 Action::OpenAccounts(p) => {
                     self.accounts_tab = p;
                     self.show_accounts = true;
@@ -156,13 +259,20 @@ impl TunmuxApp {
         }
     }
 
-    fn apply_tray(&mut self, ctx: &egui::Context, action: TrayAction) {
+    /// Handle a tray menu action; `ctx` is `None` while the window is closed.
+    pub fn apply_tray(&mut self, ctx: Option<&egui::Context>, action: TrayAction) {
         match action {
             TrayAction::Disconnect(i) => self.actions.push(Action::Disconnect(i)),
-            TrayAction::DisconnectAll => {
-                self.backend.disconnect_all();
-                self.toast("Disconnected all");
-            }
+            TrayAction::DisconnectAll => match &self.live {
+                Some(live) => {
+                    live.disconnect(None);
+                    self.toast("Disconnecting all");
+                }
+                None => {
+                    self.backend.disconnect_all();
+                    self.toast("Disconnected all");
+                }
+            },
             TrayAction::CopyProxy(addr) => self.actions.push(Action::Copy(addr, "proxy address")),
             TrayAction::QuickConnect(p) => {
                 if let Some(s) = self.best_server(p, None) {
@@ -179,9 +289,16 @@ impl TunmuxApp {
             }
             TrayAction::OpenWindow => {
                 self.show_tray_preview = false;
-                ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+                if let Some(ctx) = ctx {
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+                }
             }
-            TrayAction::Quit => ctx.send_viewport_cmd(egui::ViewportCommand::Close),
+            TrayAction::Quit => {
+                self.quit = true;
+                if let Some(ctx) = ctx {
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                }
+            }
         }
         // Tray actions queued follow-ups; run them this frame.
         if !self.actions.is_empty() {
@@ -190,6 +307,14 @@ impl TunmuxApp {
     }
 
     fn connect(&mut self, server: ServerView, replace: bool) {
+        if self.live.is_some() {
+            self.toast_error(format!(
+                "Connecting from the window is not wired yet; run: tunmux connect {} {}",
+                server.provider.label().to_lowercase(),
+                server.name
+            ));
+            return;
+        }
         let spec = self.spec.clone();
         match self.backend.connect(&server, &spec, replace) {
             Ok(instance) => self.toast(format!(
@@ -262,7 +387,7 @@ impl TunmuxApp {
     // --- status card -------------------------------------------------------
 
     fn status_card(&mut self, ui: &mut Ui) {
-        let conns = self.backend.connections.clone();
+        let conns = self.connections();
         let state = TrayState::from_connections(&conns);
         let direct = conns.iter().find(|c| c.is_direct());
 
@@ -293,7 +418,7 @@ impl TunmuxApp {
                 }
             });
         }
-        for name in &self.backend.corrupt_states {
+        for name in &self.corrupt_states() {
             ui.colored_label(
                 Color32::from_rgb(220, 80, 60),
                 format!("State file {name}.json is unreadable."),
@@ -311,7 +436,7 @@ impl TunmuxApp {
                     .color(tray::state_color(state)),
             );
             ui.label(RichText::new(format!("{}  {}", c.provider.label(), c.server)).size(16.0));
-            ui.weak(format!("{}, {}", c.country_code, c.city));
+            ui.weak(location(c));
         });
         ui.horizontal(|ui| {
             match c.health {
@@ -319,26 +444,31 @@ impl TunmuxApp {
                     ui.spinner();
                     ui.weak("bringing up tunnel...");
                 }
-                Health::Active => {
+                Health::Active | Health::Unknown => {
                     ui.monospace(&c.virtual_ip);
-                    ui.weak(c.backend.label());
-                    ui.weak(format!("up {}", fmt_uptime(c.since.elapsed())));
+                    ui.weak(&c.backend);
                     ui.weak(format!(
-                        "rx {}  tx {}",
-                        fmt_bytes(c.rx_bytes),
-                        fmt_bytes(c.tx_bytes)
+                        "up {}",
+                        fmt_uptime(c.since.elapsed().unwrap_or_default())
                     ));
+                    if let (Some(rx), Some(tx)) = (c.rx_bytes, c.tx_bytes) {
+                        ui.weak(format!("rx {}  tx {}", fmt_bytes(rx), fmt_bytes(tx)));
+                    }
+                    if c.health == Health::Unknown {
+                        // Unknown is not evidence of failure; say so plainly.
+                        ui.colored_label(tray::state_color(TrayState::Connecting), "unverified")
+                            .on_hover_text(c.health_reason.as_deref().unwrap_or("no details"));
+                    }
                 }
-                Health::Inactive | Health::Unknown => {
+                Health::Inactive => {
                     ui.colored_label(
                         tray::state_color(TrayState::Degraded),
                         format!(
-                            "health {}: {}",
-                            c.health.label(),
+                            "inactive: {}",
                             c.health_reason.as_deref().unwrap_or("no details")
                         ),
                     );
-                    if ui.small_button("Recover").clicked() {
+                    if self.live.is_none() && ui.small_button("Recover").clicked() {
                         self.actions.push(Action::Recover(c.instance.clone()));
                     }
                 }
@@ -361,13 +491,21 @@ impl TunmuxApp {
                 tray::paint_icon(ui, state, 12.0);
                 ui.label(RichText::new(&c.instance).strong())
                     .on_hover_text(format!(
-                        "{} {} ({}), {}, {}",
+                        "{} {} {}\n{}, {}: {}",
                         c.provider.label(),
                         c.server,
-                        c.city,
+                        location(c),
                         c.mode.label(),
-                        c.health.label()
+                        c.health.label(),
+                        c.health_reason.as_deref().unwrap_or("")
                     ));
+                if c.health == Health::Unknown {
+                    ui.colored_label(tray::state_color(TrayState::Connecting), "?")
+                        .on_hover_text(format!(
+                            "unverified: {}",
+                            c.health_reason.as_deref().unwrap_or("no details")
+                        ));
+                }
                 if let (Some(socks), Some(http)) = (c.socks_port, c.http_port) {
                     ui.monospace(format!(":{socks}/:{http}"));
                     if ui
@@ -541,10 +679,12 @@ impl TunmuxApp {
             });
             return;
         }
+        if self.live.is_some() {
+            ui.weak("Sample server list: browsing and connecting are wired to the library next.");
+        }
         let rows = self.filtered_servers();
         let connected: Vec<(String, String)> = self
-            .backend
-            .connections
+            .connections()
             .iter()
             .filter(|c| c.provider == provider)
             .map(|c| (c.server.clone(), c.instance.clone()))
@@ -716,26 +856,9 @@ impl TunmuxApp {
             if tray_btn.clicked() {
                 self.show_tray_preview = !self.show_tray_preview;
             }
-            ui.menu_button("Mock", |ui| {
-                if ui.button("Health unknown on first tunnel").clicked() {
-                    self.backend
-                        .degrade_first(Health::Unknown, "privileged helper not reachable");
-                    ui.close();
-                }
-                if ui.button("Last proxy inactive").clicked() {
-                    self.backend
-                        .degrade_last(Health::Inactive, "proxy daemon pid 4211 exited");
-                    ui.close();
-                }
-                if ui.button("Unreadable state file").clicked() {
-                    self.backend.corrupt_states.push("old-nl".into());
-                    ui.close();
-                }
-                if ui.button("Error toast").clicked() {
-                    self.toast_error("privileged helper: permission denied (not in group tunmux)");
-                    ui.close();
-                }
-            });
+            if self.live.is_none() {
+                self.mock_menu(ui);
+            }
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                 let accounts = self
                     .backend
@@ -743,11 +866,39 @@ impl TunmuxApp {
                     .iter()
                     .filter(|a| a.provider.needs_account() && self.backend.is_logged_in(a.provider))
                     .count();
+                let source = if self.live.is_some() {
+                    "live status, sample servers and accounts"
+                } else {
+                    "mock data"
+                };
                 ui.weak(format!(
-                    "{} tunnel(s), {accounts} account(s)",
-                    self.backend.connections.len()
+                    "{} tunnel(s), {accounts} account(s) - {source}",
+                    self.connections().len()
                 ));
             });
+        });
+    }
+
+    fn mock_menu(&mut self, ui: &mut Ui) {
+        ui.menu_button("Mock", |ui| {
+            if ui.button("Health unknown on first tunnel").clicked() {
+                self.backend
+                    .degrade_first(Health::Unknown, "privileged helper not reachable");
+                ui.close();
+            }
+            if ui.button("Last proxy inactive").clicked() {
+                self.backend
+                    .degrade_last(Health::Inactive, "proxy daemon pid 4211 exited");
+                ui.close();
+            }
+            if ui.button("Unreadable state file").clicked() {
+                self.backend.corrupt_states.push("old-nl".into());
+                ui.close();
+            }
+            if ui.button("Error toast").clicked() {
+                self.toast_error("privileged helper: permission denied (not in group tunmux)");
+                ui.close();
+            }
         });
     }
 
@@ -755,8 +906,9 @@ impl TunmuxApp {
         if !self.show_tray_preview {
             return;
         }
-        let items = tray::build_menu(&self.backend);
-        let state = TrayState::from_connections(&self.backend.connections);
+        let model = self.tray_model();
+        let items = tray::build_menu(&model);
+        let state = TrayState::from_connections(&model.conns);
         let mut open = true;
         egui::Window::new("Tray menu preview")
             .open(&mut open)
@@ -766,7 +918,7 @@ impl TunmuxApp {
             .show(ctx, |ui| {
                 ui.horizontal(|ui| {
                     tray::paint_icon(ui, state, 18.0);
-                    ui.weak(tray::tooltip(&self.backend.connections));
+                    ui.weak(tray::tooltip(&model.conns));
                 });
                 ui.separator();
                 if let Some(a) = tray::show_menu(ui, &items) {
@@ -841,12 +993,12 @@ impl TunmuxApp {
     }
 }
 
-impl eframe::App for TunmuxApp {
-    fn ui(&mut self, ui: &mut Ui, _frame: &mut eframe::Frame) {
+impl TunmuxApp {
+    /// Draw the whole window; `tick` has run for this frame already.
+    pub fn show(&mut self, ui: &mut Ui) {
         let ctx = ui.ctx().clone();
-        self.backend.tick();
-        // Traffic counters and uptime move every second.
-        ctx.request_repaint_after(if self.backend.is_busy() {
+        // Uptime (and mock traffic) moves every second.
+        ctx.request_repaint_after(if self.live.is_none() && self.backend.is_busy() {
             Duration::from_millis(100)
         } else {
             Duration::from_secs(1)
@@ -869,7 +1021,7 @@ impl eframe::App for TunmuxApp {
         self.tray_preview(&ctx);
         self.replace_prompt(&ctx);
         self.toasts(&ctx);
-        self.apply_actions(&ctx);
+        self.apply_actions(Some(&ctx));
     }
 }
 
@@ -901,6 +1053,15 @@ fn mode_help(mode: Mode) -> &'static str {
         Mode::NetnsProxy => "Kernel WireGuard in a network namespace, exposed as SOCKS5/HTTP",
         Mode::LocalProxy => "Rootless userspace tunnel exposed as SOCKS5/HTTP",
     }
+}
+
+/// "CH, Zurich", skipping parts the source does not know.
+fn location(c: &ConnectionView) -> String {
+    [c.country_code.as_str(), c.city.as_str()]
+        .into_iter()
+        .filter(|s| !s.is_empty())
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 pub fn fmt_uptime(d: Duration) -> String {
