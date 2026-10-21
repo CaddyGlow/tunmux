@@ -15,7 +15,8 @@ pub(crate) struct DataplanePerf {
     pub(crate) udp_tx_packets: u64,
     pub(crate) udp_tx_bytes: u64,
     pub(crate) tunn_net_writes: u64,
-    pub(crate) tunn_net_write_copies: u64,
+    pub(crate) udp_rx_syscalls: u64,
+    pub(crate) udp_tx_syscalls: u64,
     pub(crate) conn_visits: u64,
     pub(crate) conn_requeues: u64,
     pub(crate) active_q_peak: usize,
@@ -49,7 +50,8 @@ impl DataplanePerf {
             udp_tx_packets: 0,
             udp_tx_bytes: 0,
             tunn_net_writes: 0,
-            tunn_net_write_copies: 0,
+            udp_rx_syscalls: 0,
+            udp_tx_syscalls: 0,
             conn_visits: 0,
             conn_requeues: 0,
             active_q_peak: 0,
@@ -94,7 +96,8 @@ impl DataplanePerf {
             udp_tx_packets = self.udp_tx_packets,
             udp_tx_mib = self.udp_tx_bytes as f64 / (1024.0 * 1024.0),
             tunn_net_writes = self.tunn_net_writes,
-            tunn_net_write_copies = self.tunn_net_write_copies,
+            udp_rx_syscalls = self.udp_rx_syscalls,
+            udp_tx_syscalls = self.udp_tx_syscalls,
             conn_visits = self.conn_visits,
             conn_requeues = self.conn_requeues,
             active_q_peak = self.active_q_peak,
@@ -118,7 +121,8 @@ impl DataplanePerf {
         self.udp_tx_packets = 0;
         self.udp_tx_bytes = 0;
         self.tunn_net_writes = 0;
-        self.tunn_net_write_copies = 0;
+        self.udp_rx_syscalls = 0;
+        self.udp_tx_syscalls = 0;
         self.conn_visits = 0;
         self.conn_requeues = 0;
         self.active_q_peak = 0;

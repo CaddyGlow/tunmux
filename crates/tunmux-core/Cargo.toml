@@ -64,6 +64,7 @@ rand = "0.8"
 # Encoding
 base64 = "0.23"
 bytes = "1"
+socket2 = "0.6"
 crossbeam-queue = "0.3"
 
 # Crypto - AirVPN API

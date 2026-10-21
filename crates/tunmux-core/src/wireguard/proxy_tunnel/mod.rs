@@ -9,6 +9,7 @@ mod dns;
 mod http;
 mod perf;
 mod socks5;
+mod udp_io;
 
 pub(crate) mod connection;
 pub(crate) mod queue;
@@ -35,12 +36,17 @@ use connection::{
     mark_conn_active, next_pending_deadline, process_dns_udp_entries, top_up_active_conns,
     ConnEntry, DnsUdpEntry, VirtualTunnelIps,
 };
-use device::VirtualDevice;
+use device::{Packet, VirtualDevice};
 use dns::parse_dns_servers;
 use perf::{DataplanePerf, IdleWakeReason};
 use queue::{ConnRequest, DnsUdpRequest, QueuePushError};
+use udp_io::{UdpRx, UdpTx};
 
 const UDP_BUF: usize = 65536;
+/// Requested WireGuard socket buffers; the kernel caps them at rmem_max/wmem_max.
+/// smoltcp advertises up to `TCP_SOCKET_BUF` per connection, so the receive side
+/// must absorb a burst of that size or datagrams drop and senders back off.
+const UDP_SOCKET_BUF: usize = 8 * 1024 * 1024;
 const TCP_SOCKET_BUF: usize = 2097152;
 const STREAM_BUF: usize = 65536;
 const LOCAL_PORT_START: u16 = 40000;
@@ -50,7 +56,6 @@ const CLIENT_CHANNEL_CAP: usize = 1024;
 const REMOTE_PENDING_MAX_BYTES: usize = 2 * 1024 * 1024;
 const CLIENT_PENDING_MAX_BYTES: usize = 2 * 1024 * 1024;
 const UDP_RECV_BURST_MAX: usize = 192;
-const UDP_SEND_BURST_MAX: usize = 192;
 const ACTIVE_CONN_BATCH_MAX: usize = 384;
 const ACTIVE_CONN_TOPUP_TARGET: usize = 768;
 const ACTIVE_CONN_SWEEP_BATCH_MAX: usize = 384;
@@ -112,6 +117,7 @@ pub async fn run_local_proxy(
     udp.connect(cfg.endpoint)
         .await
         .context("connect UDP to WireGuard endpoint")?;
+    tune_udp_buffers(&udp);
     let udp = Arc::new(udp);
 
     let mut tunn = Tunn::new(
@@ -182,7 +188,6 @@ pub async fn run_local_proxy(
         remote_pending_max_bytes = REMOTE_PENDING_MAX_BYTES,
         client_pending_max_bytes = CLIENT_PENDING_MAX_BYTES,
         udp_recv_burst_max = UDP_RECV_BURST_MAX,
-        udp_send_burst_max = UDP_SEND_BURST_MAX,
         "local_proxy_tuning_enabled"
     );
     let perf_enabled = std::env::var_os("TUNMUX_LOCAL_PROXY_PERF").is_some();
@@ -267,13 +272,11 @@ pub async fn run_local_proxy(
         }
     });
 
-    let mut udp_buf = vec![0u8; UDP_BUF];
-    let mut decap_buf = vec![0u8; UDP_BUF];
-    let mut enc_buf = vec![0u8; UDP_BUF + 32];
+    let mut udp_rx = UdpRx::new(udp.as_ref());
+    let mut udp_tx = UdpTx::new();
     let mut conns: Vec<ConnEntry> = Vec::new();
     let mut dns_udp_entries: Vec<DnsUdpEntry> = Vec::new();
     let mut next_port: u16 = LOCAL_PORT_START;
-    let mut wg_pending_tx: VecDeque<Bytes> = VecDeque::new();
     let mut active_conns: VecDeque<usize> = VecDeque::new();
     let mut scan_cursor: usize = 0;
     let mut wg_timer_deadline = Instant::now();
@@ -282,13 +285,10 @@ pub async fn run_local_proxy(
 
     // Trigger an initial handshake proactively so the parent connect command
     // can report success only after an actual tunnel handshake.
-    queue_tunn_network_write(
-        tunn.format_handshake_initiation(&mut enc_buf, false),
-        udp.as_ref(),
-        &mut wg_pending_tx,
-        &mut perf,
-    );
-    flush_udp_writes(udp.as_ref(), &mut wg_pending_tx, &mut perf);
+    udp_tx.push_with(&mut perf, |dst| {
+        network_len(tunn.format_handshake_initiation(dst, false))
+    });
+    udp_tx.flush(udp.as_ref(), &mut perf);
 
     loop {
         let now_std = Instant::now();
@@ -309,12 +309,7 @@ pub async fn run_local_proxy(
         }
 
         if now_std >= wg_timer_deadline {
-            queue_tunn_network_write(
-                tunn.update_timers(&mut enc_buf),
-                udp.as_ref(),
-                &mut wg_pending_tx,
-                &mut perf,
-            );
+            udp_tx.push_with(&mut perf, |dst| network_len(tunn.update_timers(dst)));
             wg_timer_deadline = now_std + WG_TIMER_TICK_MAX;
         }
 
@@ -333,33 +328,38 @@ pub async fn run_local_proxy(
             add_dns_udp_query(req, &mut next_port, &mut sockets, &mut dns_udp_entries);
         }
 
-        for _ in 0..UDP_RECV_BURST_MAX {
-            match udp.try_recv(&mut udp_buf) {
-                Ok(n) => match tunn.decapsulate(None, &udp_buf[..n], &mut decap_buf) {
-                    TunnResult::WriteToTunnelV4(plain, _)
-                    | TunnResult::WriteToTunnelV6(plain, _) => {
-                        perf.udp_rx_packets = perf.udp_rx_packets.saturating_add(1);
-                        perf.udp_rx_bytes = perf.udp_rx_bytes.saturating_add(n as u64);
-                        device.inbound.push_back(Vec::from(plain));
-                    }
-                    TunnResult::WriteToNetwork(out) => {
-                        queue_tunn_network_write(
-                            TunnResult::WriteToNetwork(out),
-                            udp.as_ref(),
-                            &mut wg_pending_tx,
-                            &mut perf,
-                        );
-                    }
-                    _ => {}
-                },
+        let mut received = 0usize;
+        while received < UDP_RECV_BURST_MAX {
+            match udp_rx.recv(udp.as_ref(), &mut perf) {
+                Ok(()) => {}
                 Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
                 Err(e) => {
                     warn!(error = ?e.to_string(), "udp_recv_error");
                     break;
                 }
             }
+            for datagram in udp_rx.datagrams() {
+                received += 1;
+                // Decrypt straight into a pooled buffer; boringtun writes the
+                // plaintext from offset 0.
+                let mut buf = device.rx_pool.take(datagram.len());
+                match tunn.decapsulate(None, datagram, &mut buf) {
+                    TunnResult::WriteToTunnelV4(plain, _)
+                    | TunnResult::WriteToTunnelV6(plain, _) => {
+                        let len = plain.len();
+                        perf.udp_rx_packets = perf.udp_rx_packets.saturating_add(1);
+                        perf.udp_rx_bytes = perf.udp_rx_bytes.saturating_add(datagram.len() as u64);
+                        device.inbound.push_back(Packet::new(buf, len));
+                    }
+                    TunnResult::WriteToNetwork(out) => {
+                        udp_tx.push(&mut perf, out);
+                        device.rx_pool.put(buf);
+                    }
+                    _ => device.rx_pool.put(buf),
+                }
+            }
         }
-        flush_udp_writes(udp.as_ref(), &mut wg_pending_tx, &mut perf);
+        udp_tx.flush(udp.as_ref(), &mut perf);
 
         let poll_start = Instant::now();
         let _ = iface.poll(now, &mut device, &mut sockets);
@@ -368,15 +368,13 @@ pub async fn run_local_proxy(
             .iface_poll_ns
             .saturating_add(poll_start.elapsed().as_nanos() as u64);
 
-        while let Some(plain) = device.outbound.pop_front() {
-            queue_tunn_network_write(
-                tunn.encapsulate(&plain, &mut enc_buf),
-                udp.as_ref(),
-                &mut wg_pending_tx,
-                &mut perf,
-            );
+        while let Some(packet) = device.outbound.pop_front() {
+            udp_tx.push_with(&mut perf, |dst| {
+                network_len(tunn.encapsulate(packet.as_slice(), dst))
+            });
+            device.tx_pool.put(packet.into_buf());
         }
-        flush_udp_writes(udp.as_ref(), &mut wg_pending_tx, &mut perf);
+        udp_tx.flush(udp.as_ref(), &mut perf);
         process_dns_udp_entries(&mut sockets, &mut dns_udp_entries, now_std);
         expire_pending_connects(&mut conns, &mut sockets, &mut active_conns, now_std);
 
@@ -537,7 +535,7 @@ pub async fn run_local_proxy(
 
         let has_pending_work =
             !device.inbound.is_empty() || !device.outbound.is_empty() || !active_conns.is_empty();
-        perf.observe_loop(active_conns.len(), wg_pending_tx.len());
+        perf.observe_loop(active_conns.len(), udp_tx.pending());
         perf.maybe_log_and_reset(conns.len());
         if has_pending_work {
             tokio::task::yield_now().await;
@@ -558,7 +556,7 @@ pub async fn run_local_proxy(
         let wait_started = Instant::now();
         let wake_reason = tokio::select! {
             _ = udp.readable() => IdleWakeReason::Udp,
-            _ = udp.writable(), if !wg_pending_tx.is_empty() => IdleWakeReason::Udp,
+            _ = udp.writable(), if udp_tx.pending() > 0 => IdleWakeReason::Udp,
             maybe_req = conn_req_rx.recv() => {
                 if let Some(req) = maybe_req {
                     add_virtual_connection(
@@ -591,63 +589,25 @@ pub async fn run_local_proxy(
     }
 }
 
-fn queue_tunn_network_write(
-    result: TunnResult<'_>,
-    udp: &UdpSocket,
-    wg_pending_tx: &mut VecDeque<Bytes>,
-    perf: &mut DataplanePerf,
-) {
-    if let TunnResult::WriteToNetwork(out) = result {
-        perf.tunn_net_writes = perf.tunn_net_writes.saturating_add(1);
-
-        if wg_pending_tx.is_empty() {
-            match udp.try_send(out) {
-                Ok(sent) if sent == out.len() => {
-                    perf.udp_tx_packets = perf.udp_tx_packets.saturating_add(1);
-                    perf.udp_tx_bytes = perf.udp_tx_bytes.saturating_add(sent as u64);
-                    return;
-                }
-                Ok(sent) => {
-                    warn!(sent = sent, expected = out.len(), "udp_send_partial");
-                    return;
-                }
-                Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
-                Err(e) => {
-                    warn!(error = ?e.to_string(), "udp_send_error");
-                    return;
-                }
-            }
-        }
-
-        wg_pending_tx.push_back(Bytes::copy_from_slice(out));
-        perf.tunn_net_write_copies = perf.tunn_net_write_copies.saturating_add(1);
+fn tune_udp_buffers(udp: &UdpSocket) {
+    let sock = socket2::SockRef::from(udp);
+    if let Err(error) = sock.set_recv_buffer_size(UDP_SOCKET_BUF) {
+        warn!(error = %error, "udp_recv_buffer_resize_failed");
     }
+    if let Err(error) = sock.set_send_buffer_size(UDP_SOCKET_BUF) {
+        warn!(error = %error, "udp_send_buffer_resize_failed");
+    }
+    info!(
+        requested = UDP_SOCKET_BUF,
+        recv_buf = sock.recv_buffer_size().ok(),
+        send_buf = sock.send_buffer_size().ok(),
+        "local_proxy_udp_buffers"
+    );
 }
 
-fn flush_udp_writes(
-    udp: &UdpSocket,
-    wg_pending_tx: &mut VecDeque<Bytes>,
-    perf: &mut DataplanePerf,
-) {
-    for _ in 0..UDP_SEND_BURST_MAX {
-        let Some(front) = wg_pending_tx.front() else {
-            break;
-        };
-        match udp.try_send(front.as_ref()) {
-            Ok(sent) if sent == front.len() => {
-                perf.udp_tx_packets = perf.udp_tx_packets.saturating_add(1);
-                perf.udp_tx_bytes = perf.udp_tx_bytes.saturating_add(sent as u64);
-                let _ = wg_pending_tx.pop_front();
-            }
-            Ok(sent) => {
-                warn!(sent = sent, expected = front.len(), "udp_send_partial");
-                let _ = wg_pending_tx.pop_front();
-            }
-            Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
-            Err(e) => {
-                warn!(error = ?e.to_string(), "udp_send_error");
-                let _ = wg_pending_tx.pop_front();
-            }
-        }
+fn network_len(result: TunnResult<'_>) -> Option<usize> {
+    match result {
+        TunnResult::WriteToNetwork(out) => Some(out.len()),
+        _ => None,
     }
 }
