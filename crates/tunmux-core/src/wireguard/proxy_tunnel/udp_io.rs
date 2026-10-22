@@ -230,6 +230,11 @@ pub(crate) struct UdpRx {
     headers: nix::sys::socket::MultiHeaders<nix::sys::socket::SockaddrStorage>,
 }
 
+#[cfg(target_os = "linux")]
+fn rx_headers() -> nix::sys::socket::MultiHeaders<nix::sys::socket::SockaddrStorage> {
+    nix::sys::socket::MultiHeaders::preallocate(RX_SLOTS, Some(nix::cmsg_space!(i32)))
+}
+
 impl UdpRx {
     pub(crate) fn new(udp: &UdpSocket) -> Self {
         #[cfg(target_os = "linux")]
@@ -244,10 +249,7 @@ impl UdpRx {
             slots: (0..RX_SLOTS).map(|_| vec![0u8; RX_SLOT_BYTES]).collect(),
             filled: Vec::with_capacity(RX_SLOTS),
             #[cfg(target_os = "linux")]
-            headers: nix::sys::socket::MultiHeaders::preallocate(
-                RX_SLOTS,
-                Some(nix::cmsg_space!(i32)),
-            ),
+            headers: rx_headers(),
         }
     }
 
@@ -271,6 +273,10 @@ impl UdpRx {
             headers,
         } = self;
         udp.try_io(tokio::io::Interest::READABLE, || {
+            // The kernel shrinks each header's control length to what it wrote,
+            // and nix never restores it, so a slot that once got no GRO size
+            // would get none for later coalesced buffers either.
+            *headers = rx_headers();
             let mut iovs: Vec<[IoSliceMut<'_>; 1]> = slots
                 .iter_mut()
                 .map(|slot| [IoSliceMut::new(slot)])
@@ -372,5 +378,54 @@ mod tests {
             offset += len;
         }
         assert_eq!(offset, tx.end);
+    }
+
+    /// Loopback hands a GSO run to a GRO socket as one buffer, as a NIC with
+    /// GRO does; veth never coalesces, so the netns bench cannot see this.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn test_recv_splits_gro_buffers_after_uncoalesced_datagrams() {
+        let receiver = UdpSocket::bind("127.0.0.1:0").await.expect("bind");
+        let sender = UdpSocket::bind("127.0.0.1:0").await.expect("bind");
+        sender
+            .connect(receiver.local_addr().expect("addr"))
+            .await
+            .expect("connect");
+        let mut rx = UdpRx::new(&receiver);
+        let mut tx = UdpTx::new();
+        let mut perf = DataplanePerf::new(false);
+
+        // Each round first lands an uncoalesced datagram in every slot.
+        for round in 0..3u8 {
+            for _ in 0..RX_SLOTS {
+                tx.push(&mut perf, &[round; 40]);
+                sender.writable().await.expect("writable");
+                tx.flush(&sender, &mut perf);
+            }
+            tx.push(&mut perf, &[round; 1200]);
+            tx.push(&mut perf, &[round; 1200]);
+            tx.push(&mut perf, &[round; 700]);
+            while tx.pending() > 0 {
+                sender.writable().await.expect("writable");
+                tx.flush(&sender, &mut perf);
+            }
+
+            let mut lens = Vec::new();
+            let expected_bytes = RX_SLOTS * 40 + 3100;
+            let receive = async {
+                while lens.iter().sum::<usize>() < expected_bytes {
+                    receiver.readable().await.expect("readable");
+                    match rx.recv(&receiver, &mut perf) {
+                        Ok(()) => lens.extend(rx.datagrams().map(<[u8]>::len)),
+                        Err(e) if e.kind() == io::ErrorKind::WouldBlock => continue,
+                        Err(e) => panic!("recv: {e}"),
+                    }
+                }
+            };
+            tokio::time::timeout(std::time::Duration::from_secs(5), receive)
+                .await
+                .expect("all datagrams received");
+            assert_eq!(&lens[RX_SLOTS..], &[1200, 1200, 700], "round {round}");
+        }
     }
 }
