@@ -198,6 +198,10 @@ tunmux hook debug <instance>
 filter until restarted. Hooks accept built-in checks or executable paths and run
 on connection up/down events. Local-proxy DNS prefers the tunnel's DNS servers;
 `TUNMUX_LOCAL_PROXY_DNS_SERVERS` overrides them with a comma-separated list.
+On Linux, `TUNMUX_LOCAL_PROXY_UDP_GSO=1` batches the local proxy's outgoing
+WireGuard datagrams with UDP GSO. It is off by default because some NICs that
+segment UDP in hardware hang on it; check `ethtool -k <nic> | grep
+tx-udp-segmentation` and update the NIC firmware before enabling it there.
 
 Status distinguishes observed health from saved metadata. If cleanup fails,
 resolve the reported problem and retry disconnect; recovery journals retain

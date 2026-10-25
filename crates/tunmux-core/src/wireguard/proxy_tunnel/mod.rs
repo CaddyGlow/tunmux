@@ -193,6 +193,10 @@ pub async fn run_local_proxy(
     if perf_enabled {
         info!("local_proxy_perf_enabled");
     }
+    let udp_gso = std::env::var("TUNMUX_LOCAL_PROXY_UDP_GSO").is_ok_and(|v| v == "1");
+    if udp_gso {
+        info!("local_proxy_udp_gso_enabled");
+    }
 
     let (conn_req_tx, mut conn_req_rx) = mpsc::channel::<ConnRequest>(CLIENT_CHANNEL_CAP);
     let (dns_req_tx, mut dns_req_rx) = mpsc::channel::<DnsUdpRequest>(CLIENT_CHANNEL_CAP);
@@ -272,7 +276,7 @@ pub async fn run_local_proxy(
     });
 
     let mut udp_rx = UdpRx::new(udp.as_ref());
-    let mut udp_tx = UdpTx::new();
+    let mut udp_tx = UdpTx::new(udp_gso);
     let mut conns: Vec<ConnEntry> = Vec::new();
     let mut dns_udp_entries: Vec<DnsUdpEntry> = Vec::new();
     let mut next_port: u16 = LOCAL_PORT_START;

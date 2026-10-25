@@ -1,7 +1,8 @@
-//! WireGuard UDP I/O for the local proxy. On Linux, outgoing datagrams leave in
-//! UDP GSO runs (one `sendmsg` for up to 64 equal-sized datagrams) and incoming
-//! ones arrive through `recvmmsg` with UDP GRO. Elsewhere each datagram takes
-//! its own syscall. Fragmentation settings are left at the kernel defaults.
+//! WireGuard UDP I/O for the local proxy. On Linux, incoming datagrams arrive
+//! through `recvmmsg` with UDP GRO, and with `TUNMUX_LOCAL_PROXY_UDP_GSO=1`
+//! outgoing ones leave in UDP GSO runs (one `sendmsg` for up to 64 equal-sized
+//! datagrams). Otherwise each outgoing datagram takes its own syscall.
+//! Fragmentation settings are left at the kernel defaults.
 
 use std::collections::VecDeque;
 use std::io;
@@ -35,13 +36,15 @@ pub(crate) struct UdpTx {
 }
 
 impl UdpTx {
-    pub(crate) fn new() -> Self {
+    /// GSO is opt-in: NICs that segment UDP in hardware can hang their transmit
+    /// queues on it (seen on an XL710 with old firmware), taking the host offline.
+    pub(crate) fn new(gso: bool) -> Self {
         Self {
             buf: vec![0u8; TX_BUF_INITIAL],
             head: 0,
             end: 0,
             lens: VecDeque::new(),
-            gso: cfg!(target_os = "linux"),
+            gso: gso && cfg!(target_os = "linux"),
         }
     }
 
@@ -328,7 +331,11 @@ mod tests {
     use super::*;
 
     fn queued(lens: &[usize]) -> UdpTx {
-        let mut tx = UdpTx::new();
+        queued_with(true, lens)
+    }
+
+    fn queued_with(gso: bool, lens: &[usize]) -> UdpTx {
+        let mut tx = UdpTx::new(gso);
         let mut perf = DataplanePerf::new(false);
         for &len in lens {
             tx.push(&mut perf, &vec![0xab; len]);
@@ -355,14 +362,12 @@ mod tests {
 
     #[test]
     fn test_next_run_sends_singly_without_gso() {
-        let mut tx = queued(&[100, 100, 100]);
-        tx.gso = false;
-        assert_eq!(tx.next_run(), (1, 100));
+        assert_eq!(queued_with(false, &[100, 100, 100]).next_run(), (1, 100));
     }
 
     #[test]
     fn test_push_compacts_and_grows_without_losing_queued_bytes() {
-        let mut tx = UdpTx::new();
+        let mut tx = UdpTx::new(true);
         let mut perf = DataplanePerf::new(false);
         let datagrams = TX_BUF_INITIAL / 1000 + 50;
         for i in 0..datagrams {
@@ -392,7 +397,7 @@ mod tests {
             .await
             .expect("connect");
         let mut rx = UdpRx::new(&receiver);
-        let mut tx = UdpTx::new();
+        let mut tx = UdpTx::new(true);
         let mut perf = DataplanePerf::new(false);
 
         // Each round first lands an uncoalesced datagram in every slot.
